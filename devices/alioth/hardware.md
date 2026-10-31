@@ -1,73 +1,154 @@
-# Redmi K40（alioth）硬件事实表 —— iOS 16 移植用
+# Redmi K40（alioth）技术规格 —— iOS 16 移植用
 
-> 来源标注：**[K40-DTS]** = LineageOS `android_kernel_xiaomi_sm8250` @ lineage-22.2 的
-> `arch/arm64/boot/dts/vendor/qcom/alioth-sm8250.dtsi`（及下载到 `../../k40-dts/` 的附属文件）；
-> **[V60]** = ios-v60 仓库 `docs/v60/HARDWARE.md` 中已在真机验证的 SM8250 常量（K40 同 SoC，可直接引用）；
-> **[公开]** = 公开规格；**[TBD]** = 需要从你的真机 dump 确认，见 PORTING-PLAN.md。
+任何一个值动手之前先在这里找一遍：这张表存在的意义是**不再重复踩同一个坑**。
+每一条都注了来源，来源不同可信度不同：
+
+- **[本仓 DTS]** = `devices/alioth/dts/` 里入库的设备树（`alioth-sm8250.dtsi`、`kona-*.dtsi`）
+- **[真机 FDT]** = 本机 dump 出来的 `twrp-fdt.dts`，反编译自手机自己的 dtbo（**优先级最高**——
+  入库的 DTS 是 LineageOS 的，与本机批次可能不同）
+- **[实测]** = 在这台手机上跑出来的，`PROGRESS.md` 里有对应的日志
+- **[公开]** = 公开规格；**[TBD]** = 还没确认
+
+真机 dump、旧工具、备份都不在仓库里，在 `<主机>\Develop\alioth-local`
+（`dump/twrp-fdt.dts` 是其中最有用的一份，36,301 行）。设备本地的大文件（固件、`soc.args`、
+日志）另见 `~/alioth-device-state`，同样不入库。
+
+---
 
 ## SoC 与内存
 
 | 项目 | 值 | 来源 |
 |---|---|---|
-| SoC | Qualcomm SM8250-AC（骁龙 870，Kryo 585：1×A77@3.2 + 3×A77@2.42 + 4×A55@1.8） | [公开] |
-| ARM 架构特性 | ARMv8.2，支持 16K 页转换粒度（**无 topaz 那种只能用 4 核的问题**）；无 PAC 依赖（用 iPhone X 用户态） | [公开]/推导 |
-| RAM | **12 GB 版**（SKU pro，hwc=CN，cert M2012K11AC）：System RAM 实测 0x80880000–0x37FFFFFFF（含安全区裁剪）；DTB memory 节点与 iomem 已 dump 存档 | [实测] |
-| 定时器 | virtual/physical INTID 27/30，counter 19.2 MHz | [V60] 同 SoC |
-| PSCI | SMCCC 1.1，经 SMC 调用 | [V60] |
-| restart reason（IMEM） | 0x146bf65c | [V60] 同 SoC |
-| apps watchdog | 0x17c10000，EN 寄存器 +0x08 | [V60] 同 SoC |
-| GIC Distributor | 0x17a00000，size 0x10000 | [V60] 同 SoC |
-| GIC Redistributor | 0x17a60000，size 0x100000，stride 0x20000 | [V60] 同 SoC |
-| SPMI | core 0xc440000 / obs 0xe600000 / cnfg 0xc40a000 | [V60] 同 SoC |
-| UFS 控制器 | 0x01d84000，LUN0，4KB 块 | [V60] 同 SoC |
+| SoC | Qualcomm SM8250-AC（骁龙 870）：1×A77@3.2 GHz + 3×A77@2.42 + 4×A55@1.8 | [公开] |
+| 架构 | ARMv8.2；支持 16K 页转换粒度；无 PAC 依赖（用户态用 iPhone X 的） | [公开]/推导 |
+| 核编号 | 0–3 = A55 小核（`small_cores=0xf`），4–7 = A77；`bootcpu=7` 让内核跑在大核上 | [实测] |
+| RAM | **12 GB**（SKU pro，hwc=CN，cert M2012K11AC）：System RAM 0x80880000–0x37FFFFFFF | [实测] |
+| GIC Distributor | 0x17a00000，0x10000 | [实测] 同 SoC |
+| GIC Redistributor | 0x17a60000，0x100000，stride 0x20000 | [实测] 同 SoC |
+| 定时器 | virtual/physical INTID 27/30；counter 19.2 MHz（always-on 复测 19,198,365 Hz） | [实测] |
+| PSCI | SMCCC 1.1，走 SMC | [实测] |
+| restart reason（IMEM） | 0x146bf65c（IMEM 基址 0x14680000，Cookie 0x146BF000） | [实测] |
+| apps watchdog | 0x17c10000，EN 寄存器 +0x08 | [实测] |
+| SPMI | core 0xc440000 / obs 0xe600000 / cnfg 0xc40a000 | [实测] |
+| UFS 控制器 | 0x01d84000，LUN0，4 KB 块 | [实测] |
 
-## 显示
-
-| 项目 | 值 | 来源 |
-|---|---|---|
-| 面板 | 6.67" AMOLED 1080×2400，DSC，CMD 模式，驱动 IC **SW43404**（`dsi-panel-sw43404-amoled-dsc-fhd-plus-cmd.dtsi`） | [K40-DTS] |
-| 供电 | `dsi_panel_pwr_supply_vci` → pm8150a_l11 | [K40-DTS] |
-| 默认面板节点 | **实机 = 天马 k11a**（cmdline: `mdss_dsi_k11a_38_08_0a_dsc_cmd`，dtbo_idx=23）；DSC、cmd 模式、24bpp、burst、bl_ctrl_dcs，完整时序在 dump/twrp-fdt.dts 第 26971 行起 | [实测] |
-| 面板控制脚 | reset = TLMM gpio12，TE = TLMM gpio66，ESD 中断 = TLMM gpio51，供电 = `display_panel_avdd`（PM8150A 系） | [实测] |
-| splash framebuffer | **0x9C000000 已确认**（Mu-Silicium MemoryMapLib "Display Reserved" 区，36 MB），1080×2400、stride 4320、DSC **[TBD: 实机确认]** | [Mu-Silicium] |
-
-K40 面板存在多供应商混用（三星 E4 / 天马），不同批次的面板 IC 可能不同；这影响第 4 阶段显示管线的适配范围，首批只需支持你手里这台。
-
-## 触摸（关键差异项）
+## 显示（这台手机上最容易被误解的一块）
 
 | 项目 | 值 | 来源 |
 |---|---|---|
-| 触摸 IC | **FocalTech FTS**（`compatible = "focaltech,fts"`，10 点触控） | [K40-DTS] |
-| 总线 | **SPI**：QUPv3 SE4（gpio8=CLK, gpio9=MISO, gpio10=MOSI, gpio11=CS），SPI 最高 6 MHz；**SE4 PA = 0x990000**（kona-qupv3.dtsi `spi@990000`），TLMM PA = **0x0F000000**（kona-pinctrl.dtsi `pinctrl@f000000`） | [K40-DTS] |
-| IRQ / Reset | IRQ = TLMM gpio39（flags 0x2008 = 下降沿），Reset = TLMM gpio33，**均已实测确认** | [实测] |
-| 供电 | **实测（TWRP FDT）：vdd = PM8150A L11 @ 3.0V，vcc_i2c = PM8150A L2（1.2–1.3V）**，RPMh LDO。⚠️ lineage-22.2 树写的是 L10/L1@1.8V，与真机 4.19 FDT 冲突——bring-up 以 L11/L2 为准（本机 TWRP 实测可正常上电），点不亮再回退 | [实测] |
-| SE4 寄存器 | PA **0x990000**，size 0x4000，中断号 GIC 0x25d；SE 自身 50 MHz，FTS 子节点限 **6 MHz** | [实测] |
-| 逻辑坐标 | 8640×19200（= 1080×2400 ×8） | [K40-DTS] |
+| 面板 | 6.67" AMOLED 1080×2400，**DSC + CMD 模式**，24 bpp，burst mode | [真机 FDT] |
+| 实际面板节点 | **天马 k11a**：`qcom,mdss_dsi_k11a_38_08_0a_dsc_cmd`（`msm_drm.dsi_display0=…`，`dtbo_idx=23`）；完整时序在 `dump/twrp-fdt.dts:26971` | [真机 FDT] |
+| 入库 DTS 写的面板 | `dsi-panel-sw43404.dtsi`（三星 E4），**与本机不是同一个面板**——不要拿它的时序上机 | [本仓 DTS] vs [真机 FDT] |
+| 帧缓冲 | **0x9C000000**，36 MB（"Display Reserved"）；1080×2400，**stride 4320**，像素 BGRX | [实测] |
+| 谁在扫这块内存 | **MDP/DSI 由 bootloader 配好**；我们的代码只往 0x9C000000 里写。但 `hakios.display.c` 现在能发 DCS（`display_hz` / `display_bl`），前提是从**bootloader 留下的那页命令缓冲区**发（见下） | [实测] |
+| 刷新率现状 | **120 Hz 实测 121.333/s**（`display_hz=120`，5 秒后数 TE：`display_te=6 display_te_delay=25` → 「728 pulses in 6 s = 121.333 a second」）。不开参数时是 bootloader 的 `timing@0`，60.666/s | [实测] |
+| 面板控制脚 | reset = TLMM **gpio12**；TE = TLMM **gpio66**；ESD 中断 = TLMM **gpio51**（上升沿） | [真机 FDT] |
+| 显示供电 | `qcom,panel-supply-entries = <&dsi_panel_pwr_supply_vci>`；`display_panel_avdd` 与 `pm8150a_amoled` 都是 **disabled** | [真机 FDT] |
+| 亮度 | `bl_ctrl_dcs`：DCS `0x53`（0x20 关 dim / 0x28 开 dim / 0xe8 HBM）+ `0x51` 亮度值（0–0x7ff） | [真机 FDT] |
 
-好消息成对出现：协议层可借鉴 **ios-topaz 的 FocalTech 驱动**（63 字节报文格式：buf[2]&15 为点数、
-每点 6 字节，补丁 0060/0083），传输层可借鉴 **HackiOS 的 bit-bang SPI**（redwood_goodix.c，无需
-GENI 时钟投票）。骨架已写好：`port/alioth/bsd/dev/alioth_touch.c`，剩 FTS-over-SPI 帧格式需真机确认。
+### 三档时序（k11a，`dump/twrp-fdt.dts:27095` 起）
+
+| | timing@0 | timing@1 | timing@2 |
+|---|---|---|---|
+| framerate | **60** (0x3c) | **90** (0x5a) | **120** (0x78) |
+| v-back-porch | 0x230 | 0x118 | 0x08 |
+| v-front-porch | 0x258 | 0x12c | 0x04 |
+| v-pulse-width | 0x20 | 0x10 | 0x04 |
+| h porches | 0x10 / 0x08 / 0x08（三档相同） | | |
+| panel-clockrate | 0x4190ab00（≈1.1 GHz，三档相同） | | |
+| mdp-transfer-time-us | 14000 | 9500 | 7000 |
+| 切档时写的 DCS | `60 00`，`d1 2e` | `60 10`，`d1 6e` | `60 10`，`d1 2e` |
+
+读法：**刷新率是面板自己按 DCS `0x60` 的参数字节走的**（`00`=60，`10`=90/120，靠 `f0 5a 5a` 之后的
+`b0 16` / `d1` 再分 90 与 120）。`mi,mdss-dsi-smart-fps-max_framerate = <0x78>` 也说明这颗面板的
+上限是 120。三档的 `qcom,mdss-dsi-timing-switch-command` 都是 `dsi_lp_mode`，所以切档要在 LP 下发。
+
+**已通**：`display_hz=120` 把上表 timing@2 那 7 个包按顺序发下去，TE 从 60.666 变成 121.333。
+关键在于**命令 DMA 从哪一页读**：DSI 命令 DMA 是总线主设备，走显示侧的地址窗口，内核
+`kmem_alloc_contig` 出来的普通页它读不到（`CMD_DMA_DONE`、`status0 0`、`ack err 0`，但面板毫无反应）；
+从 bootloader 留在 `DSI +0x048` 的那页（`0x9aead000`）发就立刻生效。默认值已改为那一页：
+`display_dma_at=ADDR` 可换，`display_dma_own=1` 是失败的那个反例。
+
+注意面板 120 Hz ≠ 画面 120 fps：MDP 侧（`mdp-transfer-time-us` 14000/9500/7000）和帧驱动的
+`fb_hz`（默认 60）都还没跟着改。
+
+### 帧怎么上屏（`xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp`）
+
+这是显示驱动，参数不少，全部是 boot-arg：
+
+| 参数 | 默认 | 作用 |
+|---|---|---|
+| `fb_hz` | **60**（`kFBRefreshHz`） | 上屏节拍，也是 CoreAnimation 读到的速率（1–240） |
+| `fb_beat` | 1 | 0 = 不按节拍，GPU 一画完就上屏 |
+| `fb_threads` | 3 | 几个核一起把一帧缩放着拷进面板内存（1–8）；3 时约 3 ms，1 时 9–10 ms |
+| `fb_queue` | 2 | 允许几帧等面板（1–2） |
+| `touch_lat` | 0 | 1 = 每帧一行 `tl:`（`tools/latency.py` / `tools/frames.py`） |
+| `display_te` | — | N = 数 N 秒 TE（gpio66）的脉冲并报 Hz；`display_te_delay=N` 先等 N 秒再数（要在切档之后量就用它） |
+| `display_hz` | — | `60` / `90` / `120`：发 k11a 对应档的 `timing-switch-command`（7 个 DCS 包，LP）。`display_hz_delay=N` 默认 20 秒后发 |
+| `display_bl` | — | 1..0x7ff：发一次 DCS `0x51` 背光；`display_bl_ramp=1` 是 0x7ff→0x20→0x7ff 三轮渐变，约 9 秒，用来肉眼判定"面板到底收没收到" |
+| `display_hs` | 0 | 1 = 用 HS 而不是 LP 发（vendor 的普通 DCS 走 HS，切档走 LP；实测 LP 就够） |
+| `display_read` | — | 0x01..0xff：发一次 DCS 读并打印 RDBK 四个字（面板不回话时读到全 0） |
+| `display_dma_at` | — | 指定命令缓冲区的物理地址；**默认用 `DMA_BASE` 里 bootloader 留的那页**，因为只有显示侧能读到的页才有效 |
+| `display_dma_own` | 0 | 1 = 用内核自己 `kmem_alloc_contig` 的页（会静默失败的反例，仅作对照） |
+| `fb_filter` | 0 | 1 = 缩小时做混合（更好看，3.8 倍贵） |
+
+## 触摸
+
+| 项目 | 值 | 来源 |
+|---|---|---|
+| 触摸 IC | **FocalTech FTS**（`compatible = "focaltech,fts"`，10 点） | [本仓 DTS] |
+| 总线 | SPI：QUPv3 **SE4 @ 0x990000**（size 0x4000，GIC 0x25d）；gpio8=CLK / 9=MISO / 10=MOSI / 11=CS；最高 **6 MHz** | [本仓 DTS][实测] |
+| IRQ / Reset | IRQ = TLMM **gpio39**（0x2008，下降沿）；Reset = TLMM **gpio33** | [本仓 DTS][实测] |
+| 供电 | **vdd = PM8150A L10（L10C）@ 3.0 V，vcc_i2c = PM8150A L1（L1C）@ 1.8 V** | [本仓 DTS]，代码 `hakios.goodix.c` 的 `io_supply_on()` 用同一组 |
+| 逻辑坐标 | 8640×19200（= 1080×2400 ×8） | [本仓 DTS] |
+| 固件 | FTS 固件已烘进源码：`xnu/files/bsd/dev/hakios.focaltech_fw.h`（116,448 字节）；原始 `fw-touch/focaltech_ts_fw_m20.bin` 不在仓库 | [实测] |
+
+⚠️ 老版本的这张表写的是「L11 @ 3.0 V / L2」，**是错的**，已按 DTS 与代码改正。另外驱动文件名
+`hakios.goodix.c` 是历史遗留：它同一份代码里既有 POCO 的 Goodix GT9916 分支，也有这里用的
+FocalTech 分支，alioth 走的是后者。别被文件名骗了。
 
 ## 按键 / PMIC
 
 | 项目 | 值 | 来源 |
 |---|---|---|
-| PMIC 家族 | PM8150（按键/基础）、PM8150A（显示供电）、PM8150B（充电/USB-PD），K40 与 V60 同家族 | [K40-DTS][V60] |
-| 电源键 / 音量 | 电源键 + 音量下 = PM8150 SID0 PON@0x810 bit0/1（V60 验证，K40 无 gpio_keys 电源/音量下节点）；**音量上 = TLMM gpio6（active-low），gpio_keys 节点实测确认** | [V60]+[实测] |
-| 按键实现方式 | K40 设备树无 gpio_keys 节点 → 走 qpnp-power-on，与 V60 相同 | [K40-DTS] |
+| PMIC 家族 | PM8150（按键/基础）、PM8150A（显示/触摸供电）、PM8150B（充电/USB-PD） | [本仓 DTS] |
+| 电源键 / 音量下 | PM8150 SID0 PON @ 0x810，bit0 / bit1 | [实测] |
+| 音量上 | **PM8150 的 SPMI GPIO6**（不是 TLMM gpio6！真机 FDT：`gpios = <&pm8150_gpios 6 GPIO_ACTIVE_LOW>`，node `gpio_keys/vol_up`）。`hakios.buttons.c` 只读不写 PMIC：若固件没把它留成「带上下拉的输入」，驱动会明说 *"volume up is left alone"* 并放弃这个键 | [真机 FDT]/[实测] |
+| 实现方式 | 无 `gpio_keys` 电源节点 → 走 qpnp-power-on | [本仓 DTS] |
 
-按键驱动骨架已写好：`port/alioth/bsd/dev/alioth_buttons.c`（SPMI 仲裁器/观察者代码直接复用
-redwood_buttons.c，其地址 0xc440000/0xc40a000/0xe600000 与 V60 实测完全一致）。
-
-## UEFI 引导（第 1 阶段，已落实）
+## GPU（Adreno 650）
 
 | 项目 | 值 | 来源 |
 |---|---|---|
-| Mu-Silicium 目标 | **`Platforms/Xiaomi/aliothPkg` 已获取**（本地 `base/mu-silicium/`，sparse 检出），直接 `build_uefi.py -d alioth` | [实测] |
-| FD_BASE / FD_SIZE | **0x9FC00000 / 0x00300000 已确认**（MemoryMapLib "UEFI FD" 区；FD 之上 0x9FF90000=Stack、0x9FFFF000=Info Blk，与 dsc 的 PcdCPUCoresStackBase 吻合） | [Mu-Silicium] |
-| PAYLOAD_BASE | 安卓 boot 镜像加载惯例 0x8000000 段或按内存图 DXE Heap 0x98900000 区域安排；8GB 版 DDR 顶 0xA0000000 **[TBD: 构建时按 build_uefi.py 输出确认]** | [TBD] |
+| chipid | **0x06050002**（A650），speed bin **2**（QFPROM 0x00784000，offset 0x19b，bit5 起 3 位） | [真机 FDT] |
+| kgsl-3d0 | **0x03d00000**，0x40000 | [真机 FDT] |
+| GMU | **0x03d6a000**，0x30000（dt 节点名叫 `qcom,gmu@3d69000`，但它的 `kgsl_gmu_reg` 是 0x3d6a000——按 reg 走） | [真机 FDT] |
+| GPUCC | **0x03d90000**，0x9000 | [真机 FDT] |
+| kgsl SMMU | **0x03da0000**，0x10000（**不是** 0x20000——POCO 才是）；stream 0 GPU / 2 secure / 4 GMU user / 5 GMU kernel | [真机 FDT] |
+| RSCC | 0x03de0000 | [真机 FDT] |
+| 频率档 | GMU index 1–7 = **305 / 400 / 441.6 / 490 / 525 / 587 / 670 MHz**；默认 1（305） | [实测] |
+| 固件 | `firmware/fw-gpu/a650_gmu.bin`、`a650_sqe.fw`、`a650_zap.*`（设备本地） | [实测] |
 
-### SM8250 DDR 布局（K40，来自 Mu-Silicium MemoryMapLib，已确认）
+**启动参数怎么给**（这一条最值钱，见 PROGRESS「GPU 的正确参数」）：
+
+- `gpu=1` 在 alioth 上**一定被拒**（`hakios.adreno.c:4815`：SM8250 只有独立的 1–22 步）。
+- 能用的是 `gl=1 adreno=22 adreno_keep=1`：跑到最后一步，并且**把 GPU 留下来给系统用**
+  （服务 `HakiosGPU`，`iokit/Kernel/hakios.gpu.cpp`）。少了 `adreno_keep=1` 就等于跑完收摊。
+- `adreno_speed=N`（1–7）挑档位，`adreno_speed=7` 是 670 MHz。频率是发给 GMU 的投票
+  （`HFI_GX_BW_PERF_VOTE`），之后 GMU 自己向 RPMh 投票，我们没有 devfreq，所以**选了就一直停在那档**。
+- 成功的标志：`OpenGL ES 3.2 Mesa 25.0.7; FD650`、`THE GPU STAYS ON`，且日志里
+  `Software renderer` / `no GPU to draw with` / `vibrant views plain` 都是 0 次。
+
+## UEFI 引导（已落实）
+
+| 项目 | 值 | 来源 |
+|---|---|---|
+| UEFI 镜像 | `devices/alioth/prebuilt/SILICIUM_UEFI.fd`（Mu-Silicium aliothPkg），3 MB | [实测] |
+| FD_BASE / FD_SIZE | **0x9FC00000 / 0x00300000**（POCO 是 0x9FD00000 / 0x200000，**所以每条 `xl` 都要 `DEVICE=alioth`**） | [实测] |
+| PAYLOAD_BASE | 0xF0000000 | [实测] |
+| 栈 / Info Blk | 0x9FF90000 / 0x9FFFF000 | [实测] |
+
+### SM8250 DDR 布局（K40）
 
 | 区域 | 地址 | 大小 |
 |---|---|---|
@@ -85,15 +166,23 @@ redwood_buttons.c，其地址 0xc440000/0xc40a000/0xe600000 与 V60 实测完全
 | UEFI Stack | 0x9FF90000 | 0x00040000 |
 | Info Blk | 0x9FFFF000 | 0x00001000 |
 
-寄存器区（GSI/TLMM 三片 0x0F100000/0x0F500000/0x0F900000、USB、AOSS、SMMU、APSS_HM 0x17800000 等）同表，供 loader 页表与驱动引用。IMEM 0x14680000（Cookie 0x146BF000，与 restart reason 0x146bf65c 一致）。
+### TLMM 三片：基址已确认，引脚分配是**交错**的
 
-#### TLMM 三片 tile：基址已实测确认，但引脚分配是**交错的**
+基址（**以能工作的驱动为准**，不是按编号猜）：
 
-基址（上表的三片）已被两个独立来源确认：Mu-Silicium 的寄存器表，以及 XNU 内核里用 TDM 引脚
-（gpio 133/134/135/137）逐个候选基址试读——**只有 `0x0F100000` 读出合理的引脚配置**
-（`cfg 0x00000001`：pull 1、function 0、drive 2 mA），其余两处全 0。
+```
+WEST   0x0F100000    pins 133..179（TDM 133-137 在这里；hakios.amp.c 的探针也是这么认出来的）
+SOUTH  0x0F500000    pins 0..3, 24..27, 32..65, 69..76, 85..91, 125..132（触摸 33/39、马达 60/61）
+NORTH  0x0F900000    pins 4..23, 28..31, 66..68, 77..84, 92..124（SPI 8-11、TE 66、功放 114/119/120）
+```
 
-**但引脚属于哪一片不是连续分段**，这一点必须照抄上游表，不能按区间猜：
+每个引脚的寄存器间隔是 **0x1000**：`cfg` 在 `+0`（[1:0] pull，[5:2] function，[8:6] drive-1，[9] output），
+电平在 `+4` 的 bit0（输入）/ bit1（输出）。
+
+⚠️ 早期文档把这三个基址的名字写反过（说 NORTH=0x0F500000）。判断依据只有一条：**能跑的驱动在哪个基址
+上读写**——`hakios.goodix.c` 用 0x0F900000 配 gpio8-11、用 0x0F500000 配 33/39，触摸是通的。
+
+**但引脚属于哪一片不是连续分段**，必须照抄这张表，不能按区间猜：
 
 ```
 SOUTH   0..3      NORTH   4..23     SOUTH  24..27    NORTH  28..31
@@ -101,28 +190,87 @@ SOUTH  32..65     NORTH  66..68     SOUTH  69..76    NORTH  77..84
 SOUTH  85..91     NORTH  92..124    SOUTH 125..132   WEST  133..179
 ```
 
-现有驱动里的 `GPIO_BASE(n) = (n >= 4 && n <= 23) ? north : south` **只在它们用到的引脚上碰巧正确**
-（touch 的 8–11/33/39、haptic 的 60/61）。它对 28–31、66–68、77–84、92–124、133–179 全部算错。
-音频要用的 133–137 属于 **WEST**，照抄旧宏会写到 south 去（读回全 0，看起来像"引脚没配"，
-实际是地址错了）。
+老宏 `GPIO_BASE(n) = (n>=4 && n<=23) ? north : south` 只在本机用到的几个脚上碰巧对。音频要用的
+133–137 属于 **WEST**，照旧宏会写到 SOUTH 去，读回全 0，看起来像「引脚没配」。
 
 | 引脚 | 用途 | tile |
 |---|---|---|
-| 8–11 | 触摸 SPI（QUPv3 SE4 @ 0x990000） | NORTH |
+| 8–11 | 触摸 SPI（SE4 @ 0x990000） | NORTH |
+| 12 | 面板 reset | SOUTH |
 | 20 | WiFi `wlan-en` | NORTH |
+| 23 / 24 | 指纹 IRQ / reset（Goodix） | NORTH |
 | 33 / 39 | 触摸 reset / IRQ | SOUTH |
+| 51 | 面板 ESD 中断 | SOUTH |
 | 60 / 61 | 马达 I2C（SE11） | SOUTH |
+| 66 | 面板 TE | NORTH |
 | 114 | 两颗 CS35L41 的共用 reset | NORTH |
-| 119 / 120 | 功放 I2C（SE3 @ 0x98c000，SDA/SCL） | NORTH |
-| 133 / 134 / 135 / 137 | 三级 TDM：SCK / DIN / WS / DOUT（`mi2s2_*`，function 1） | **WEST** |
+| 119 / 120 | 功放 I2C（SE3 @ 0x98c000） | NORTH |
+| 133–137 | 三级 TDM：SCK / DIN / WS / DOUT（`mi2s2_*`，function 1） | **WEST** |
 
 ## 其余外设
 
 | 项目 | 状态 | 说明 |
 |---|---|---|
-| GPU | Adreno 650 | Mesa freedreno 支持成熟；HackiOS 的 Adreno 驱动基于 642L，同 a6xx 家族，需改地址/固件 |
-| Wi-Fi | **QCA6390**（`qcom,cnss-qca6390@b0000000`，wlan-en = TLMM gpio20） | **ath11k 官方支持的芯片**——HackiOS 的 ath11k-via-LinuxKPI 路线可直接走，不再是"未知"。⚠️ 需先有 PCIe 根复合体驱动（`qcom,pcie@1c00000/1c08000/1c10000`），XNU 侧目前完全没有 PCIe 代码；设备树里 MHI 挂在 domain 2 而 cnss 节点写 `wlan-rc-num = 0`，**两者不一致，动手前必须用运行时 `lspci` 核实** |
-| 音频 | 见 `alioth-audio-overlay.dtsi`（已下载） | **扬声器已实测到"可配置"**：两颗 CS35L41 挂在 `i2c@98c000`（QUPv3 SE3，SDA=gpio119/SCL=gpio120，复位=gpio114 低有效），DEVID `0x035a40`；内核能读能写，升压已按本机 1000 nH/15 µF/4000 mA 配好，模拟增益已从 19 压到 0。出声还差 ADSP + 三级 TDM（`0x9020`/`0x9120`）+ 使能。麦克风走 SoundWire（WCD938x），是另一套控制器 |
-| 相机 | IMX582 等（`alioth-sm8250-camera-*.dtsi`） | 最复杂，最后做 |
-| 指纹 | 侧边 Goodix 指纹 | iOS 无对应能力，忽略 |
-| 振动 | aw8697（与 HackiOS haptic 同款） | 可直接借鉴 |
+| GPU | ✅ 真机跑起来 | 见上 |
+| Wi-Fi | ❌ | **QCA6390**（`qcom,cnss-qca6390`，wlan-en = gpio20），走 PCIe；XNU 侧没有 PCIe 代码，`hakios.wifi.c` 还是 WCN6750 版本 |
+| 音频 | ⚠️ 部分 | 两颗 CS35L41 在 `i2c@98c000`（SE3，gpio119/120，reset gpio114），DEVID `0x035a40`，能读能写；出声还差 ADSP + 三级 TDM（0x9020 / 0x9120）。麦克风走 SoundWire（WCD938x） |
+| 振动 | ✅ | aw8697，与 HackiOS 同款；`fw-haptic` |
+| 相机 | ❌ | IMX582 等，最复杂，最后做 |
+| 指纹 | — | 侧边 Goodix（gpio23/24），iOS 无对应能力，忽略 |
+
+**`soc.args`**（`devices/alioth/soc.args`，由 `pull-soc.sh` 从真机 DTB 生成，`modem-cycle.sh` 自动拼进命令行）：
+
+```
+soc_ipa_base=0x1e40000   soc_gsi_base=0x1e04000   soc_ipcc=0x408000
+soc_rsc=0x18220000       soc_apps_smmu=0x15000000 soc_smem=0x80900000
+soc_imem=0x14600000      soc_ipa_stream=0x5c0     soc_ipa_stream_uc=0x5c2
+soc_pas_ipa=0xf          soc_ipa_fw=ipa_fws
+```
+
+## 启动参数速查（本机常用）
+
+```sh
+# 一个能用的系统：GPU + 触摸 + 电池，120 s 后自己回 loader
+DEVICE=alioth XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 rd=md0 battery=1" \
+  XL_SECS=120 ./xl run
+
+# 放着不动，直到 xl stop
+DEVICE=alioth XL_SECS=0 XL_CMDLINE="…同上…" ./xl run
+
+# 量帧率（配 RC_JOBS=rc.jobs.fps 构建的小镜像）
+… touch_lat=1 glframes=1 …   # 然后 tools/frames.py logs/<run>.log
+```
+
+按功能分类的常用参数（完整名单见各处 `TUNABLE`/`PE_parse_boot_argn`）：
+
+| 目的 | 参数 |
+|---|---|
+| 内核在哪跑 | `bootcpu=7`（大核）、`cpus=8`、`cpufreq=1` |
+| 超时 | `XL_SECS=N`；`0` = 永不（`loader_return_after=0`） |
+| 系统 | `rd=md0`（用常驻 RAM 里的系统镜像）、`battery=1`、`touchscreen=1` |
+| 显示 | `fb_hz` `fb_beat` `fb_threads` `fb_queue` `fb_filter` `display_step` `display_probe` `display_te`(`_delay`) `display_hz`(`_delay`) `display_bl`(`_ramp`) `display_hs` `display_read` `display_dma_at` `display_dma_own` |
+| 绘制 | `gl=1` `glwait` `glcopy` `glblit` `glframes=1` `gltrace=A-B` `glskip` |
+| GPU 驱动 | `adreno=N` `adreno_speed=N` `adreno_keep=1` `adreno_only=N` `adreno_skip=0xMASK` `adreno_pause=MS` `adreno_fine=1` |
+| 触摸 | `touchscreen=1` `touch_power` `touch_spi_hz` `touch_flip` `touch_swap` |
+| 测量 | `touch_lat=1`（`tools/frames.py`/`latency.py`）、`cpuload=MS`、`rec_secs=N`（录屏） |
+
+## 踩过的坑（按"疼"排序）
+
+1. **`DEVICE=alioth` 不能忘**。`xl` 和 `mkxnuimg.py` 默认是 POCO，UEFI 地址不同，刷进去进不了 loader。
+2. **`gpu=1` 在这台机器上必然被拒**，别浪费时间看它为什么"没生效"。用 `adreno=22 adreno_keep=1`。
+3. **触摸供电是 L10/L1**，不是 L11/L2（老文档错了）。写错的表现是「引脚都配了但读不到芯片」。
+4. **`tools/modem-cycle.sh` 曾经无条件把 `tools/macos-bin` 放进 PATH**，Linux 上 `timeout`/`stat`
+   是 MacPorts 的壳，于是 `fastboot` 全部失败、loader 明明在却报 `loader did not come up on USB`。
+   现在只有 Darwin 才加。
+5. **loader 重启过就必须重新 `xl ramdisk userland/system.apfs`**（2.4 GB，约 90 s），否则根分区是空的，
+   内核 panic 在 `Process 1 exec of /sbin/launchd failed, errno 2`。
+6. **常驻镜像不认识工作目录**：`xl run` 会打印它是从哪个 worktree 传的、多大。看到了就读一眼——
+   上一轮残留的镜像会让这一轮以完全无关的方式失败。
+7. **`XL_CMDLINE=` 给空串等于 `-v`**：`${XL_CMDLINE--v}` 只在变量**未设**时用默认值。
+8. **给 TLMM 引脚算错 tile** 时读回全 0，看起来像「硬件没响应」，其实是地址错（见上面的交错表）。
+9. **改文件用 UNC 路径（`\\wsl.localhost\…`）会把 0755 变成 0644**，`./xl`、`tools/*.sh` 会
+   `Permission denied`。改完 `chmod 755`，或者按 `git ls-files -s` 里的模式恢复。
+10. **绿屏不是坏了**：loader 交还控制权时整屏涂色表示结局——绿=跑完、琥珀=停在 checkpoint、
+   红=早期异常、紫=panic、蓝=selftest。看到绿屏说明这一轮**正常结束**了；要它一直跑用 `XL_SECS=0`。
+11. **改内核要改 `xnu-src/xnu-8796.121.2/`，不是 `xnu/files/`**（后者是 `export.sh` 的产物）；
+    增量构建没动静时删掉 `BUILD` 重编（19.8 秒）。

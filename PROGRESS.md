@@ -1,5 +1,36 @@
 # 移植进度日志
 
+> **这是一份按时间顺序追加的日志，不是入门文档。** 3500 多行从 2026-10-26 一直写到现在，
+> 越往下越新；早期段落里的结论有很多已被后来的实测推翻，**不要从第 1 行开始读**。
+>
+> 想了解某个子系统现在是什么状态，先看这两份，它们按"现在怎么办"组织、随改动更新：
+>
+> | 想知道 | 看哪 |
+> |---|---|
+> | 这台手机怎么启动、参数怎么给、踩过哪些坑 | [`devices/alioth/README.md`](devices/alioth/README.md) |
+> | 某个寄存器/引脚/时序到底是多少 | [`devices/alioth/hardware.md`](devices/alioth/hardware.md) |
+> | 所有 boot-arg 的完整清单 | [`docs/ru/notes.md`](docs/ru/notes.md) |
+>
+> 这份日志的用处是别的：**为什么**会走到今天这一步——每个坑当时是怎么发现的、
+> 错误结论是怎么被证伪的、哪些方案试过并且否决了。查"这条结论有没有证据"时来这里。
+>
+> 下面是几处入口，按问题找，不要顺序读：
+>
+> | 问题 | 段落 |
+> |---|---|
+> | 整条链路最早是怎么搭起来的 | [2026-10-26 上午](#2026-10-26-上午第-0-阶段完成-基座内核构建成功) |
+> | UEFI 与 loader 首测 | [2026-10-26 中午](#2026-10-26-中午uefi-loader-真机首测成功) |
+> | GPU 从零到画出第一帧 | [10-27](#2026-10-27a650-基础访问完成) · [10-28 secure mode](#2026-10-28-上午a650-走出-secure-modesecure-mode-死结解开) · [10-28 第一帧](#2026-10-28-上午a650-阶段-22-gpu-画出第一帧并上屏成功) |
+> | 触摸坐标错位 | [2026-10-28 凌晨](#2026-10-28-凌晨ft3658u-触摸坐标定位修复完成已实测验证) |
+> | 屏幕"冻住"其实是跑完了 | [2026-10-28 傍晚](#2026-10-28-傍晚屏幕冻住连时钟都不走的定案-是跑完了不是死机) |
+> | 壁纸黑、小组件空白 | [2026-10-30 深夜](#2026-10-30-深夜壁纸没了小组件空白-是镜像里的作业表不是渲染) |
+> | 120 Hz | [10-31 凌晨](#2026-10-31-凌晨120-hz-的-dcs-通路打通了面板还没换挡) · [10-31 凌晨 续](#2026-10-31-凌晨120-hz-上去了-唯一的坎是命令从哪一页内存发) |
+> | 亮度条、音量条没反应 | [2026-10-31 凌晨（二）](#2026-10-31-凌晨二亮度为什么调不动-请求走到了-corebrightness然后没地方去) |
+> | **当前停在哪、下一步做什么** | **[文末「22:40 今晚结论汇总」](#2240-今晚结论汇总用户要求记录后停手)** |
+>
+> 段落标题里的日期是我自己写的，锚点按 markdown 规则生成（空格转连字符、去掉标点）；
+> GitHub 上点不动就按 `Ctrl+F` 搜标题原文。
+
 ## 2026-10-26 上午：第 0 阶段完成 + 基座内核构建成功
 
 ### 手机数据采集（全部完成，存档于 `dump/`，清单见 dump/README.md）
@@ -1984,3 +2015,1600 @@ WSL2 里系统 fastboot 看不到 USB，本机靠 `/usr/local/bin/fastboot` 转�
 
 同一天重建了 git 历史：原来 4 个提交压成一个初始提交并 force push，旧哈希 `7590a6d`/`a4272dd`/`4a7aa4f`/
 `e1d3f1f` 不再存在，文档里引用的它们只当历史记录看。
+
+## 2026-10-30（二）：从零跑通一遍、macOS shim 的 PATH 陷阱、GPU 的正确参数
+
+### 从零复现（这一步是为了证明仓库能独立站住）
+
+新 clone 到 `~/hackios-alioth`，然后严格按 README 的顺序：
+
+```
+xnu/apply.sh            → XNU 源码 c54f35ca，打 185 个补丁文件
+setup.sh                → 交叉工具链
+./xnu-build.sh          → mach.development.bcm2837，15,210,808 字节
+tools/fetch.sh          → iOS 16.5 IPSW，7.4 GB
+REST=1 GL=1 userland/build.sh   → root.apfs 6,266,880；system.apfs 2,486,968,320
+make phone
+```
+
+结果是 `=== 36 checks, 0 failed ===`、`surf_test: 80 checks, 0 failed`、SpringBoard 4.76 s 起、日志
+1,467,622 字节 / 10,715 行。也就是说仓库里该有的都在，跑不起来只可能是本地状态或路径的问题——
+后面那条 PATH 陷阱就是这么找出来的。
+
+### Windows 只剩「插拔 USB」
+
+`<主机>\Develop\iOSOnAndroid` 清空（9.7 G），保留的数据（platform-tools、dump、firmware、
+twrp-alioth.img、证据日志，共 650 M）挪到 `<主机>\Develop\alioth-local`，不参与版本控制。
+`/usr/local/bin/fastboot`、`/usr/local/bin/adb` 现在是两个壳，直接 exec platform-tools 里的 `.exe` 并
+`tr -d '\r'`（fastboot 37.0.1 / adb 1.0.41 已验证）。除了把手机插到这台上，全部工作在 WSL 里。
+
+### `tools/modem-cycle.sh` 把 macOS 的 shim 装到了 Linux 上
+
+症状：`make phone` 打印 `xl: loader did not come up on USB (state: fastboot)` 两遍，然后
+`modem-cycle.sh: the run never started`。但同一时刻 `./xl state` 明明说 `loader`，手机就在 loader 上。
+
+原因在脚本第 7 行：**无条件**把 `tools/macos-bin` 放到 `PATH` 最前。那里的 `timeout` 和 `stat` 是
+`exec /opt/local/bin/gtimeout|gstat` 的壳（MacPorts），Linux 上不存在。于是 `xl` 里每一条
+`flock ... timeout 10 fastboot ...` 都直接失败（`tools/macos-bin/timeout: 2: exec: /opt/local/bin/gtimeout:
+not found`），`is_loader()` 的 `fb getvar product` 读不到 `product: xnuloader`，`state()` 就把一台正在
+loader 上的手机判成 `fastboot`，`enter()` 于是永远等不到、永远不发 payload。
+
+判据很干净：同一台手机、同一时刻，普通 `PATH` 下 `./xl state` = `loader`，modem-cycle 的 `PATH` 下 = `fastboot`。
+修复是加一个和 `xl:49` 一样的条件：
+
+```sh
+[ "$(uname)" = Darwin ] && PATH=$PWD/tools/macos-bin/platform-tools:$PWD/tools/macos-bin:$PATH
+```
+
+顺手补了两处：
+
+- `./xl run ... | tail -2` 之后检查 `${PIPESTATUS[0]}`。`xl run` 在内核缺失或 payload 做不出来时会
+  **什么都没传就返回**，脚本接着去 `ls -t logs/*-run.log.live`，读到的就是上一轮的日志，还被当成这一轮的。
+- `tools/modem-cycle.sh` 在 git 索引里是 644，而 `Makefile:84` 直接执行它——干净的 clone 上 `make phone`
+  会 `Permission denied`。改成 755（和 `xl`、其它 tools 一致）。
+
+### `XL_SECS=0`：一次运行不超时
+
+原来最长 `XL_SECS` 秒后内核自己交还控制权。看一个放着不管的系统（动画、待机）时这没用。现在
+`XL_SECS=0` → payload 的 `loader_return_after=0`，`xnu/files/osfmk/arm64/loader_return.c:464` 把 0 读作
+「永不」，`xl` 那边也不再设 deadline，运行只由 `xl stop` 结束。`xl` 头部说明同步改了。
+
+顺带记一条容易踩的：`args=${XL_CMDLINE--v}` 是「变量没设时用 `-v`」，不是「空时」。想要不 verbose 启动
+就显式给非空值（比如 `XL_CMDLINE="gl=1 ..."`），给空串等于 `-v`。
+
+### GPU：`gpu=1` 在 alioth 上是**被设计拒绝**的
+
+`gpu=1` 是 `adreno=21 adreno_skip=0x1c00 adreno_pause=0 adreno_keep=1` 的简写（`hakios.adreno.c:4735`），
+而 `hakios.adreno.c:4815` 对 alioth 明确拒绝：*"REFUSED: alioth has only standalone SM8250 steps 1 to 22"*。
+这不是退化，是 A6xx 那一串寄存器步骤按 SoC 分档，SM8250 只做到 22。
+
+能用的是**直接点名最后一步并留住 GPU**：
+
+```
+gl=1 adreno=22 adreno_keep=1
+```
+
+`adreno=22` 跑完第 22 步，`adreno_keep=1` 不让它停——第 22 步之后服务 `HakiosGPU` 才会被
+`HakiosGPUStart()` 启动（`iokit/Kernel/hakios.gpu.cpp`，msm ioctl），Mesa 的 freedreno 才有东西可用，
+CoreAnimation 才会把帧交给它。**少了 `adreno_keep=1` 就等于 21 步做完收摊**，屏幕上看起来和没有 GPU 一样。
+
+验证成功的标志（本轮日志）：
+
+- `hakios-gl: an OpenGL ES 3 context for CoreAnimation, by Mesa, off-screen (OSMesa): OpenGL ES 3.2 Mesa 25.0.7; FD650`
+- `adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU`
+- `Software renderer` / `no GPU to draw with`：0 次（没有 GPU 时每次界面重绘都打一条）
+- `vibrant views are plain`：0 次（半透明模糊回来了）
+- SpringBoard 5.32 s 起，GPU 305 MHz，48–50 °C
+
+`adreno=22` 之后 GPUCC 的默认档位是 **index 1 = 305 MHz**（`0/305/400/441.6/490/525/587/670` 八档中的第二档）。
+
+### 电池：`battery=1` 还要 loader 给的地址
+
+`hakios.battery.c:183` 只认 `battery=1`，但第 184 行还要 `battery_shared_pa`——由 loader 放在命令行里
+（日志里能看到 `battery_shared_pa=0x00000000a1012000`）。所以 `battery=1` 单独写是对的，前提是走
+`xl run`/`make phone` 让 loader 一起上；手工拼命令行漏掉它，驱动会一声不响地不加载。
+
+### 这一轮确认过的完整启动参数
+
+```
+DEVICE=alioth XL_SECS=0 \
+XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 rd=md0 battery=1" \
+./xl run
+```
+
+### 改内核文件的两个坑（这一轮各踩一次）
+
+1. **`xnu/files/` 不是构建的输入**。构建读的是 `xnu-src/xnu-8796.121.2/`。改 `files/` 里那份再编，
+   编译器一声不响地什么都不做（`.o` 的时间戳都不变）。顺序是：在 `xnu-src` 里改 → `xnu/export.sh`
+   把结果写回 `files/`（`xnu/README.md` 第 44 行就是这么写的）。这一轮新的 `display_te` 就是这样落的。
+2. **增量构建会卡在 `check_all_exports` 上，而且这次它挡住的不是结尾而是全部**。表现是
+   `bsd/` 根本没重编、内核文件时间戳还是旧的（大小 15,210,808 不变）。`-k` 也没用。
+   可靠的做法是把整个 `BUILD` 删掉重编：**19.8 秒**，内核仍是好的（末尾照旧只有那几条已知无害的
+   exports/symbolset 报错，`xnu/README.md` 也说了「看文件日期，不看 make 的退出码」）。
+
+### 绿屏 = 这一轮正常结束
+
+loader 交还控制权时整屏涂色说明结局（`xnuloader/loader.c:3267`）：**绿**=跑完按时交还、**琥珀**=停在
+checkpoint、**红**=早期异常、**紫**=panic（文字留在屏上）、**蓝**=selftest。所以量帧率时用
+`XL_SECS=30/260` 跑完看到绿屏是预期行为；想让它一直不结束就用 `XL_SECS=0` 再 `xl stop`。
+
+### 还没解决的：帧率
+
+画面能动但很慢——时钟几秒一跳、点图标要十几秒才开。已知的闸门有三层，下一轮按这个顺序量：
+
+1. **显示驱动自己的节拍**：`MiniIOMobileFramebuffer.cpp:79` `kFBRefreshHz = 60`，`fb_hz` 可改（1–240）。
+   帧只在 1/60 s 的节拍上上屏（`fb_beat=0` 取消节拍）。CoreAnimation 不读这里的 vsync 通知，而是按它
+   读到的速率自己起拍——所以 `fb_hz` 同时决定「最多多少帧」和「CoreAnimation 以为该画多少帧」。
+2. **GPU 档位**：305 MHz。八档里这是第二低。
+3. **真正的绘制耗时**：`touch_lat=1`（每帧 `tl:` 行，`tools/latency.py`）、`glframes=1`（每帧一行，
+   `tools/frames.py`）、显示驱动自己的统计行（「from one frame to the next: … under 10/18/26/35 ms」）。
+   没有这三个数之前不要猜是 GPU 还是 CPU 还是上屏拷贝。
+
+至于这个手机在安卓上能跑 120 Hz：那是 panel 的 DSI 时序 + 面板初始化序列（天马 k11a，
+`mdss_dsi_k11a_38_08_0a_dsc_cmd`，DSC、CMD 模式）决定的，而现在的驱动只往 bootloader 留下的
+splash framebuffer（0x9C000000）里画，**从不碰 DSI 时序**。`hakios.display.c` 也只有 `display_step`
+一个参数，全部是只读的寄存器观测。要把面板开到 120 Hz 得先有自己的 DSI host 驱动（时序表、
+`dsi_panel_pwr_supply_vci` → pm8150a_l11、reset gpio12、TE gpio66），这是另一件事，和现在的掉帧是两回事：
+现在连 60 Hz 的节拍都没喂满。
+
+### 量过了：现在是 58 fps，天花板是面板的 60 Hz
+
+上面三条闸门，这一轮把 1 和 3 量了。
+
+**用 `tools/frames.py` 量的（`RC_JOBS=rc.jobs.fps` 的镜像 + `touch_lat=1`，260 秒，GPU 开、
+其余默认）**：25 个手势、**1,238 帧上屏**，全部手势合计 **1,064 个帧间隔，20% 超过 16.7 ms、
+2% 超过 33 ms**；每个手势单独看是 **43–61 fps**，多数在 57–60。慢帧的时间去向（均值）：
+draw 2–11 ms、gpu 2–9 ms、copy 2–4 ms、**idle before 6–25 ms**——也就是说慢帧不是在等 GPU，
+是窗口服务器自己没按时交帧（在等一次 commit）。显示驱动自己的统计同样印证：
+`from one frame to the next: 0 under 10 ms, 113 under 18, …`，一半在 17 ms。
+**「巨卡」「完全没有动画」是软件渲染器时代的事**，GPU 回来后它不再是瓶颈。
+
+**面板到底多少 Hz，用 TE 引脚数的（新增 `display_te=SECONDS`，`hakios.display.c`）**：
+TE 是 gpio66（NORTH tile，`cfg 0x4` = function 1、无上下拉），读它的电平位、忙循环采样 3 秒：
+
+```
+display: TE: 182 pulses in 3 s = 60.666 a second (from 5353016 samples, 2693331 of them high)
+```
+
+**60 Hz**，而且 TE 是占空比约 50% 的方波（不是窄脉冲），所以这个数不会有采样漏计的问题。
+TE 的周期就是面板的刷新周期——bootloader 给面板配的是设备树里的 `timing@0`（60 Hz）。
+于是：
+
+- `fb_hz=120` 现在**没有意义**：我们的节拍可以到 120，但面板每 16.7 ms 才取一帧，多写的那些白搭。
+- 想上 90/120，必须让面板换档：DCS `0x60` 写 `0x10`（并保持 `d1 2e`，见 `hardware.md` 的三档表）。
+  这条命令要走 DSI 的 command DMA——寄存器映射已经摸清（`display_step=7` 的 dump 里，
+  `CMD_DMA_CTRL/CMD_CFG1/DMA_BASE/DMA_LEN/TRIG_CTRL` 都在，连 bootloader 上次发的那 8 个字节都在），
+  但**这条写路径本内核还从来没走过**，PROGRESS 里「没人看着不写活着的显示控制器」的结论仍然成立。
+- 就算面板换成 120 Hz，渲染侧也不够快：慢帧的 draw+gpu+copy 加起来 11–16 ms，而 120 Hz 的预算是 8.3 ms。
+  换档之前得先把这三项压下去（GPU 到 670 MHz、`fb_threads` 加核、`fb_beat=0` 去掉等节拍）。
+
+---
+
+## 2026-10-30 深夜：壁纸没了、小组件空白 —— 是镜像里的作业表，不是渲染
+
+**现象**（用户报的，三条互相独立）：桌面背景纯黑、两个小组件是纯白空块但文字标签正常、音量上键没反应。
+
+### 壁纸与小组件：先证伪渲染路径
+
+`glcopy=1`（每个 IOSurface 走处理器拷贝而不是共享）跑一轮，240 秒后截图：**照样纯黑、照样白块**。
+所以跟 eagl 的 surface 共享/blit 无关，也不是 `adreno_speed`/`fb_threads`（上一轮已排除）。
+
+### 真正的原因：`Could not find job` 与只有 25 个作业的镜像
+
+这一轮的 launchd 日志里有 43 条：
+
+```
+com.apple.xpc.launchd <Error>: Could not find job with label com.apple.chronod
+```
+
+小组件是 `chronod` 画的，壁纸是 `PosterBoard` 画的，两个进程**根本没被加载**。
+`userland/root/LaunchDaemons` 只有 **25** 个 plist，就是 `build.sh` 里 `IOS_JOBS` 的默认那一串
+（notifyd … runningboardd … SpringBoard … wifid），`chronod` 不在里面。
+`mkjobs.py` 的 `REST=1` 才会把其余 382 个守护进程也写进镜像（`MachServices` 有、程序在的才要，
+去掉 `RunAtLoad/KeepAlive`，用到才启动）。**这就是"以前能用、现在又不能"的东西：镜像是用哪套参数建的。**
+
+### 修法与验证
+
+```sh
+cd userland && GL=1 REST=1 SYSTEM=1 ./build.sh      # 作业 25 -> 407，含 com.apple.chronod.plist
+cd .. && ./xl stop; ./xl ramdisk userland/system.apfs   # 2371 MB，97 s，24 MB/s
+XL_SECS=0 XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 rd=md0 battery=1" ./xl run
+```
+
+- 日志：`(user/501/com.apple.chronod [87]) <Notice>: Successfully spawned chronod[87] because ipc (mach)`，
+  之后 chronod 给 `CLKWatchFaceLibrary` 等一堆服务建 stub，没崩。
+- 截图：**蓝/青/黄/橙渐变壁纸回来了**；Weather 小组件显示 "No weather data"，Calendar 小组件显示
+  "FRIDAY / 30 / No events today"。图标行、Search 药丸、Dock 全部正常。
+- 小瑕疵：`(com.apple.chronod) <Error>: Invalid type for plist importer (key: ThrottleInterval type: string),
+  accepted types: [integer]` —— 某个作业的 plist 里 `ThrottleInterval` 是字符串，launchd 拒收这一项，不影响启动。
+
+### 两条要注意的
+
+- **`xl ramdisk` 在跑的时候会被拒**（`xl: a run is in progress`）。换镜像之前必须 `xl stop`，等它真回来再传。
+  另外 `xl` 早就不用 `DEVICE=` 了——`DEVICE` 只影响 `mkxnuimg.py`/`make` 打出来的 payload 与 `soc.args`。
+- **速度**：手机开机比想象的快，150 秒足够截图；240 秒是白等。
+
+### 发烫
+
+`cpufreq=1` 的日志是明写的：`cpufreq: group 2 (1 of our cores): row 20 -> 20 of the frequency table, 3187 MHz`
+—— `raise_domain()` 把 EPSS 的 perf state **直接写到每个 cluster 的最高行**，不是设一次上限、让硬件自己降频，
+所以 8 个核全部钉在各自最高频。以前只有 25 个作业时机器基本空转，看不出来；现在 407 个作业真起来几十个
+守护进程，满频 + 真负载 = 烫。
+
+**对照跑过**（同镜像、同参数，只去掉 `cpufreq=1`）：
+
+| | `cpufreq=1` | 不带 |
+|---|---|---|
+| 渲染层每帧 | 3570 µs | 3413 µs |
+| 壁纸 / 小组件 | 正常 | 正常 |
+
+差 4%，不值得为它把八核钉在最高频。**默认不要再带 `cpufreq=1`。**
+（`bootcpu=7` 保留：那只是把内核放在大核上跑，不涉及频率。）
+
+### 还没修
+
+音量上键：固件没有把 PM8150 的 SPMI GPIO6 配成带上拉的输入，`hakios.buttons.c` 有意不去写 PMIC，
+所以按了永远读不到。要修就得加一段 SPMI 写：`MODE` 改成输入、`PULL_CTL` 开上拉、`EN_CTL` 打开。
+
+
+
+## 2026-10-31 凌晨：120 Hz 的 DCS 通路打通了，面板还没换挡
+
+### 三个 bug，一个比一个靠里
+
+**1. `dsi` 是 0 —— `Kernel data abort … pc hz_thread, far 0x48`**
+
+第一次 `display_hz=120` 直接 panic。只有 panic buffer 才有答案：`ESR 0x96000005`（translation
+fault，level 1）、`FAR 0x48`、`x0 = 0`。0x48 正是 `DSI + DMA_BASE` 的偏移——`dsi` 这个映射只在
+`display_thread` 里做（`display_step` 那条路），`hz_thread` 自己的 `dsi` 还是 0。
+现在是一个 `display_map()`，两个线程共用，谁先到谁建。
+
+**2. 点火寄存器写错了地址 —— `TRIG_CTRL +0x084` 只是"触发源"**
+
+修好映射后不再 panic，但日志说：
+
+```
+display: dcs 60: len 4, trigger 0x4 -> 0x5 after 100000 us
+```
+
+`0x4 -> 0x5` 说明那一比特根本没自清——因为 **+0x084 是 TRIG_CTRL，它配置的是"由谁触发"**
+（`DMA_TRIGGER` 在 bit 0..2，`0x4 = TRIGGER_SW`），真正的一次性点火在 **`TRIG_DMA`，+0x090**。
+依据是 Linux 的 `drivers/gpu/drm/msm/registers/display/dsi.xml`（6G host 全部 +4）：
+`dsi_cmd_dma_tx` 最后调 `msm_dsi_host_cmd_xfer_commit`，写的是 `DMA_BASE`、`DMA_LEN`、`TRIG_DMA=1`。
+同一张表也解释了从机读到的每个数：`CMD_DMA_CTRL 0x14000000` = FROM_FRAME_BUFFER(bit28)
+| LOW_POWER(bit26)，`CMD_CFG1 0x13c2c` = wr-mem-start 0x2c / continue 0x3c / INSERT_DCS_COMMAND，
+`TRIG_CTRL 0x4` = TRIGGER_SW。
+
+**3. 不再往 bootloader 的缓冲里写**
+
+包字节改成写自己 `kmem_alloc_contig` 的一页（加 `ml_io_map_unmappable` 的 uncached 映射，
+`dsb` 之后再点火），`DMA_BASE` 用完还原成 bootloader 留下的值。原来那 8 个字节在
+`0x9aead000`，属于谁不知道，往里面写就是无声的内存破坏。
+
+### 现在到哪一步
+
+```
+display: command buffer: 0x92ac4000, a page of our own; the bootloader had left 0x9aead000
+display: dcs 60: len 4, 2000 us, intr 0x501, status0 0, trig ctrl 0x4, dma ctrl 0x14000000
+display: dcs f0 (long): len 8, 100 us, intr 0x501, …
+…（7 个包，全部 intr bit0 = CMD_DMA_DONE，无 ERROR 位）
+display: the panel was asked for 120 a second (display_te counts what it now does)
+display: TE: 182 pulses in 3 s = 60.666 a second
+```
+
+命令**确实上了线**（100 µs 就 done，说明不是没发出去），但 **TE 还是 60.666**。两种可能还没分辨：
+
+1. 面板收到了但没换挡（smart fps，或者要 MDP 侧时序跟着改）；
+2. 面板根本没收到（LP 模式、时序、或主机这边的模式不对）。
+
+### 下一刀：亮度就是判据
+
+k11a 的背光是 DCS 0x51（`bl_ctrl_dcs`，大端，最大 0x7ff），所以加了 `display_bl=1..0x7ff`：
+屏幕变亮 = 面板确实收到包；不变 = 命令通路本身还差东西。日志侧永远是 `intr 0x501`，
+它只能证明 DSI 主机把包推上去了，证明不了面板收到。
+
+### 顺带：设备树里 k11a 的三档（`dump/twrp-fdt.dts` 26971 起）
+
+| timing | framerate | vbp / vfp | clockrate | mdp-transfer-us | 切换命令里的关键字节 |
+|---|---|---|---|---|---|
+| timing@0 | 0x3c = 60 | 0x230 / 0x258 | 0x4190ab00 (1.1 GHz) | 0x36b0 = 14000 | `60 00` + `d1 2e` |
+| timing@1 | 0x5a = 90 | 0x118 / 0x12c | **同一个 0x4190ab00** | 0x251c = 9500 | `60 10` + `d1 6e` |
+| timing@2 | 0x78 = 120 | 0x08 / 0x04 | **同一个 0x4190ab00** | 0x1b58 = 7000 | `60 10` + `d1 2e` |
+
+三档的 panel clockrate 完全一样，所以换挡不需要动 DSI/PHY 的 PLL——这点对"只发 DCS 就能换"
+是好消息；但 `mdp-transfer-time-us` 三档不同，说明 **MDP 侧也要跟着改**，而这正是 bootloader
+留在 60 Hz 的那一套。
+
+---
+
+## 2026-10-31 凌晨：loader 上了网却没 USB，其实是它把自己当成了 QEMU
+
+### 现象
+
+跑完几轮内核（其中有一轮 panic、loader 报过 `core 600 is not off … not the kernel's to take`
+和 `THE KERNEL LEFT CORE 500 RUNNING`）之后，手机屏幕上有 XNULOADER 的字，PC 上
+`fastboot devices` / `adb devices` / `xl state` 全是空，Windows 连"未知设备"都没有。
+拔插 USB 无效；`xl reboot` 之后重新 `xl enter` 也还是起不来。
+
+### 屏幕上那行 Synchronous Exception 就是答案
+
+```
+Synchronous Exception at 0x00000000A10026D8
+```
+
+loader 的 PE `/base` 就是 `0xA1000000`（`xnuloader/build.sh` 里写着），所以这是 **RVA 0x26D8**。
+把 `prebuilt/loader.efi` 按 PE 节表映射后反汇编：
+
+```
+26c0:  mov  w27, #0x8
+26cc:  movk w27, #0x902, lsl #16      ; w27 = 0x09020008
+26d8:  strh w9,  [x27]                ; ← 崩在这条 store
+```
+
+`0x09020000` 在 `loader.c` 里只有一处：`FW_CFG_BASE`，QEMU virt 的 fw_cfg。
+
+### 根因：平台靠 framebuffer 基址认，认不出就当 QEMU
+
+`efi_main` 里：
+
+```c
+PLAT = &platform_qemu_virt;
+… SCREEN.base = GOP->mode->fb_base;
+for (…) if (platforms[i]->fb_base == SCREEN.base) PLAT = platforms[i];
+if (PLAT == &platform_qemu_virt) ramfb_phone_screen();     /* 写 0x09020000 */
+print("display %d x %d at %x\n", …);                     /* 这句在崩溃点之后 */
+```
+
+alioth 的判据是 `fb_base == 0x9C000000`。**那一次固件报的不是这个数**，于是平台留在 QEMU virt，
+`ramfb_phone_screen()` 去写 fw_cfg，在真机上就是同步异常；而唯一能说明"固件报了哪个地址"的那行
+恰好写在后面，所以屏幕上永远看不到。
+
+### 修法（`xnuloader/loader.c`）
+
+- `print("display … at %x")` **提到** `ramfb_phone_screen()` 之前；
+- `ramfb_phone_screen()` 只在 `SCREEN.base == platform_qemu_virt.fb_base`（`0xE1000000`）时调用。
+
+改完第一次启动，同一块板子报的是 `display 1080 x 2400 at 9c000000` / `platform alioth` /
+`usb: started`——说明 fb_base 平时是对的，是那一两次启动的固件状态让 GOP 报了个别的值。
+**以后再遇到，屏幕会先打出那个地址**，按那个地址补一条 `platforms[]` 或者加别的判据就行，
+loader 不会再崩在 fw_cfg 上。
+
+### 还有一个坑：`xl enter` 自己要 `DEVICE=alioth`
+
+`xl enter` 内部调 `mkxnuimg.py` 时**不带 `-d`**，而 `mkxnuimg.py` 的默认设备是 `poco-x5-pro`
+（只读 `$DEVICE`）。所以从 Android/fastboot 拉 loader 必须 `DEVICE=alioth ./xl enter`，
+否则打出来的是 POCO 的镜像（1.47 MB，alioth 是 1.99 MB），刷进去自然起不来 loader。
+
+## 2026-10-31 凌晨：120 Hz 上去了 —— 唯一的坎是"命令从哪一页内存发"
+
+### 结论
+
+DCS 命令通路一直是好的，包格式、触发寄存器、模式都没错。**坏的是命令缓冲区的地址**：
+
+| 发送用的页 | 日志 | 面板 |
+|---|---|---|
+| 内核 `kmem_alloc_contig` 的 `0x92ac4000` | `intr 0x501, status0 0, ack err 0`，100 µs 完成 | **一动不动** |
+| bootloader 留在 `DMA_BASE` 的 `0x9aead000` | 同样 `intr 0x501, status0 0, ack err 0` | 亮度立刻变，随后 TE **121.333/s** |
+
+两次的代码、包字节、寄存器顺序完全一样，只有 `DMA_BASE` 的值不同。也就是说
+**`CMD_DMA_DONE` 只能证明"主机把一次传输跑完"，不能证明"面板收到"**——上一次记在
+PROGRESS 里的那个判断要往后挪一位：不是面板不听话，是 MCU 读到的是垃圾。
+
+### 怎么逼出来的：让亮度渐变，然后只换地址
+
+上一节留下的判据是"亮度变了 = 面板收到包"。但一次单步 0x7ff→0x3c 在绿屏上根本看不出来，
+所以先加了 `display_bl_ramp=1`：0x7ff → 0x20 → 0x7ff，40 ms 一步，来回三轮，约 9 秒，
+`dsi_quiet` 关掉中间那一百来行日志。第一次跑（自己的页）——屏幕从头到尾没变。
+换 `display_dma_at=0x9aead000` 重跑——**"亮度变了"**。
+
+### 为什么
+
+MSM 的 DSI 命令 DMA 是**总线主设备**，它按 `DMA_BASE` 去读内存，走的是显示侧的地址窗口
+（这一代 SoC 上显示自己的 SMMU/预留区），而不是"AP 能访问就算数"。bootloader 那一页是它自己
+刚刚发过命令的地方，当然在窗口里；内核 `kmem_alloc_contig` 出来的普通物理页不在。
+所以现在的默认值是**直接沿用 `DMA_BASE` 里 bootloader 留下的值**（它读到的地方，显示一定能读到），
+每次发包前保存那一页的前 16 字节、发完写回去：
+
+```
+display: command buffer: 0x9aead000, the bootloader's own page, the one the display can reach; the bootloader had left 0x9aead000
+```
+
+- `display_dma_at=ADDR`：指定别的地址（`0x9E200000` 之类落在 `cont_splash_region` 里的位置，
+  还没试过，留作把这一页"合法化"的方向）；
+- `display_dma_own=1`：回到内核自己那页，也就是反例，留着当对照；
+- 真正的修法是找到显示 SMMU 的上下文、把我们自己的页映射进去，这件事还没做。
+
+### 120 Hz 的实测
+
+```
+display: asking the panel for 120 a second: 7 packets, each one a DCS write
+display: dcs 60: len 4, 100 us, intr 0x501, status0 0, ack err 0, …
+…（7 个包全部完成）
+display: TE: 728 pulses in 6 s = 121.333 a second (from 9504614 samples of gpio 66, 62086 of them high)
+```
+
+`display_te_delay=25` 让计数窗口落在切档之后，所以 121.333 是**切档后**的读数，
+不是把开机那 20 秒算进去的平均。k11a 的 `timing-switch-command` 是 `dsi_lp_mode`，
+我们默认就是 LP（`dma ctrl 0x14000000`），和 vendor 一致；`display_hs=1` 那条 HS 路没再需要。
+
+### 还没做（要给 120 Hz 配上"合理调度"，这几件事都得动）
+
+- **`fb_hz` 还是 60**：面板 120 Hz 了，但 iOS 的上屏节拍还是每 60 Hz 一帧。真正的 120 Hz 画面
+  要把 `fb_hz=120` 一起带上（`MiniIOMobileFramebuffer` 的 `kFBRefreshHz` 也是 CoreAnimation 读到的值）；
+- **MDP 侧没动**：`mdp-transfer-time-us` 三档是 14000 / 9500 / 7000，MDP 现在还是 bootloader 的
+  60 Hz 那一套。面板在命令模式下按 TE 取帧，TE 120 了 MDP 也会被拉成 120 次/秒推帧，
+  但每一帧的传输时间预算没跟着改，重活的时候要重新量；
+- **功耗**：AMOLED 面板自刷新在 120 Hz 下空转也更费电。要"坚固"，得有 idle 回 60、用起来才 120 的
+  策略（vendor 靠 `mi,mdss-dsi-smart-fps` + `dfps_data_region@9e300000` 那套做动态帧率切换）。
+
+### 顺带：绿屏不是故障
+
+跑完一轮之后整屏 `(32,128,64)`，是 loader 的 `ending = 0xff208040`——"内核跑完、正常交还控制权"
+的颜色（见 `xnuloader/loader.c` 的返回色表）。所以亮度测试要放在**内核还活着的时候**看，
+`display_hz_delay`（默认 20 秒）之后、`loader_return_after`（`XL_SECS`）之前。
+
+## 2026-10-31 凌晨（二）：亮度为什么调不动 —— 请求走到了 CoreBrightness，然后没地方去
+
+### 证据链，从 iOS 里往外
+
+1. **SpringBoard 的滑杆是走的**。日志里 backboardd 自己打：
+
+   ```
+   backboardd [Backlight] Setting CoreBrightness backlight factor:1.000000 with fade duration:0.185000
+   backboardd [Backlight] Set BrightnessSystem property:DisplayBrightnessFactorWithFade to:1
+   ```
+
+   说明 `BKSHIDServicesSetBacklightFactor…` → backboardd → CoreBrightness 这一条是通的。
+
+2. **CoreBrightness 找的是 IOKit 服务，不是 framebuffer**。framebuffer 的 user client 在
+   backboardd 里只被用了 4/5/12/79 号 selector（swap begin/end、power change、get block），
+   没有任何亮度 selector；反编译字串里却有
+   `BCAppleBacklightBrtControl initWithService:`、`AppleBacklightBrtControlGetRegistryID`、
+   `Unable to find backlight service.`、`AppleBacklight` / `AppleARMBacklight` 两个类名。
+
+3. **本内核以前没有这个服务**，所以第 1 步的请求进了 CoreBrightness 之后再没有下一步，
+   滑杆自然什么都没发生。
+
+### 做了什么
+
+`iokit/Kernel/MiniAppleBacklight.cpp`：照类名发布 `AppleBacklight` 和 `AppleARMBacklight`
+（`IOServiceMatching` 比的是实例的**类名**，所以类必须就叫这个名字），user client 记录
+selector/scalar（标量与 float 两种读法都打出来）、结构体大小，并回填零输出。
+两个类**不互为父子**（共同基类叫 `MiniBacklightService`）：`metaCast` 会把子类也算进去，
+`AppleARMBacklight : AppleBacklight` 会让匹配 `AppleBacklight` 一次返回两个服务。
+
+现在内核日志里能确认服务是起来了：
+
+```
+AppleBacklight: published as AppleBacklight, provider GenericARMPE
+AppleBacklight: published as AppleARMBacklight, provider GenericARMPE
+AppleBacklight: 2 services published, the user client asked for 0 times
+```
+
+最后那个 `0 times` 是 bsd_init 刚跑完时的读数（backboardd 还没起来），**不是结论**。判断用的
+是启动后每 20 秒打一次的同一行：如果到 iOS 桌面之后还是 0，说明 CoreBrightness 根本不按
+`AppleBacklight` 这个类名找（下一步去翻 dyld cache 里的匹配路径）；只要不是 0，
+`CLIENT OPENED` 和随后每一条 `selector N` 行就是**协议本身**，照着接
+`hakios_display_set_brightness()` 即可（`backlight_dcs=1` 已经会把这个 level 按 float/整数
+两种解释映射到 0..0x7ff 再发 DCS 0x51）。
+
+脚本：`tools/backlight-test.sh`（等手机 → 修槽位 → 起 loader → 补 resident 镜像 → 跑 →
+截图 → 汇总 AppleBacklight / TE / amp 三组日志）。`amp_step=2` 顺带带上，读-only。
+
+### 这一轮的坑（都已写进 devices/alioth/README.md）
+
+- **`fastboot boot` 全线 `Failed to load/authenticate boot image: Load Error`**：不是 AVB、不是镜像，
+  是 ABL 把槽位标成了 `slot-unbootable:b: yes`（`xl reload` 把手机冷重启回 Android，Android
+  没起来被记了一次失败）。`fastboot --set-active=b` 一行修好，之后同一份 `xnu-usb.img` 立刻
+  `Booting OKAY`。**连原版 TWRP 都拒**，所以别去怀疑镜像。
+- **loader 重启后 resident 镜像就没了**：直接 `xl run` 会在 launchd 处 panic
+  （`Process 1 exec of /sbin/launchd failed, errno 2`）。README 原来就写了，这次又踩了一遍。
+- **`loader_return_after=0` 的代价**：没有一个定时返回兜底，内核/loader 一旦挂死（USB 端点还在、
+  一个命令都不回），手机只能长按电源。凌晨这次就挂在 `xl run` 之后，`fastboot getvar product`
+  报 `AdbWriteEndpointSync failed (121)`，等了 20 分钟没看门狗。**去现场重启一下即可**，
+  不是变砖。
+
+### 下一轮要看的
+
+- 桌面起来后 `AppleBacklight: … asked for N times` 的 N；
+- 有 N 的话，第一条 `selector …` 的标量/结构体；
+- 顺带 `amp:` 开头那几行（CS35L41 在不在 I2C 上、DEVID 是不是 0x35a40）。
+
+
+### 挂死之后为什么没有被看门狗救回来
+
+loader 的 `run_on_other_cpu()` 里，虚拟看门狗（Qualcomm Haven，SMC `0x86000007`）由 loader 这个核
+喂到 `budget + 60` 秒，之后交给内核；内核只有在 **`hv_wdt_pet=1`** 时才喂
+（`osfmk/arm64/loader_return.c`）。默认没有这个参数，而 `budget`（= `loader_return_after`）是 0，
+所以 60 秒以后没人喂、`WDT_BITE_MS=30000`，理论上 90 秒就该复位——实际等了 20 分钟手机还
+枚举着，说明这台机器上 `wdt_armed` 本来就是假（SMC 的 pet 调用没成功）。
+
+结论：**不要指望看门狗把挂死的跑法救回来**。`loader_return_after=0` 的跑法一旦 loader 的
+USB 端点死了，只能长按电源重启。判断方法：设备还枚举着、但
+`fastboot getvar product` 报 `AdbWriteEndpointSync failed (121)`，就是这种情况，不是变砖。
+
+
+## 2026-10-31 凌晨（三）：手机挂死，改在离线准备电池项的“问卷”
+
+### 手机的状态（未恢复）
+
+02:35 又探了一次：`xl state` 说 fastboot，实际是 Windows 上
+`USB\VID_18D1&PID_D00D\XNULOADER` 这个接口还在、但
+`getvar product` / `getvar slot-unbootable:b` 全部 `AdbWriteEndpointSync failed (121)`；
+`Get-Process fastboot` 是空的（没有僵尸进程占着设备）。也就是说还是第二轮里那个“loader 的 USB
+端点死了”的状态，`loader_return_after=0` 的跑法没有兜底，**只能长按电源**。按约定停在这里等用户，
+没有再去碰设备状态（没有盲试 `oem`/重启命令）。
+
+### 这段时间做了什么：第 3 项（电池显示）的证据准备
+
+亮度那项现在卡在“等手机回来看 `asked for N times`”，扬声器那项也一样要上机；电池这项里
+还有一段可以离线做完的：**状态栏那个电池图标到底是什么类、有哪些方法**。
+
+已经确认的（上一轮的像素证据）：填充 ~81 %、“81”在里面、闪电在、充电时填充是**白色**。
+真机充电时填充是**绿色**，而颜色不是 `chargePercent`/`showsPercentage`/`_shouldShowBolt`
+这三个钩子管的——所以下一步需要知道 `_UIBatteryView` 用哪个属性/方法决定颜色。
+
+这次没有去猜一个选择器就硬钩（钩错了会给没充电的手机画绿色，或者什么都不画），而是让
+日志自己说。在 `userland/src/inject_sb.c` 里加了一次性的**方法问卷**：
+
+- `battery_survey_class()`：用 `class_copyMethodList` 列出实例方法和类方法，只打印名字里带
+  battery/charge/percent/bolt/color/fill/level/state 的（大小写不敏感），每条带**去掉 slide 的
+  地址**和类型编码；另外用 `class_copyIvarList` 把同类的 ivar 连偏移一起打出来
+  （颜色很可能就是一个 ivar，例如 fill color / charging 状态）。
+- 类表：`_UIBatteryView`、`UIStatusBarBatteryItemView`、`UIStatusBarBatteryPercentItemView`、
+  `_UIStaticBatteryView`、`_UIStatusBarBatteryItem`。
+- 时机：启动后 **90 秒和 240 秒**各打一次。只打一次会丢——loader 每次 `XL_FOLLOW` 只取环形
+  缓冲区尾部，启动瞬间那几行很容易夹在两次抓取之间（第一轮的教训）。
+- 输出走 `say()`（stderr → 控制台 → 运行日志里 `hakios:` 前缀那一类），不需要额外 boot arg。
+
+日志里落地后，要看的就三件事：`_UIBatteryView` 有没有 `setBatteryState:`/`batteryState`/
+`chargingState`/`fillColor`；`UIStatusBarBatteryItemView` 是不是真正在画状态栏（它是不是持有
+一个 `_UIBatteryView`——有 `setBatteryView:` 的话就是）；以及那个 ivar 里有没有颜色。
+
+### 顺便：共享缓存里找私有方法地址（离线尝试，未完成但记下进展）
+
+想不靠手机就把 `-[_UIBatteryView setBatteryState:]` 的未 slide 地址从 dyld 共享缓存里读出来，
+做了这些（都是 `20F66__iPhone10,3_6` 这套分片缓存）：
+
+- 主缓存 `dyld_shared_cache_arm64` 里 0x270 开始的 32 字节记录就是 **路径 → mach-o 地址**表
+  （`q0=loadAddress, q1=modTime(0), q2=inode(0), q3=path 文件偏移`），共 2711 个镜像；
+  UIKitCore 在 `0x188d7a000`。
+- 分片缓存每个文件头里 `mappingOffset/mappingCount`（0x10/0x14，一个 mapping 32 字节）就能
+  建出 vm→(文件, 偏移) 的映射；`dyld_shared_cache_arm64.27.dylddata` 这类文件 mapping 的
+  **fileOffset 不为 0**，不能假设“vm - 基址 = 文件偏移”。
+- UIKitCore 是“预优化”镜像，**没有 `__objc_classlist`**；class_t 在 `__DATA_DIRTY.__objc_data`，
+  在这套缓存里是 **40 字节**（isa、superclass、cache、vtable、data），不是运行时的 48 字节；
+  指针带 tag（`0x02 << 40`，`v & 0xFFFFFFFFFF` 才是地址）。
+- `class_ro_t` 还是老布局：+0x18 是类名指针，+0x20 是 baseMethods。`_UIBatteryView` 的类 ro
+  在 `0x1d5cc5770`（flags 0x184），方法表在 `0x189e45df8`，header `0xc000000f / 0x6d`，
+  共 **109 个方法**。
+- 方法表项是 12 字节相对偏移，但**偏移是相对“字段自己的地址”**：IMP = `(entry+8) + impOffset`
+  正好对上已知的五个地址（例如 `showsPercentage` = `0x189a9370c`，解析出 `0x189a93704 + 8`；
+  `setChargePercent:` = `0x18928d310`，解析出 `0x18928d308 + 8`）。**名字（nameOffset）没解出来**：
+  `entry + nameOffset` 落在字符串中间，`& ~3` 的 selref 假设也不成立。109 条里能稳定对上
+  IMP、对不上名字——下次要么按运行时问卷（已加好，最省事），要么继续啃 nameOffset 的低两位
+  语义。
+
+### 影像已经重新打好（等手机回来就能用）
+
+`userland/obj/libhakios.sb.dylib` 02:44 重新编译通过；`build.sh system.apfs` 默认**不会**因为
+dylib 变了就重建镜像（它的重建条件只看 stage0 / manifest / cryptex），必须 `SYSTEM=1`，否则
+镜像还是旧的（这次先踩了一遍：system.apfs 时间戳仍停在 23:46）。`SYSTEM=1 ./build.sh system.apfs`
+之后新镜像才带着这份问卷。
+
+### 下一轮（手机回来之后）
+
+1. 长按电源 → `tools/backlight-test.sh`（看 `AppleBacklight: … asked for N times`）；
+2. 同一次跑法的日志里找 `hakios: battery survey:` 那几行（90 s / 240 s 两拨），
+   据此决定第 3 项的颜色钩子；
+3. 亮度如果 N>0，就看 `CLIENT OPENED` 和 `selector …`，接 `hakios_display_set_brightness()`。
+
+
+### 02:55 这一轮的离线证据：CoreBrightness 到底按哪个类名找
+
+又探了一次手机：还是 `AdbWriteEndpointSync failed (121)`，没有恢复，继续等。
+
+趁这段时间把 dyld 缓存（`20F66__iPhone10,3_6`）里两个类名字符串的**出处**查清楚了
+（方法：主缓存 0x270 的“路径→mach-o 地址”表 + 每个镜像自己的 `__TEXT` 段范围）：
+
+| 字符串 | 出现在 | 说明 |
+|---|---|---|
+| `AppleARMBacklight` | **CoreBrightness**（`0x1af0e46b0`）、PowerlogLiteOperators | 16.5 的亮度栈按这个名字找 IOKit 服务 |
+| `AppleBacklight` | **BrightnessControl.framework**（`0x202552482`）、PowerlogCore、PowerlogHelperd | 旧名字，BrightnessControl 还在用 |
+| `BacklightControl - Primary` | **CoreBrightness**（`0x1af0e39e2`） | 它给这条亮度控制起的名字（日志/模块名） |
+| `DisplayBackLightArchitecture` | **CoreBrightness**（`0x1af0df3ee`） | 决定走“老架构（Apple*Backlight 服务）”还是新架构（IOMFB/DCP 的 `brightness-nits`） |
+
+同一个 CoreBrightness 里还有 `IOServiceFirstMatch`、`IOMFBBrightnessLevel`、`brightness-nits`、
+`dcp-brightness-node`、`backlight-level`、`new-backlight-architecture` 这些字符串——也就是说
+它**两条路都有**，走哪条由 `DisplayBackLightArchitecture`（型号/预设）决定。
+
+对我们的意义：内核现在 `backlight=1 backlight_arm=1` 同时发布两个类名，**两个框架都能找到**，
+所以 `asked for N times` 如果是 0，问题就不在类名上，而在下面某一个：
+
+1. 服务不在它搜索的父节点/路径里（我们是挂在 `GenericARMPE` 下的）；
+2. 它先读 `DisplayBackLightArchitecture` 走了 IOMFB 那条路（那就要在 framebuffer 服务上提供
+   `brightness-nits` / `IOMFBBrightnessLevel` 属性，而不是 Apple*Backlight 服务）；
+3. 它要求服务有某些属性（`BacklightControl - Primary` 之类）才认。
+
+这三条都要等 N 的值才能判断，不先改代码。
+
+
+### 03:10 又一层离线证据：从 iOS 内部看这个服务在不在
+
+手机还是 `(121)`，继续等。这轮把“N 的两种可能”里能提前做的准备做了：
+
+1. **反汇编 CoreBrightness 里引用 `AppleARMBacklight` 的代码**（`__text` 里 adrp+add 定位，
+   共 5 处：`0x1af06732c`、`0x1af068390`、`0x1af068e0c`、`0x1af068e60`、`0x1af06bc6c`）。
+   形态都是 `adrp/add x1, "AppleARMBacklight"` 紧接 `bl 0x1afb35c1c`（同一段代码里前面还有
+   `ldr w0, [全局]` → `bl`，再把另一个字符串 `0x1af0f78db` 放进 x3 去调用）。这些 `bl` 落在
+   **分支岛**里（0x1afb3xxxx，不是 `__stubs` 0x1af0d7b50–0x1af0d8a98），没有符号表就分不清
+   被调的是 `IOServiceMatching` 还是日志/遥测函数，**所以不下结论**——但“字符串确实作为参数
+   出现在代码里”是确定的（不是只躺在字符串表里）。
+   跟进了一句：`0x1afb35c1c` 不在任何镜像的段里，是缓存自己的**跳板岛**；岛里的条目是 12 字节的
+   `adrp x16 / add x16 / br x16` 链，要接着走下去得解 `LC_DYLD_CHAINED_FIXUPS` 的 import 表
+   才能知道最终符号。**这条线先停**：同样的答案，一次带 `asked for N times` 的跑法就能给，
+   不值得在没有手机的时候继续啃。
+
+2. **在 iOS 内部加了一个直接探针**（`userland/src/inject_sb.c`，`backlight_probe()`）：
+   SpringBoard 启动 95 s / 245 s 时用 `IOServiceGetMatchingService(0, IOServiceMatching("…"))`
+   分别查 `AppleBacklight` 和 `AppleARMBacklight`，用 `IORegistryEntryGetPath` 打印服务在
+   registry 里的**完整路径**。日志行是
+   ```
+   hakios: backlight probe: AppleARMBacklight -> IOService:/GenericARMPE/AppleARMBacklight
+   hakios: backlight probe: AppleBacklight: no such service in the registry
+   ```
+   这行的用处：内核那条 `asked for N times = 0` 时，如果探针**能**匹配到，说明 userland 看得见、
+   是 CoreBrightness 自己没找（名字/路径/架构判断的问题，看路径就知道该不该改父节点）；
+   如果探针也匹配不到，那就不是 CoreBrightness 的问题，而是服务根本没进 userland 能看到的
+   registry（发布/权限）。
+3. `tools/backlight-test.sh` 会把 `backlight probe:` 那几行一起打出来。
+
+镜像重新打一次（`SYSTEM=1 ./build.sh system.apfs`），跑法不变。
+打好了：`userland/obj/libhakios.sb.dylib` 02:53（91,328 字节，`strings` 里有 5 条
+`battery survey` + 3 条 `backlight probe`），`userland/system.apfs` 02:54（2,486,968,320 字节）。
+
+
+### 03:25 服务挂在哪：loader 的 device tree 里确实有 arm-io
+
+手机还是 `(121)`。这轮查的是“N=0 的第三条可能：路径不匹配”里能离线确认的部分：
+
+- `xnuloader/loader.c` 建 DT 时**有 `arm-io` 节点**（`dt_begin(&w, "arm-io")`，3119 行），
+  下面只有 `isp`（cam=5 时）、`gic`、`uart0`，**没有 display/backlight 节点**。
+- 内核里我们的服务是 `GenericARMPE.cpp:304` 调 `MiniAppleBacklightStart(this)` 发布的，
+  provider 就是 PE 本身；也就是说现在 iOS 看到的路径是
+  `IOService:/<PE 的名字>/AppleARMBacklight`，**不是** `IOService:/arm-io/AppleARMBacklight`。
+
+所以如果回来以后 `asked for N times` 是 0、而 `backlight probe:` 能匹配到并打印出
+`IOService:/GenericARMPE/AppleARMBacklight` 这样的路径，下一步就是**把服务挂到一个叫
+`arm-io` 的 IOService 底下**（在 PE 里建一个空壳 IOService、`setName("arm-io")`、
+`registerService()`，再把 Apple*Backlight attach 到它下面）。这样做只赚不亏：
+`IOServiceMatching` 是全 registry 匹配、不看父节点，路径查找则只有挂对了父节点才成立。
+现在不改——`IOServiceMatching` 依然是最可能的写法，一次跑法就能判定。
+
+
+### 03:35 扬声器这一项的离线盘点：固件缺一半
+
+手机还是 `(121)`。把第 2 项能用得上的素材点了一遍：
+
+- `alioth-local/firmware/fw-audio/`：`adsp.mdt` + `adsp.b00`–`adsp.b18`，这是 **ADSP 的固件**
+  （WCD938x codec 的驱动跑在 ADSP 里）。这东西在。
+- **CS35L41 自己的 DSP 固件不在**：`alioth-local/dump` 是一堆单独文件（boot/dtbo/gpt/dmesg…），
+  不是 vendor 分区；`find alioth-local -iname "*cs35l41*"` 没有结果。
+- 结论：功放要么按**无 DSP 直通模式**初始化（初始化寄存器序列自己写，工作量在《几百个寄存器》
+  这个量级），要么先补一份 `/vendor/firmware`（`cs35l41-dsp1-spk-prot.bin` /
+  `cs35l41-dsp1-spk-cali.bin`）再走 smart-amp 路径。
+
+已写进 `devices/alioth/README.md` 的扬声器一节。**这不是这一轮的主线**，只是把“缺什么”记清楚，
+免得下次从零开始查。
+
+
+### 03:50 修掉一个会让证据白跑的时间错：脚本读日志太早
+
+对了一遍时间线：`backlight-test.sh` 原来在 `HOME_WAIT=150` 秒后截图、再等 **130** 秒就读
+`.live`，也就是 `xl run` 之后约 280 秒。可 SpringBoard 不是 t=0 起来的（内核 + launchd + 应用
+注册，大约要一分钟以上），问卷在 **SpringBoard 启动后 90 s 和 240 s** 才打，探针是 95/245 s——
+240 s 那一拨落在 run 之后 300 秒上下，**原来那一下会正好错过它**（这正是第一轮“只打一次会被
+环形缓冲截掉”的同类错误，只不过这次是脚本读早了）。改成截图后再等 **240** 秒（约 run 后
+390 秒），无论 SpringBoard 晚到什么时候，第二拨问卷和探针都已经在日志里。`bash -n` 通过。
+
+
+### 04:05 顺手堵掉“旧日志冒充新日志”
+
+`backlight-test.sh` 原来用 `ls -t logs/*.live | head -1` 找日志——如果这次跑法根本没写出
+`.live`（loader 挂死、刚进 loader 就断），它会捡到**上一次跑法的** `.live`，然后拿旧数据当
+这次的结论（和之前的教训同一条：一次跑法只看一次生成的日志）。现在改成只认 **mtime 晚于
+本次 `xl run` 启动时刻**的 `.live`：
+
+```
+started=$(date +%s)                     # 起跑前记下
+live=$(find logs -maxdepth 1 -name '*.live' -newermt "@$started" -printf '%T@ %p\n' |
+       sort -rn | head -1 | cut -d' ' -f2-)
+```
+
+没有这样的文件就走“no live log yet”分支、只打本次 run 自己的日志，不再看旧的。
+`find -newermt` 在 WSL 的 GNU find 上实测可用（`@0` 能找到现存两个 `.live`，`@now` 为空）。
+
+
+### 04:30 `DisplayBackLightArchitecture` 不是可以改配置绕过的开关
+
+在 `sysimage/rootfs` 整棵树上搜这两个键，**只有 `usr/libexec/backboardd` 一个文件命中**
+（没有 plist、没有默认值文件）。看 backboardd 里那串字符串的上下文：
+
+```
+DisplayBrightnessFactorPending / DisplayBrightnessFadePeriod / DisplayBrightnessFactorWithFade
+com.apple.backboardd.backlight.changed
+DisplayBackLightArchitecture
+backlight dim/off
+```
+
+它夹在 backboardd 的一堆**显示属性名**中间（旁边就是 `com.apple.backboardd.backlight.changed`
+这种属性/通知名），也就是说这是 backboardd 从显示模块（CoreBrightness 的 CBDisplayModule*）
+拿到的**运行时属性**，不是读 Preferences 的键——**不能靠改 plist 强制走老架构**。
+所以“它是不是走了 IOMFB 那条路”只能从 `asked for N times` / 探针路径来判断，配置这条捷径不存在。
+
+
+## 夜间总结（给早上看的版本）
+
+**手机从 01:56 起挂死**：loader 的 USB 端点死了（设备还枚举成
+`Android Bootloader Interface / VID_18D1&PID_D00D\XNULOADER`，但所有命令
+`AdbWriteEndpointSync failed (121)`；没有僵尸 fastboot 进程；`loader_return_after=0` 时看门狗
+也不会救）。**需要你长按电源**；按不动就先插充电器等一分钟。
+
+**其余全部就绪**（没有提交代码）：
+
+| 项 | 状态 | 设备回来后怎么验 |
+|---|---|---|
+| 1 亮度滑杆 | 内核发布 `AppleBacklight`/`AppleARMBacklight` 服务并计数；CoreBrightness 按 `AppleARMBacklight`、BrightnessControl 按 `AppleBacklight` 找（已从缓存定位）；SpringBoard 里加了 registry 探针 | `tools/backlight-test.sh`：看 `asked for N times` 和 `hakios: backlight probe:` 的路径 |
+| 2 扬声器 | 已确认滑块/音量键都到了内核、写进来的就是静音；硬件链缺 CS35L41 初始化 → TDM → ADSP；ADSP 固件在，CS35L41 的 DSP 固件不在 | `amp_step=2` 的行（身份）+ 决定走无 DSP 直通还是先补 `/vendor/firmware` |
+| 3 电池 | 数值/闪电正常、颜色不绿；为“改哪个属性”加的问卷已烘焙（90/240 秒两拨） | 同一次跑法里的 `hakios: battery survey:` 行 |
+
+一条命令（会自动等手机、修槽位、补上传 resident 镜像、跑 120 Hz + 背光 + amp 只读，约 7 分钟
+后汇总四组日志）：
+
+```
+tools/backlight-test.sh
+```
+
+
+
+
+
+
+
+
+
+
+## 08:05 现状：手机又卡在"设备在、命令全超时"，这次需要长按电源
+
+`fastboot devices` 显示 `???????????? fastboot`，Windows 里是
+`USB\VID_18D1&PID_D00D\XNULOADER`（loader，不是 ABL），所有命令
+`AdbWriteEndpointSync failed: 信号灯超时时间已到 (121)`，`fastboot reboot` 也一样发不进去。
+WSL 这边不是管理员，禁用/启用 USB 设备那条路走不通（`IsInRole(Administrator)` = False），
+所以**没有软件办法让它重启**，只能长按电源。
+
+今天 07:47 之后每一轮都是同一个结尾：内核起来之后 20 秒到 2.5 分钟之内，loader 就不再回答。
+
+| 轮次 | 用的内核 | 结尾 |
+|---|---|---|
+| 07:47 | 02:08 | 68 秒 panic：`Process 1 exec of /sbin/launchd failed, errno 2`（root 是空的，见第一条） |
+| 07:53 | 02:08 | 起跑约 150 秒后 mute；又过约 2 分钟手机自己复位回 ABL（`product: alioth`） |
+| 08:01 | 07:56（新内核） | 起跑 20 秒内就 mute：`XL_FOLLOW=20` 的第一份 `.live` 就没取到；一直 mute 到现在 |
+
+三次里只有 07:47 留下了原因（panic）。07:53 和 08:01 什么都没留下，因为 loader 在被问之前
+就已经不说话了。
+
+**一处我自己的错误，记在这里**：往 PROGRESS.md 追加下面这段（第一次尝试）时 heredoc 引号写错，
+正文里的命令被 shell 执行了，其中有一条 `fastboot reboot`（输出 `Rebooting FAILED ... (121)`）。
+从时间上看那台设备在它之前约 20 秒（08:01:55 的第一次 `.live` 抓取）就已经不回答，所以它不像是
+起因；但这件事是我不对，`PROGRESS.md` 当时还被写坏了 40 行，已经用 `head -n 2748` 截回去了。
+
+## 今天做的三处修改
+
+1. **`xl` 的 `enter()`：新起来的 loader 一定没有 resident 镜像，把 `$PHONE.ramdisk` 删掉。**
+   07:47 那次就是因为这个记录还留着 01:54 的上传，`xl run` 什么都没传就开跑，root 是空的，
+   于是 `launchd ... errno 2`。文件头注释也补了一句：resident 镜像跨 run 存活，不跨 loader 重启。
+2. **`tools/backlight-test.sh` 起跑时带 `XL_FOLLOW=20`。** `XL_SECS=0` 时 `xl run` 只在 run 结束
+   才取日志，脚本却要在 run 中间读，之前那份 `.live` 根本没被生成过；现在每 20 秒一份，
+   真被复位也留得下最后 20 秒。
+3. **`tools/backlight-test.sh` 加 `SCREENSHOT=0` 开关。** 截图是 10 MB 的 `get_staged`，
+   和 loader 每 2 秒的轮询同时发生；07:53 那次复位前最后一件大事就是它（疑点，不是结论）。
+
+## 新内核：把"第二种到达方式"也接住了（已编译，未验证）
+
+`MiniAppleBacklight.cpp` 加了 `MiniBacklightService::setProperties(OSObject*)`：
+
+- IOKit 里这个方法是虚的（`IORegistryEntry.h:661`），userland 的 registry 写入
+  `is_io_registry_entry_set_properties`（IOUserClient.cpp:4015 起）先查 allowable 列表，
+  没有就直接调它，所以服务截得到；
+- macOS 那套亮度栈正是 `IOServiceMatching("AppleARMBacklight")` +
+  `IORegistryEntrySetCFProperty(IODisplayParameters)`，**根本不开 user client**，所以
+  `asked for 0 times` 不等于 "CoreBrightness 没找它"，属性写入是另一半证据；
+- 顺带一个事实：`IOService` / `IORegistryEntry` 自己都没实现 setProperties（基类返回
+  `kIOReturnUnsupported`，什么都不存），没有这个 override 时这类写入是**既被拒绝又被忽略**；
+- 新代码把写入的字典按键打印到深度 3（正好覆盖 `IODisplayParameters > brightness > value/max`），
+  有 `{value, max}` 就按 `value * 0x7ff / max` 换成分辨率亮度，`backlight_dcs=1` 时照旧发 DCS 0x51，
+  最后把 `IODisplayParameters` 存进服务自己的属性。
+- 构建：`./xnu-build.sh` 链接成功（`mach.development.bcm2837` 07:56，里面有
+  `properties written on` 和 `level %llu of %llu -> panel` 两个新字符串）；结尾的 export check
+  报错是 README 里写过的已知无害项（看文件日期，不看退出码）。
+  **注意：08:01 那轮就是第一轮用这个内核，20 秒内 mute，所以这个改动还没有任何运行时证据。**
+
+## 手机回来后按这个顺序做（每轮都有界）
+
+1. `tools/backlight-test.sh`：会自动等手机、修槽位、补上传 resident 镜像（约 90 秒）。
+2. 若还想排查"为什么 loader 中途不说话"，先用
+   `SCREENSHOT=0 XL_SECS=180 tools/backlight-test.sh`：内核 180 秒后自己回来，
+   日志一定拿得到，不用靠 loader 在 run 中间回答；
+3. 对照实验里唯一还没排除的差异是 boot args 里的 `amp_step=2`（01:33 那次活过 10 分钟的运行
+   没有它）。要么去掉它跑一轮，要么保留它、把 `amp_step` 从 1 开始逐个加，看那一行之后 loader
+   是否还回答。
+
+## 08:10 离线：loader 为什么会在 run 中间"不说话"
+
+读 `xnuloader/loader.c` 和 `osfmk/arm64/loader_return.c`，串起来是这样：
+
+- 内核每 10 秒更新一次 `loader_live.heartbeat`，用的是 `thread_call_enter_delayed`
+  （`loader_return.c:585`），不是中断里，所以**线程调用被饿住时会停**。
+- loader 在 `run_on_other_cpu()` 里盯着它：`SILENCE_SECONDS = 50`（loader.c:920），
+  心跳停 50 秒就判定"内核悬死"。
+- 判定的后果（loader.c:3197 起）：`hc_take_back("the kernel hung")` → 打印
+  `THE KERNEL HUNG on core %x: no sign of life for 50 seconds; its log follows` →
+  `set_result("hung", …)` → 把内核日志写出去 → 返回菜单。
+
+所以 07:53 那次"两分钟后自己回到 ABL"很可能就是这个分支：内核（或它的心跳线程）停了
+50 秒以上，loader 收工。
+
+而 08:01 那次**第一份 `.live`（起跑 20 秒）就没取到**，这比 50 秒的判定还早，所以
+"心跳超时"解释不了它；要么是 loader 的 USB 服务在这之前就不工作了，要么是
+`hc_take_back`（等 UFS 控制器空闲）在内核核心还占着的时候把自己锁死——后者能解释
+"设备还在、永远不说话、也永远不重置"。这两种目前都只是假设。
+
+下一轮值得的两个选项（都还没有做）：
+
+1. 给 `SILENCE_SECONDS` 一个 boot arg（比如 `kernel_silence=120`），先区分"内核真的悬死"
+   和"只是某一段时间心跳被饿住"；
+2. 在 `hc_take_back` 前后各打一行到 loader 屏幕/日志，下次 mute 时至少知道它卡在哪。
+
+**注意**：loader 的改动要 `DEVICE=alioth ./xl reload` 才会生效，而且 reload 本身要重新打
+loader 镜像——手机还在 mute 的时候不要做。
+
+## 08:22 根因找到了：`backlight-test.sh` 的 boot args 从来没进过内核
+
+`tools/backlight-test.sh` 第 31 行定义了 `ARGS=`，然后**没有任何地方把它交给 `xl`**。
+`xl run` 的写法是 `local args=${XL_CMDLINE--v}`，而脚本从来没设 `XL_CMDLINE`，所以每次跑的
+都是 loader 自己的最小配置：
+
+```
+cmdline: debug=0x8 cpus=1 rd=md0 loader_return_after=0 epoch=1793404076 sb_delay=8 -v
+```
+
+（这是 07:47 那次 panic 日志里的原话。`-v` 是 `xl` 的默认值，原样进了 cmdline。）
+
+对照 01:33 那次活过 10 分钟的 run：
+
+```
+cmdline: debug=0x8 battery_shared_pa=... loader_return_after=0 epoch=... sb_delay=8 gl=1 adreno=22
+adreno_keep=1 touchscreen=1 bootcpu=7 cpus=8 rd=md0 battery=1 backlight=1 backlight_arm=1
+display_hz=120 display_hz_delay=5 fb_hz=120
+```
+
+也就是说 07:47、07:53、08:01、08:11 这四轮：
+
+- **`cpus=1`（loader 补的默认值）、没有 `bootcpu=7`**：内核只在一个小核上跑，
+- 没有 `gl=1 adreno=22 adreno_keep=1`：没有 GPU，画面靠软件路径，
+- 没有 `battery=1`：电池页不读，
+- **没有 `backlight=1 backlight_arm=1`：`AppleBacklight`/`AppleARMBacklight` 服务根本没发布**，
+  `asked for N times` 这个判据这四轮里一次都没被真正问过，
+- 没有 `display_hz=120`、没有 `amp_step=2`。
+
+所以"`asked for 0 times`"之类的结论**不能用**——问题不在 CoreBrightness，在这行脚本。
+
+**这也很可能就是手机每轮 mute 的原因**：单核 + 没有 GPU 的 iOS 启动在 loader 看来就是心跳停了
+（`SILENCE_SECONDS = 50`），loader 判"内核悬死"、`hc_take_back`，然后 USB 就不再说话；
+有时能走到 watchdog 复位回 ABL，有时卡在那里等人按电源。08:10 那段把 50 秒判定当成主要嫌疑，
+现在看它只是**症状的出口**，真正的原因是内核根本没按能跑起来的那套参数启动。
+
+修法（已改，`bash -n` 通过）：
+
+```
+XL_FOLLOW=${XL_FOLLOW:-20} XL_CMDLINE="$ARGS" ./xl run > "$log" 2>&1 &
+```
+
+另外脚本现在会把参数打出来：`backlight-test: boot arguments: gl=1 adreno=22 ...`，
+一眼就能看出这轮到底带没带。
+
+**下一轮开始之前先确认这一行**：run 的日志里 `cmdline:` 必须含 `backlight=1 backlight_arm=1
+bootcpu=7 cpus=8`；不含就说明还没修好，别拿那一轮的数据下结论。
+
+## 08:25 另一个把判断带偏的东西：Windows 侧的 fastboot 僵尸进程
+
+`xl` 的 `timeout N fastboot …` 只杀 WSL 这侧的转发，Windows 的 `fastboot.exe` 有时会留下来并
+占着设备；之后所有调用都会"看不到设备"或 121 超时。今天 08:14–08:24 我连续探了二十多次手机，
+每次都可能在 PC 上留下一个，于是把"PC 不让我看"误当成"手机没响应"。
+
+判据（已写进设备 README）：
+
+- 先 `Stop-Process -Name fastboot -Force` 全部杀掉，**等 2 秒**，再只发一条
+  `fastboot getvar product`；
+- `fastboot devices` 列出 `????????????  fastboot`（序列号是问号）就是"设备在、命令不进"；
+  真正的 ABL 是 `<序列号>  fastboot`，xnuloader 是它自己的名字；
+- 杀干净之后仍然是 121 → 才是手机侧的问题。
+
+时间线对齐一下：08:08:54 手机确实回来过（`product: alioth`），08:11:00 起跑了那轮
+`XL_SECS=180`，约 20 秒后 loader 就不再应答；08:12 之后我的探测本身已经不可靠，
+所以"它到底哪一秒 mute 的"目前只有 .live 一份都没取到这一个证据。
+
+## 08:30 为什么"mute"其实是必然的：kernel 和 loader 抢同一个核
+
+`xnuloader/loader.c:2754`：
+
+```
+uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
+```
+
+默认 `kernel_mpidr == this_mpidr`，只有 cmdline 里有 `bootcpu=N` 才会改（2769 行）；改过之后
+3157 行会打 `the kernel will run on core %x (this is core %x)`。而 3192 行是：
+
+```
+if (kernel_mpidr != this_mpidr) { run_on_other_cpu(...); }   /* loader 留在自己的核上，继续服务 fastboot */
+else                            { jump_to_kernel(...); }     /* loader 把自己这个核让给 kernel */
+```
+
+今天四轮的 cmdline 都是 `debug=0x8 cpus=1 rd=md0 … -v`（script 的 ARGS 没传，见 08:22 那条），
+**没有 `bootcpu=7`**，所以 loader 是把自己正在用的核直接让给了内核：
+
+- 从那一刻起，**没有任何一个核在跑 loader**，`getvar result` / `oem log` / `fastboot devices`
+  当然全部 121 超时；
+- 这和内核健不健康完全无关，`XL_FOLLOW` 的每份 `.live` 也必然取不到；
+- 01:33 那次活过 10 分钟、`.live` 能连续取到，正是因为它带着 `bootcpu=7`，loader 在另一个核上。
+
+所以今天所有"20 秒内就 mute"的记录**都不能当成挂死的证据**，它们只是"loader 不在线"；
+08:10 那条关于 50 秒心跳的推断，只在 `bootcpu=7` 的跑法里才有意义（那时 loader 真的在看）。
+
+**唯一还没解释的是 08:11 那轮为什么没在 180 秒后自己回来**：`loader_return_after=180`，
+kernel 健康的话应当交还控制权、loader 重新上线。到 08:28 都没有，说明单核、无 GPU 的启动
+确实卡住了（`cpus=1` + 没有 `gl=1`，iOS 的图形栈在软件路径上）。它现在大概停在"内核还在、
+但不回交还"的状态；如果它的定时器还在给它喂 watchdog，手机就不会自己复位，只能等电源。
+
+**结论**：在 `bootcpu=7` 补上之前，不要再开机跑；补上之后 mute 才有诊断价值。
+
+## 08:45 电池颜色：除了问卷，还打视图树（已烘焙进 08:44 的镜像）
+
+方法名单说明"有哪些方法"，但没说"那抹颜色在哪一层、由谁画"。所以在
+`inject_sb.c` 里给 `-[_UIBatteryView setChargePercent:]` 加了**一次性**的视图树输出：
+第一次设亮度值之后 3 秒（布局已完成）走一遍子视图，两层、最多 16 个：
+
+```
+hakios: battery view: the tree of _UIBatteryView:
+hakios: battery view: _UIBatteryView 17x11 at 0,0 hidden 0 alpha 1.00
+hakios: battery view:       background UIExtendedSRGBColorSpace 1 1 1 1
+hakios: battery view:       tint UIExtendedSRGBColorSpace 0.2 0.8 0.4 1
+hakios: battery view:       layer CALayer
+hakios: battery view:     _UIBatteryFillView 17x11 at 0,0 hidden 0 alpha 1.00
+hakios: battery view:       layer CAShapeLayer
+hakios: battery view:       fill UIExtendedSRGBColorSpace 1 1 1 1
+```
+
+（上面是格式示例，不是这次的值——真值要等手机跑起来。）
+
+要点：
+
+- 视图自己的 `backgroundColor`/`tintColor`，以及它 layer 的 `fillColor`/`strokeColor`/
+  `backgroundColor` 都打；`fillColor`/`strokeColor` 只在 `respondsToSelector:` 通过时才发，
+  `CALayer` 没有这两个属性，直接发会抛 unrecognized selector；
+- 颜色用 `-description` 打，任何色彩空间都能读（不依赖 CGColor 分量）；
+- 视图在第一次调用时 retain 住，3 秒后 dump 完再 release，避免视图已经销毁。
+
+构建：`cd userland && SYSTEM=1 ./build.sh system.apfs`，退出 0、0 个 error；
+`userland/root/lib/libhakios.sb.dylib` 08:43（91,640 字节，含
+`battery view: the tree of`），`userland/system.apfs` 08:44（2,486,968,320 字节）。
+手机起来后**必须先重新上传镜像**（`xl ramdisk userland/system.apfs`），本轮的结论才作数。
+
+## 09:05 loader 自己判定"内核没回来"并复位手机（OTHER_CPU_OVERRAN）
+
+问题不是"检测不到挂死"，而是**有两种挂死逃掉了所有现有机制**：
+
+1. 心跳停了 50 秒 → 现有 `SILENCE_SECONDS` 能发现（`result: hung`，`xl run` 会 `fb reboot`）。
+2. **内核定时代码还活着、但内核卡住** → 心跳一直在跳，上面那条永远不触发；而 alioth 上
+   Haven watchdog 根本没启用（`wdt_arm()` 只对 `platform_redwood` 生效），loader 复位手机
+   的唯一路径是 `ST->rt->reset_system()`，但它只在"用户按了"（`xl reboot`）或异常处理器里被调用。
+   于是手机保持"内核在跑、什么也不做"直到有人长按电源——08:12 之后那半小时就是这样。
+
+改法（`xnuloader/loader.c`）：内核自己承诺过返回时间（`loader_return_after=N`，即 `XL_SECS=N`），
+loader 就按承诺判它：
+
+- `budget != 0` 且已过 `budget + RETURN_GRACE_SECONDS`（60 秒）→ `OTHER_CPU_OVERRAN`；
+- 立刻 `log_of_hung_kernel()` 把内核日志理好（此时内存还在），
+  `set_result("overrun", …)` + `write_logs()` 暂存给主机；
+- 再空转 `OVERRUN_LINGER_SECONDS`（60 秒）只响应 USB，让 `xl run` 把日志取走；
+- 然后 `ST->rt->reset_system(0 /* EfiResetCold */)` 冷复位。主机不在也一样复位 —— 这正是目的。
+
+`budget == 0`（默认 `XL_SECS=0`，普通使用）**行为完全不变**：没有承诺就没有期限，只有 `xl stop`。
+`wdt_pet` 那条"`budget + 60` 之内喂狗"顺手改成同一个宏，语义一致。
+
+`xl` 侧：`result` 含 `overrun` 时打印一行并返回 2，**不再** `fb reboot`——loader 一分钟后自己复位，
+从主机再插一脚只会和它抢。
+
+前提（写在文档里）：这条只在 `bootcpu=N`（loader 独占另一个核）时存在。没有 `bootcpu=`，
+loader 根本不在运行，没有软件能救；`XL_SECS=0` 的跑法也没有承诺可判。
+
+验证：
+
+- `xnuloader/build.sh` 退出 0；`loader.efi` 09:01（旧件备份 `loader.efi.bak-20261031`，00:28，
+  md5 不同），`strings` 里有 `THE KERNEL DID NOT RETURN: it said %d seconds…`；
+- 新 loader 在**下一次 `xl enter`** 才进卡（`enter()` 从 `xnuloader/loader.efi` 现打 payload）；
+- 手机自 08:12 起不再应答（`????????????  fastboot`，`getvar` 121），需要长按电源，
+  所以 09:05 时这条路径**还没在真机上跑过**。回来后先 `XL_SECS=60` 正常跑一次
+  （应当 `result: returned`，不受影响），再人为制造超时验证 `overrun` 分支。
+
+## 09:16 QEMU 里跑通了"内核没回来 → 复位"（不用手机）
+
+手机还躺着（08:12 起不应答），所以这条路径先在 QEMU 上验。要制造"内核承诺返回却没返回"，
+给内核加了一个只在测试时用的 boot arg：
+
+```c
+/* osfmk/arm64/loader_return.c: loader_return_timer_init() */
+uint32_t skip = 0;
+if (PE_parse_boot_argn("loader_return_skip", &skip, sizeof(skip)) && skip != 0) {
+	printf("loader_return_after=%u was asked for, and not armed (loader_return_skip)\n", seconds);
+	return;
+}
+```
+
+`loader_return_after=30` 仍然写在命令行里（loader 照读），内核自己不装那个定时器 —— 心跳照跳，
+内核永远不回来，正是静默检测看不到的那一类。`qemu/overrun-test.sh` 一键跑：
+
+```
+loader_return_after=30 was asked for, and not armed (loader_return_skip)
+THE KERNEL DID NOT RETURN: it said 30 seconds, its log follows; the phone is restarted in 60 seconds
+overrun 0 0
+... 60 秒（期间 QEMU 里照常跑内核，root device 找不到后自己 panic）...
+restarting the phone
+qemu exit: 0            ← reset_system 真的把机器复位了（run.sh 带 -no-reboot，复位即退出）
+```
+
+所以 30 + 60 秒判定、暂存、60 秒留出时间、`ST->rt->reset_system(0)` 全部走通，包括
+"内核还活着的时候 loader 调用 UEFI 冷复位"这一步。
+
+两个观察：
+
+- 暂存的内核日志在 QEMU 里是 **0 字节**：内核写进 `loader_log` 的是各 hakios 驱动的 printf
+  （adreno/mic/sound/... 都调 `loader_log_putc`），QEMU 里一个都不跑。手机上会有，
+  但还是要在真机上确认一次"overrun 时取到的日志有多少"。
+- 早先那次 `return_cpu=0` 的尝试**没有**造出超时：XNU 的逻辑 CPU 0 就是内核自己所在的核
+  （QEMU 里只有 1 个逻辑 CPU），xcall 直接就地执行、正常返回。也正因为那次是正常返回，
+  它顺带验证了**不会误报**：30 秒的跑法在 33 秒正常回交，loader 没有打 overrun。
+
+另外：`wdt_armed` 在 redwood 上是真开着的，所以 overrun 的 60 秒等待期里 loader 现在也喂狗
+（每 5 秒），否则 Haven watchdog 会在等待中途咬掉，轮不到 loader 自己的复位。
+
+内核构建：09:11（`xnu-build.sh` 收尾照旧是 symbolset/export-check 报错，看文件时间），
+mach 15,239,512 字节，`strings` 里有 `not armed (loader_return_skip)`。loader.efi 09:06
+（含等待期喂狗）。下次 `xl enter` / `xl run` 用的就是这两个。
+
+## 10:15 ADSP：不是"没移植"，是"没跑过"——下一步是只读的两步
+
+手机仍不应答，这轮把声音那条链的下一步核清楚了。`hakios.adsp.c` 的文件头写的是 redwood，
+但代码里的常量**已经全换成 alioth 的**（`ADSP_MEMORY 0x8bb00000/0x2500000`、`PAS_ADSP 1`、
+`SMEM_PHYS 0x80900000`、SMP2P 429/443、crash reason 423、IPCC client 3 信号 0/2、
+`CMD_DB 0x80860000`），逐条都能在 `dump/twrp-fdt.dts` 里对上（详见 `devices/alioth/README.md`
+"声音（三）"）。
+
+没对上的只有三类，都是运行期才知道的：
+
+- GLINK item `478/479/480`：redwood 跑出来的编号，alioth 不一定相同；
+- RSC 基址 `0x18220000` vs DT 的 `rsc@18200000`（可能只是 drv 偏移）；
+- DSP 镜像装不装得下 37 MB 的区域。
+
+所以真机回来后的第一件事不是写代码，而是 `adsp_step=1`、`adsp_step=2`——两步都不写任何硬件，
+第 1 步给出 429/443/478/479 在不在、doorbell 计数、crash reason；第 2 步核对固件。编译时间不变，
+`adsp_step` 解析早就在，无需重新构建。
+
+## 10:53 把"设备在、没人答"这件事钉死：USB 描述符是 loader 的，不是 ABL 的
+
+Windows 设备管理器（`Get-PnpDevice`）给出：
+
+```
+Status : OK
+Class  : AndroidUsbDeviceClass
+FriendlyName : Android Bootloader Interface
+InstanceId   : USB\VID_18D1&PID_D00D\XNULOADER
+```
+
+`VID_18D1&PID_D00D` 是 fastboot，实例名 `XNULOADER` 是**loader 自己挂的**描述符（`xl is_loader`
+认的就是 `product: xnuloader`）。所以 08:05 之后这台不是"卡在 ABL"，而是 **loader 的 USB 端点还在、
+loader 那一核已经交给内核在跑**（08:11 那轮没有 `bootcpu=`），内核不服务 fastboot，于是所有命令
+121 超时。这也解释了为什么等再久也不会自己好：没有第二个核在看任何东西。
+
+顺带修了文档里一句会误导人的话：`devices/alioth/README.md` 的"设备枚举着，但一个命令都不回"第 2 条
+原来写"没有任何看门狗会把它救回来"，现在补上例外——`XL_SECS=N` **且** `bootcpu=N` 的跑法有
+09:05 的 loader 自复位；并注明躺着的这台没有 `bootcpu`，属于救不回来的那一类。
+
+## 10:58 无人值守的跑法默认带上了期限（backlight-test.sh：XL_SECS=600）
+
+今早那台手机之所以躺到没人能救，根子是"跑法没有期限"（`XL_SECS=0`，`loader_return_after=0`）。
+光有 loader 的自复位还不够：没有 `XL_SECS` 它连"承诺"都没有。所以脚本自己给一个：
+
+```bash
+XL_FOLLOW=${XL_FOLLOW:-20} XL_SECS=${XL_SECS:-600} XL_CMDLINE="$ARGS" ./xl run > "$log" 2>&1 &
+```
+
+- 600 s 在读数点（`HOME_WAIT + 240 s`，默认 390 s）之后，不影响上面那套 grep；
+- `ARGS` 里有 `bootcpu=7`，所以 600 s 到了内核还不回来时，loader 在 720 s 冷复位（09:05 那条）；
+- 调用者仍可 `XL_SECS=… tools/backlight-test.sh` 覆盖；`STOP=1` 照旧提前结束；
+- 结果提示改成了"它会在 ${XL_SECS} 秒后自己回来"。
+
+以后写别的无人值守脚本（`battery-check.sh` 等）也照这个来：**只要是人不在旁边的跑法，就带期限**。
+
+## 18:50 离线：iOS 自己的二进制说了亮度服务该长什么样（不用手机）
+
+手机从 08:11 躺到现在，但**亮度这个问题有一半根本不用手机**：iOS 里"找背光服务"的那段代码就在
+`userland/system.apfs` 里，只要会读 APFS 就能把它的话抠出来。
+
+**取法**（可复用，以后查电池/音量也是这条路）：
+
+```
+iOS 16 的 dyld 共享缓存不在 /System/Library/Caches，而在 cryptex 里：
+  /System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.*（43 个分片）
+tools/apfs/apfs.py cat userland/system.apfs <上面那条路径> > /tmp/dsc/<分片名>     # 会自动解 decmpfs
+```
+
+**三个调用方，原文都在**（`grep -aoE '.{140}AppleBacklight.{200}'`）：
+
+| 分片 | 代码 | 字符串（原文） | 读的东西 |
+|---|---|---|---|
+| `.37` | BrightnessControl 的 `-[BCAppleBacklightBrtControl initWithService:]` | `com.apple.BCBrtControl`、`AppleBacklight`、`IODisplayParameters`、`brightness`、`min`、`max`、`BrightnessMilliNits`、`BrightnessMicroAmps`、`_maxUser >= _minUser`、`_maxNits >= _minNits`、`Unable to find backlight service.`、`got back service %u` | 按类名 **`AppleBacklight`** 找；读 `IODisplayParameters.brightness.{min,max}` 当量程 |
+| `.13` | CoreBrightness 的 `CBDisplayContaineriOS` | `com.apple.CoreBrightness.CBDisplayContaineriOS`、`AppleARMBacklight`、`IOHIDDevice`、`DisplayBrightness…`（`DisplayBrightnessData`/`Factor`/`Min`/`Max` 等） | 按类名 **`AppleARMBacklight`** 找 |
+| `.19`/`.23` | PowerLog 的 `PLDisplayAgent` / `BrightnessSystemClient` | `IOServiceMatched`、`AppleARMBacklight`、`IODisplayParameters`、`min`、`max`、`rawData`、`brightness=%@ self.pendingBacklightEntry` | 按类名 **`AppleARMBacklight`** 找，读同一本字典 |
+
+顺带确认：`/usr/libexec/backboardd` 自己的字符串里**没有** `AppleARMBacklight`/`IODisplayParameters`
+——背光不是 backboardd 直接做的，做它的是缓存里的框架（CoreBrightness / BrightnessControl），
+所以没有哪个守护进程需要改。
+
+**这解释了两件事**：
+
+1. `MiniAppleBacklight.cpp` 同时发布 `AppleBacklight` 与 `AppleARMBacklight` 两个类是对的——
+   三种调用方确实分用这两个名字（那份注释里的"两个名字都发"不是猜，现在有原文）。
+2. **真正缺的东西不是类名，是属性**：`MiniBacklightService::start()` 以前只 `registerService()`，
+   一个属性都没发。而 `BCAppleBacklightBrtControl` 一上来要读 `IODisplayParameters.brightness.min/max`
+   （还要求 `max >= min`），读不到就是"没有量程的背光"，滑块没有可动的范围。
+
+**改了什么**（`xnu/files/iokit/Kernel/MiniAppleBacklight.cpp`，已同步到 `xnu-src`）：
+
+- 新增 `publishBrightnessParameters()`：`IODisplayParameters = { brightness = { value, min = 0, max = 0x7ff } }`，
+  在 `registerService()` **之前**发（调用方是"找到服务就在同一口气里读量程"）；
+- 每次把电平送面板时（`backlight_dcs=1` 那条路）用同样的函数把 `value` 更新成新电平；
+- 日志行多了量程：`AppleBacklight: published as %s, provider %s, brightness %#x of %#x`。
+
+**构建**：18:45 完成，`mach.development.bcm2837`（15,239,432 字节）里已能 `strings` 到新行与
+`IODisplayParameters`。`xnu-build.sh` 结尾仍是那个已知无害的 `IOKit.symbolset` / `check_all_exports`
+（exit 2），没有 `error:`。
+
+**这仍不是结论**：属性发对了不等于滑块会动——要等手机回来跑一轮，看
+`AppleBacklight: N services published, the user client asked for M times` 里的 M 是不是非零，
+以及 `CLIENT OPENED` / `selector ...` 的原文。**但这一轮把"跑之前能确定的东西"都确定了。**
+
+**跑之前确认过路径**：`xl` 的 `K=xnu-src/…/mach.development.bcm2837`（就是 18:45 这一版），
+`xl enter` 用的是 `xnuloader/loader.efi`（09:06，带 OVERRUN 自复位）——所以手机回来后
+不需要额外换什么，跑的就是今晚这两样。
+
+## 18:55 同一招用在电池上：颜色是哪个方法选的
+
+缓存分片 `.03` 里 `_UIBatteryView` 的颜色代码是：
+
+```
+_batteryColorForCapacity:lowCapacity:style:usingTintColor:      ← 主色由 容量 + lowCapacity + style + tint 决定
+_batteryFillColorForEntry:usingTintColor:                       ← 充放电状态在 entry 里
+_batteryFillColor / _batteryUnfilledColor / _batteryTextColor
+_updateBatteryFillColor  _updateBodyColors  _updateBodyLayers  _updateBolt
+```
+
+所以"充电时填充是白的、真机是绿的"不该靠给图层硬写颜色解决，该看
+`_batteryColorForCapacity:lowCapacity:style:usingTintColor:` 的入参（尤其 entry 的充电标志、style）
+再决定要不要钩。电池数据本身走 IOPS：分片 `.05` 有 `AppleSmartBatteryManager` 和
+`com.apple.system.accpowersources.*`。已写进 `devices/alioth/README.md` 的电池一节。
+
+## 18:58 音量那一半：不是坏了，是"下游没人"
+
+缓存里 HAL 的样子（分片 `.13`）：`AMCP` / `HALS_IOA2Device` / `IOAudio2::Engine`，
+匹配的是 IOKit 的 `IOAudioDevice` / `IOAudioEngine`（`IOAudioEngineGlobalUniqueID`、
+`IOAudioEngineNumSampleFramesPerBuffer` 等一串键）。也就是说**真正的 iOS 音频驱动形状是 IOAudio 引擎**，
+而本移植走的是 HAL 插件（`userland/src/audio_plugin.c`，日志 `hakios-audio: the volume: … dB`），
+它已经收得到音量、按 dB 缩放样本——所以音量滑杆本身没有"没接上"的问题，
+**缺的是 sink（第 2 项：CS35L41 + TDM + ADSP）**。结论：第 1 项里音量那一半挂在第 2 项后面，
+亮度那一半独立且已备好（18:50 节）。
+
+顺带把"CS35L41 固件到底有没有"查完了：`alioth-local`（`dump/`、`firmware/`、`firmware.tar`）
+里 `find -iname '*cs35l41*'` 一条都没有——所以功放只能走"无 DSP 直通"初始化（寄存器序列自己写），
+或者等抓一份完整 `/vendor` 再回来。这条与 README 的说法一致，但现在是查过的，不是推断。
+
+## 19:10 ADSP 第 4/5 步与 Linux 对齐（读代码 + 段布局，不是猜）
+
+- 第 4 步（`step_header`）把 `.mdt` 的**头 + 哈希**放进一页内核内存，整页清缓存后交给
+  `SCM_PAS_INIT_IMAGE`（`scm` 里 `SCM_CALL(2,1)`）——这正是 Linux `qcom_scm_pas_init_image()`
+  吃的 "metadata"；随后 `SCM_PAS_MEM_SETUP(pas_id=1, 0x8bb00000, 跨度)`。
+- 第 5 步（`step_image`）只写**段**，落点 `paddr - min_addr`，再读回逐字比对。
+- **不写元数据到区首是对的**：这份镜像第一段 `paddr == min_addr`，按 `paddr - min_addr` 正好落在
+  偏移 0；Linux 的 `mdt_loader` 若再往区首写一份头，就会和第一段重叠。所以"区首 = 第一段"这个
+  事实本身就排除了"还要多写一份头"的可能。
+- README 里"镜像装不装得下 37 MB"这条旧的待确认项删掉了——真机 `adsp_step=2` 已经答过
+  （18 段、`0x2500000` 恰好填满）。
+
+（试图在线取 `mdt_loader.c` 原文复核时，这台机器出不去外网：raw.githubusercontent / git.kernel.org
+被拦，MCP 搜索也超时——19:30 那条取源码的任务在 1800 s 后自己失败退出，等于确认了这条路今晚走不通。
+所以上面这一条是按**段布局**推的，不是照抄源码；要在源码层面钉死，得本机有一份 Linux 树时再看。）
+
+## 19:22 新背光服务在 QEMU 里冒烟通过（不用手机）
+
+带 `backlight=1 backlight_arm=1` 在 QEMU 里启动（`qemu/backlight-smoke.log`，`qemu exit: 0`）：
+
+```
+[    5.797151]: AppleBacklight: published as AppleBacklight, provider GenericARMPE, brightness 0x7ff of 0x7ff
+[    5.797697]: AppleBacklight: published as AppleARMBacklight, provider GenericARMPE, brightness 0x7ff of 0x7ff
+```
+
+两个类都发布成功、属性在 `registerService()` 之前就位、内核照常往下跑。日志里的两次
+`panic(cpu 0 … Failed to mount root device @IOKitBSDInit.cpp:926)` 是 QEMU 没有根设备的老现象
+（和 09:16 那次 overrun 测试同一个），不是这次改动引起的——panic 发生在服务发布之后，
+日志仍以 `== END OF LOG ==` 结束。
+
+QEMU 只能证明"这段代码能跑、会发布"，证明不了 iOS 会不会来开客户端——那仍然要等手机。
+
+## 19:30 回来后照这个顺序做（这一版是 10 月的最终版，替换 2805 行那份旧的）
+
+**前提**：手机自 08:11 起 `fastboot getvar` 一直 121 超时，只有长按电源能救。先物理重启。
+
+1. `./xl state`：`android` → `./xl enter`（这次 `enter` 打的是 09:06 的 loader，带 OVERRUN 自复位）；
+   等到 `loader`。
+2. **只读、有界的第一轮**：`SCREENSHOT=0 tools/backlight-test.sh`
+   （脚本自带 `XL_SECS=600`、`bootcpu=7`、`backlight=1 backlight_arm=1`；720 s 内核不回来 loader 自己复位）。
+   先看它打印的 `cmdline:` 里有没有 `backlight=1 backlight_arm=1 bootcpu=7`——**没有就别读后面的数据**。
+3. 判据（都在这轮 `.live` 里）：
+   - `AppleBacklight: published as … brightness 0x7ff of 0x7ff` **两行**（两个类各一行）→ 18:50 的属性改动生效；
+   - `AppleBacklight: N services published, the user client asked for M times`：
+     **M > 0** → 协议到了，下一轮加 `backlight_dcs=1` 才碰面板；
+     **M = 0** → 看 `backlight probe:` 那几行：探针查得到就是 CoreBrightness 的匹配问题，
+     探针也查不到就是发布侧的问题。
+4. `adsp_step=1`、`adsp_step=2` 各跑一轮（只读）：刷新重启后 429/443/478/479 的有没有、
+   doorbell 读数和固件完整性。
+5. 电池：同一轮的 `battery survey:` / `battery view:` 两段（08:44 的镜像里已有），
+   配合 18:55 那条 `_batteryColorForCapacity:lowCapacity:style:usingTintColor:`。
+
+**这一轮里没有一步是写硬件的**。`backlight_dcs=1`（真发 DCS 0x51）、`adsp_step>=3`
+（AOP 邮箱、RPMh、PAS）、`amp_step>=6`（功放初始化）都必须有人在旁边时才做。
+
+## 19:35 `backlight-test.sh` 自己先检查参数（把这轮读数的前提写进脚本）
+
+08:22 那次的教训是"参数没进内核，数据看起来却是数据"。现在读数之前脚本自己判：
+
+```bash
+if ! grep -aq "cmdline:.*backlight=1.*backlight_arm=1" "$live"; then
+	say "WARNING: the kernel did not get backlight=1 backlight_arm=1 -- nothing below can answer the slider"
+fi
+if ! grep -aq "cmdline:.*bootcpu=" "$live"; then
+	say "WARNING: no bootcpu= -- the loader handed its core to the kernel, so it cannot be asked anything while this runs"
+fi
+```
+
+`bash -n` 通过，四条判据用两行假 `cmdline:` 试过（好的一行不报、坏的一行两条都报）。
+
+## 19:40 一条先记下、还不敢当结论的：`IOMFBBrightnessLevel`
+
+CoreBrightness 的文本（分片 `.13`）里有 `IOMFBBrightnessLevel`，但**它的上下文是 CoreBrightness 自己
+的一组标定键**：`BLNitsCap`、`brightness-nits-cap`、`AvgBacklightNits`、`AvgLogicalBrightnessNits`、
+`max_Factor`/`aab-constraint-*`、`__DisplayStartFade`…… 也就是说它更像"这份曲线/标定的键名"，
+不一定是"要写进 IOKit 的属性"。所以它**不构成**"亮度其实走 IOMobileFramebuffer 而不是背光服务"的证据；
+真要走那条路，跑一轮之后 `IOMobileFramebuffer` 那边的属性写入日志会自己说话。先记在这里，
+免得下次又从头找一遍。
+
+## 19:50 文档里写过、代码里从来没有的 `setProperties()`——补上了
+
+`devices/alioth/README.md` 的"第二种到达方式"一节写着"`MiniBacklightService::setProperties()`
+现在把写入的字典按键打印出来"。查了一遍：**`xnu/files` 与 `xnu-src` 两份 `MiniAppleBacklight.cpp`
+里都没有这个 override**，而基类 `IORegistryEntry::setProperties` 是
+
+```cpp
+IOReturn
+IORegistryEntry::setProperties( OSObject * properties )
+{
+	return kIOReturnUnsupported;
+}
+```
+
+（`xnu-src/…/iokit/Kernel/IORegistryEntry.cpp:584`）。也就是说，如果 CoreBrightness 走的是
+"写属性"这条路，写进去的东西**既没被拒绝也没什么可查**——日志里连一行都不会有。
+
+**19:37 的实现**（`xnu/files/iokit/Kernel/MiniAppleBacklight.cpp`，已同步）：
+
+- `MiniBacklightService::setProperties(OSObject *)`：逐键打印写入的字典（最多四层，数字打值）；
+- `IODisplayParameters.brightness.{value,max}` 存在时按 `value * 0x7ff / max` 换算（四舍五入、上限 clamp），
+  更新发布的 `value`；**只有 `backlight_dcs=1` 才真的发 DCS 0x51**，否则日志写
+  `(not sent: no backlight_dcs=1)`；
+- `showProperties()` 用 `OSCollectionIterator`，只关心字典和数字，其它类型只写一句 "not a number"。
+
+**验证**：19:37 编译（exit 2 仍是已知的 symbolset，无 error/warning，新字符串在核里）；19:45 QEMU
+冒烟再次通过（两个类照常带属性发布），日志仍是 QEMU 那个 `Failed to mount root device` 老 panic。
+**真机上会不会有人写这个属性，仍然是手机回来那一轮才知道。**
+
+## 19:47 user client 的结构体也记下来了
+
+原来那行只知道"有个 `structure N in`"，内容一个字节都没留下。现在 `externalMethod` 把
+`structureInput` 的前 32 字节按 8 字节字打出来：
+
+```
+AppleBacklight: selector %u: %u scalars in [...], %u out; structure %u in, %u out
+AppleBacklight:   structure in [0]: 0x…
+```
+
+这样真机上如果客户端用的是结构体而不是标量，日志里就有东西可看。19:40 编译（15,239,560 字节，
+`strings` 已确认 `structure in [%u]`），19:47 QEMU 冒烟通过（两个类照常发布、无新 panic）。
+
+顺带把 `userland/src/inject_sb.c` 的 `backlight_probe()`（853 行）读了一遍：`IOServiceMatching`
+按两个类名各查一次、`IORegistryEntryGetPath` 打路径、查不到就明说——逻辑没问题，**没有改它**。
+它能再进一步读 `IODisplayParameters` 验证属性对用户态可见，但那要重做 2.4 GB 的系统镜像、
+而且改坏了是"SpringBoard 起不来"这种代价；等这轮真机数据回来再决定值不值得加。
+
+再读一遍 DCS 那条路（`hakios.display.c:777` `hakios_display_set_brightness`）：`level` clamp 到
+`0x7ff`；`static last_level = 0xffffffff`，**第一次调用一定发**（不会因为"和初始值一样"被吞掉）；
+首行与超过 `0x40` 的跳变才打 `display: brightness N: dcs 51 hi lo`；字节是 `0x51, hi, lo` 三字节
+short write，`dsi_quiet` 包住避免刷屏。没有发现要改的地方。
+
+## 19:55 今晚（18:40 起）的净变化，一页看完
+
+**代码（未提交）**
+
+| 文件 | 改了什么 | 验证 |
+|---|---|---|
+| `xnu/files/iokit/Kernel/MiniAppleBacklight.cpp` | ① `publishBrightnessParameters()`：服务起来、每次电平变化都发 `IODisplayParameters = {brightness = {value, min, max}}`；② `setProperties()` override（原来没有，基类直接 unsupported 且什么都不存）；③ `externalMethod` 打 `structureInput` 前 32 字节；④ 19:59 自查补上的守卫：`service == NULL` 时不发布（user client 的 `getProvider()` 理论上不该是 NULL，但一个属性不值得一次 panic） | 19:59 编译无 error/warning；20:05 QEMU 冒烟：两个类照常发布 |
+| `tools/backlight-test.sh` | 读数前先查 `cmdline:` 有没有 `backlight=1 backlight_arm=1` 和 `bootcpu=`，缺了先打 WARNING | `bash -n` + 两组假 cmdline 试过 |
+
+（`xnu-src` 里的同名文件已同步；`xl` 用的就是 19:40 那次编出来的核，`xl enter` 用的是 09:06 的 loader。）
+
+**只读结论（写进文档的）**
+
+- iOS 16.5 的亮度栈三种调用方与各自读的键（18:50）；电池颜色由
+  `_batteryColorForCapacity:lowCapacity:style:usingTintColor:` 决定（18:55）；音量挂在 sink 后面（18:58）。
+- ADSP 第 4/5 步与 Linux 对齐，第 5 步"只写段"不是遗漏（19:10）。
+- 手机自 08:11 起 121 超时、需要物理重启；回来后照 19:30 那份顺序做，一轮只读、带判据、带期限。
+
+**没做、也不该在无人时做的**：`backlight_dcs=1`（真发 DCS 0x51）、`adsp_step>=3`、`amp_step>=6`。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---
+
+---
+
+## 21:30 UniXNU-alioth 参考仓库结论 + 手机 ABL 阻塞项
+
+**参考仓库（用户指派，/tmp/unixnu，只读）**：同机（alioth）另一条移植线：Mu-Silicium
+UEFI + iPadOS 17.7.11 (21H461) donor，boot 机制与 `xl enter` 完全同构（`fastboot boot`
+一个 gzip(BootShim+UEFI FD+payload) 的 boot.img）。
+
+- **亮度（任务 1）**：他们独立得出与我们相同的硬件结论（k11a_38_08_0a_dsc_cmd 面板，
+  `bl_ctrl_dcs`，min 1 / max 0x7ff，init 0x218，big-endian；无 KTZ8866，WLED disabled）。
+  他们的 BacklightProbe.cpp 走 DSI0(0xae94000) TPG 命令 FIFO 逐字写：长写头
+  `0xC0390003`、payload `0x51|hi<<8|lo<<16|0xff<<24`、读回用 `0xA0060000|cmd`（bit 5 转
+  lane）经 RDBK_DATA_CTRL 取 DCS 0x52。mode 3 = 把 iOS 服务接到 DCS。**可直接借鉴的增量**：
+  DCS 0x52 读回配方（我们还没有），以及他们"只读模式先行、逐问题设判据"的验证法。
+- **音频（任务 2）**：仓库里**没有**任何 codec/扬声器工作，只有 native_audio_stats 统计行
+  和 AdspProbe（DSP 段/信箱）的描述。CS35L41 仍无参照，我们领先。
+- **电池（任务 3）**：只有 ShengBattery.cpp 的统计行布局（stage/pct/mv/ma/temp/flags/
+  cycles/usb/full/design/cycles/refuse）——电池驱动本体不在这个仓里，价值是"一行该报什么"。
+- 他们的 patches/xnu/series 是空的：一切靠组件和 boot args，不靠改内核。
+
+**手机侧阻塞（继续查因）**：`fastboot boot` 现在**对任何镜像**报
+`Failed to load/authenticate boot image: Load Error`——我们的 20:24 镜像、00:28 备份
+loader、现场重建镜像、连 10 月 26 日在本机用过的 TWRP 都拒绝。因此是手机 ABL 侧状态，
+不是镜像问题。判别证据：
+- 10-26 健康 getvar 存档（alioth-local/dump）与现在的 diff：唯一实质变化是 `token`
+  （ARB token 变了），其余 anti/crc/unlocked/verity 相同；slot-successful 由 a+b 都 yes
+  变为都 no，slot-retry 7/6。
+- `fastboot --set-active=b` 清掉了 slot-unbootable:b，boot 仍报 Load Error → 不是该标志。
+- 未做任何刷写；所有动作都是只读查询和 RAM boot 尝试。ABL 产生这个错误串的检查点还没
+  定位到（无 UART 控制台，网络源码搜索被打断）。按规矩：手机回不到 loader，停在用户处。
+
+---
+
+## 21:40 根因找到：今晚的镜像全部错建成了 poco-x5-pro
+
+**现象链（一晚的证据）**：`fastboot boot` 报 `Failed to load/authenticate boot
+image: Load Error`（任何镜像，含 TWRP）；新 bootloader 会话里我们的镜像
+`Booting OKAY` 但 2 秒内回 fastboot、屏幕闪一下黑屏；TWRP 能起。
+
+**根因**：mkxnuimg.py 的 `--device` 默认值是 `poco-x5-pro`（取 $DEVICE，没设就
+用 redwood）。20:24 及之后重建的镜像全部装进了 **redwood 的 FD + dtb + shim**——
+错误机型的 UEFI 在 alioth 上显示初始化就崩（闪一下→黑屏→复位→fastboot）。
+证据：从镜像内核段解出 FDT（405,158 B，magic d00dfeed00062ea6）与
+devices/poco-x5-pro/prebuilt/device-tree.dtb 逐字节一致；alioth 的 dtb 是
+919,977 B（000e09a9），不在镜像里。
+
+**修复**：`./mkxnuimg.py -d alioth -p usb-payload.bin` 重建 → alioth dtb 在镜像
+内 → 新 bootloader 会话 boot → **4 秒 loader 就活了（product: xnuloader）**。
+（教训：xl enter 带 DEVICE=alioth 的规矩被破坏过一次，后面所有手动重建都没
+检查机型。）
+
+**ABL 侧另有两个未解之谜（不阻塞，记录在案）**：① 旧会话里 Load Error 连
+TWRP 都拒、新会话就收——像是 ABL 会话态问题；② logfs 里 ABL 日志显示
+`fastboot boot` 后走 "Booting from slot (_b)" + "Error: Appended Soc Device Tree
+blob not found"（那是 redwood 镜像 v1 头 + 非 QCDT dtb 被 ABL 拒后落回槽位
+启动的路径——换回 alioth 镜像后是否消失待观察）。misc 里有 `boot-system0`
+命令、XBL 报 `pil-SPSS failed to validate firmware metadata`（SPSS/slpi 固件
+校验失败，每次启动都有）、ARB token 与 10-26 存档不同——都已只读取证存入
+alioth-local/dump/（logfs2.img、uefivarstore.img、misc/devinfo/secdata/abl_a/
+abl_b 等）。
+
+**21:39 起**：loader 已活，backlight 只读跑（backlight=1 backlight_arm=1、
+amp_step=2、无 backlight_dcs）在后台进行中。
+
+---
+
+## 21:55 01:52 以来所有 "Process 1 exec of /sbin/launchd failed" panic 的根因：哨兵文件骗过了上传
+
+**现象**：21:40 的 backlight 只读跑在 78.5 s panic——`Process 1 exec of /sbin/launchd
+failed, errno 2`（init 找不到 /sbin/launchd）。01:52、07:47 的跑死于同一处；01:30 的
+跑正常进了 SpringBoard。
+
+**根因**：真正的根文件系统是 2.3GB 的 userland/system.apfs，由 `./xl ramdisk` 上传到
+loader RAM 的 resident 区，内核拿它当 md0。是否上传由哨兵文件
+`${XDG_RUNTIME_DIR}/darwin-hakios-phone.ramdisk`（存在=已在 RAM 里，跳过上传）决定。
+手机一冷启，loader RAM 就空了，但哨兵文件还活着 → 上传被静默跳过 → 内核拿 4MB 的
+payload ramdisk（userland/root.apfs，/redwood overlay）当根 → /sbin/launchd 不存在 →
+panic。`xl enter` 会在冷启 loader 后删哨兵（31 号上午刚修过的坑），但今晚用
+`fastboot boot` 直接起的 loader，绕过了 enter。
+
+**证据链**：01:30 好 boot 的 loader 日志有 `resident image at pa fc000000 size
+943c4000: it is the root (md0), the payload ramdisk is md1`；01:52/07:47/21:40 的
+loader 日志全都没有这行；night-backlight.out 里没有 "uploading" 行 = 哨兵静默跳过。
+
+**修复**：手动 `./xl ramdisk userland/system.apfs`（90 s，26 MB/s，21:53 完成）→
+重跑 backlight 只读（night2）。
+
+**注意**：system.apfs 是 08:44 重建的（2,486,968,320 B = 0x943a0000），与 01:30 成功
+boot 用的镜像（0x943c4000）不同——新镜像从未成功启动过，night2 是它的首飞。
+
+---
+
+## 22:40 今晚结论汇总（用户要求记录后停手）
+
+### 1) 21:40 之前所有 "launchd failed" panic 的根因：哨兵文件骗过了上传
+真正的根文件系统是 2.3GB 的 `userland/system.apfs`，靠 `./xl ramdisk` 传进 loader RAM，
+内核拿它当 md0。是否上传由哨兵 `${XDG_RUNTIME_DIR}/darwin-hakios-phone.ramdisk`
+决定（存在就跳过）。手机冷启后 loader RAM 是空的，但哨兵还在 → 静默跳过上传 →
+内核拿 4MB payload ramdisk 当根 → `Process 1 exec of /sbin/launchd failed, errno 2`。
+判别：好 boot 的 loader 日志有 `resident image at pa fc000000 size ...`，坏 boot 没有。
+`xl enter` 会删哨兵，但 `fastboot boot` 直接起 loader 会绕过它。**已写入
+devices/alioth/README.md 的"已知坑：resident 根文件系统与哨兵文件"一节。**
+
+### 2) 21:53 night2 跑：镜像上传成功，内核 600 s 未返回
+- `./xl ramdisk userland/system.apfs`：2371 MB，90 s，26 MB/s，21:53 完成。
+- 21:53:34 起跑（resident 镜像在位），屏幕停在 adreno GPU 自检的三条色带；
+  内核到 600 s 没有自己返回，loader 的 OTHER_CPU_OVERRAN 在 660 s 把它复位回 fastboot。
+- **没有拿到任何内核日志**：backlight-test.sh 把 xl 放后台后脚本先退出，
+  WSL 会话结束把 xl 的轮询进程杀掉了，日志一次都没 fetch。教训：跑必须在前台进程里。
+- 镜像本身在宿主机上用 `tools/apfs/apfs.py` 验过：容器 607170 块、45061 文件、
+  0 坏块、`/sbin/launchd` 在（34560 字节）。**镜像结构是好的**，不是坏镜像。
+- 该镜像（2,486,968,320 B = 0x943a0000，08:44 重建）从未成功启动过；01:30 成功那次
+  用的是 0x943c4000 的旧镜像（已被覆盖，无备份）。
+
+### 3) 对照 UniXNU-alioth（工作正常的参考实现，已 clone 到
+###    <主机>\Develop\iOSOnAndroid\UniXNU-alioth）
+- **根在 UFS 真存储**（`board.toml [userdata]`：OS/SystemOS 两个卷在 userdata，
+  带 verified-root；Data 卷只有 32 MiB RAM seed）。没有 2.3GB 内存上传。
+- **三条实时诊断**：`qcom-usb-debug=1` CDC-ACM 串口控制台、`boot-progress=3`
+  面板文字页、持久日志 + `sheng-autoreset=180` 自复位。原话："a colour band
+  cannot carry what a text page can"。
+- **镜像防呆**：`check-payload-kernel.py` 防"build kernel 后不 build payload
+  会打包旧内核"——和我们 `mkxnuimg.py --device` 默认 poco-x5-pro 是同一类坑。
+- **已知崩的进程直接禁**：sheng-disable-jobs=liveactivitiesd,cryptexd,routined，
+  逐个记录崩溃 PC。
+- 他们的未解之谜和我们一致：`fastboot boot` 连续失败、同一镜像手动断电重启能进，
+  怀疑落回活动槽位，需要持久日志 tag 字段判定。
+
+### 4) 当前手机状态（2026-10-31 深夜，停手时）
+- 手机在 **fastboot**（stock ABL），不在 loader。
+- 最后一次 `xl enter` 失败：`loader did not come up on USB (state: fastboot)`。
+- 已验证过的恢复手法（今晚用过两次成功）：`fastboot reboot bootloader` → 等 14 s →
+  `fastboot boot /tmp/xnu-usb-alioth.img` → loader 约 4 s 起来
+  （脚本 `\\wsl.localhost\Ubuntu-24.04\tmp\recover-loader.sh`，未执行）。
+- 起来之后必须：`./xl ramdisk userland/system.apfs`（90 s）再跑，否则 launchd panic。
+
+### 5) 下一步建议（未执行）
+1. 用**前台**方式跑一次诊断 boot（`-v` + `XL_FOLLOW=15 XL_FOLLOW_KEEP=1`），拿到内核
+   停在 bsd_init 之后哪一行的实时日志——这是 night2 缺的那份证据。
+2. 中期按 UniXNU-alioth 补齐：镜像打包防呆检查（mkxnuimg 的 DEVICE 必须显式）、
+   面板文字诊断页、UFS 根（本树已有 `ufs=2` 块设备和
+   `tools/darwin-write.py`，但根仍是 RAM 镜像）。
+
+## 2026-10-31 22:30 桌面回来了：根因是镜像漏了 `GL=1 REST=1`，不是代码被改坏
+
+### 现象
+
+「桌面起不来」——内核起来了、SpringBoard 进程 `job state = running`，但画面停在开机 logo，
+之后要么自己返回 loader，要么 600 s 被兜底复位。而 01:29 那张截图（`logs/shot-ios.png`）
+里壁纸、小组件、图标全在，说明它曾经是好的。
+
+### 根因：08:43 那次重建镜像时漏了两个构建参数
+
+三条独立证据，互相印证：
+
+1. **镜像里没有 GL 库**。`root.apfs` 的 `/lib` 只有 7 个 `libhakios.*.dylib`，
+   没有 `libOSMesa.8.dylib`，也没有 `libhakios.gl.dylib`；全盘搜 `osmesa` 零命中。
+2. **内核日志直接点名**：
+   ```
+   hakios: no accelerated renderer; the software one will draw
+   backboardd [WindowServer] CoreAnimation: Software renderer! Simulating crash!
+   backboardd [WindowServer] CoreAnimation: Failed to initialize Metal or OpenGLES contexts!
+   ```
+   这正是 `PROGRESS.md:119` 记过的那条：没 GL → CoreAnimation 拿不到上下文 → 停在 logo。
+3. **作业表只有 25 个**。`/redwood/LaunchDaemons` 缺 `chronod`、`PosterBoard`、`searchd`，
+   也就是 `devices/alioth/README.md:85` 写的「桌面背景纯黑、小组件纯白空块」那套配置。
+
+也就是说：08:43 那次是**默认参数**构建（`GL` 空、`REST` 空），而截图里那个能用的桌面
+需要 `GL=1 REST=1 SYSTEM=1`。
+
+### 修复
+
+```sh
+cd userland && GL=1 REST=1 SYSTEM=1 ./build.sh
+```
+
+退出 0，0 个 error。结果：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `root.apfs` | 4,194,304 (1,024 块) | 6,266,880 (1,530 块) |
+| `/lib/libOSMesa.8.dylib` | 无 | 14,822,264 |
+| `/lib/libhakios.gl.dylib` | 无 | 541,888 |
+| launchd 作业 | 25 | **407**（`... and 382 more jobs`） |
+| `chronod` / `PosterBoard` / `searchd` | 无 | 全在 |
+
+旧镜像备份在 `~/alioth-backup/root.apfs.25jobs`（这是唯一可能回退的来源，
+`SYSTEM=1` 会覆盖 `system.apfs`）。
+
+### 验证
+
+上传 2371 MB（91 s，26 MB/s）→ 跑 `gl=1 adreno=22 adreno_keep=1 touchscreen=1 bootcpu=7
+cpus=8 rd=md0 battery=1`：
+
+- 中途截图 `logs/verify2.png`：**苹果 logo**（不再是 loader 的三条色带）；
+- 再截 `logs/verify3.png`：**桌面完整回来** —— 壁纸、Weather/Calendar 两个小组件、
+  全套图标、Dock、电池 99%。文件 3,056,630 字节，与 01:29 那张 `shot-ios.png`
+  （3,056,607 字节）几乎同尺寸，是满屏内容的旁证。
+
+### 过程中的两个坑（都是老坑，又踩了一遍）
+
+1. **哨兵文件又一次骗过上传**。`pkill` 掉 `xl run` 后 loader 里其实没有常驻镜像了，
+   但 `${XDG_RUNTIME_DIR}/darwin-hakios-phone.ramdisk` 还在，于是内核拿 4 MB 的
+   `root.apfs` 当根 → `panic: Process 1 exec of /sbin/launchd failed, errno 2`。
+   **判别：** 好的跑法日志里有 `resident image at pa fc000000 size 943c4000: it is the root
+   (md0)`，坏的那次没有。修法：`rm` 掉哨兵再 `./xl ramdisk`。
+2. **`xl run` 在后台跑时被 `pkill` 会留下 `.run` 锁**，下一次 `xl run` 报
+   "a run is in progress"。清理：`./xl stop` + `pkill -f "xl run"` +
+   `rm /run/user/1000/darwin-hakios-phone.run`。
+
+### 顺带确认的
+
+- **代码侧没有发现被改坏**。`inject_sb.c` 的新增（`battery_survey`、`backlight_probe`、
+  `battery_dump_view`）都是只读探测；`hakios.display.c` 的 594 行里所有写操作都由
+  `display_hz` / `display_bl` / `display_bl_ramp` / `display_read` 四个 boot-arg 门控，
+  默认不碰硬件；`display_map()` 只是把原来的三行 `ml_io_map` 包了一层并加了失败即终止线程。
+- GPU 侧全程健康：日志里 22 步跑完，TrustZone 归还 secure extent、SMMU 路由、
+  `standalone CX cleanup: off again` 都正常。
+
+### 下次别再踩
+
+**重建镜像一律用 `GL=1 REST=1 SYSTEM=1 ./build.sh`**，三个都不能省：
+`GL` 少了停在 logo，`REST` 少了壁纸黑+小组件空白，`SYSTEM` 少了 dylib 改了镜像不更新。
+判断手上的镜像属于哪套：`ls /redwood/LaunchDaemons | wc -l` → **25 = 精简，407 = 全量**。

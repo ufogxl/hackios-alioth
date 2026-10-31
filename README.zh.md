@@ -48,6 +48,35 @@ HakiOS 在搭载高通 SoC 的 Android 手机上运行开源的 XNU 内核（xnu
 | `/private/var` 跨重启保留（`var_store=1 ufs_write=1`） | |
 | Sileo、Procursus 软件包、SSH 登录手机 | |
 
+### 红米 K40（`alioth`）这一路
+
+第二台手机是**红米 K40**（`alioth`，骁龙 870，12 GB）。内核、loader 和用户态是同一套，不一样的东西
+全部收在 `devices/alioth/` 里。它跑到的是同一个 iOS 16.5 用户态：桌面有壁纸、有小组件、触摸可用，
+面板跑在 120 Hz。
+
+| K40 上已经能用 | K40 上还不行 |
+|---|---|
+| 内核起到 SpringBoard；锁屏、桌面、自带 app | Wi-Fi：QCA6390 是 PCIe 外挂芯片，`hakios.wifi.c` 仍是 WCN6750 版本；PCIe 链路从来没训练起来过 |
+| 8 核全开；`bootcpu=7` 跑大核；EPSS 调频 | 麦克风：WCD938x 挂在 ADSP 后面的 SoundWire 上，没做过 |
+| 触摸（FT3658U）、多点、坐标按面板实测校正过 | 亮度（滑杆会走，然后什么都没发生）和音量上（不是 TLMM 引脚，固件没给它上拉）——两个不同的原因 |
+| GPU：freedreno 驱动真实 A650，CoreAnimation 由它渲染（`gl=1 adreno=22 adreno_keep=1`） | Metal：这一路完全没有 |
+| 显示：120 Hz（`display_hz=120`）；DCS 背光（`display_bl=N`） | 状态栏数字下面的电池颜色 |
+| 壁纸和小组件（镜像构建带 `SYSTEM=1`：407 个 launchd 作业，而不是 25 个） | 相机 |
+| `/private/var` 跨重启保留（`var_store=1 ufs_write=1`） | |
+| ADSP 固件加载（第 1-2 步，只读）；音频和功放已接线但未初始化 | |
+
+去读这个端口的笔记之前，有两件事值得先知道——每一件都曾经搭进去一整晚：
+
+- **根文件系统是上传进 loader 内存的 2.3 GB `userland/system.apfs`**，不是手机上的分区。冷启会清空
+  那块内存，但 `xl` 在手机旁边留的那条记录不会被清空，于是 `xl run` 静默地什么都不传，内核在
+  `Process 1 exec of /sbin/launchd failed, errno 2` 处 panic。**这永远不是镜像坏了。**
+  `xl enter` 现在会删那条记录；绕过 `xl enter` 直接用 `fastboot boot` 的不会。
+- **`mkxnuimg.py` 默认是 `poco-x5-pro`**，它的 UEFI 在另一个地址。不带 `DEVICE=alioth` 打出来的镜像
+  在这台手机上起不来。正确的镜像是 1,992,704 字节，POCO 的是 1,470,464。
+
+一天一天记下来的移植日志（包括那些后来被证伪的猜想）在 `PROGRESS.md`，它的开头有索引；
+`devices/alioth/README.md` 是这个端口的说明书，`devices/alioth/hardware.md` 是寄存器级的事实。
+
 ## QEMU 快速开始
 
 Linux x86-64，约 12 GB 磁盘，7-Zip 23 或更新，`lz4`，`qemu-system-aarch64`，`edk2-aarch64`。
@@ -86,6 +115,17 @@ make phone ARGS="modem=1" SECS=300  # 或自定义内核参数
 | `cam=5` | 摄像头 |
 | `modem=1` | 与系统并行启动调制解调器：固件、文件系统、IPA、SIM、NAS |
 | `var_store=1 ufs_write=1` | 跨重启保留 `/private/var` |
+
+在红米 K40（alioth，见 `devices/alioth/`）上有两条不一样，而且这是**故意的**：**`gpu=1` 在
+那里一定被拒绝**——那个简写是 POCO 的 Adreno 642L 的步骤，而 SM8250 的 Adreno 650 只有独立的
+1–22 步。能用的是
+
+```sh
+DEVICE=alioth XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 rd=md0 battery=1"
+```
+
+（`adreno_keep=1` 才是「把 GPU 留给系统画」的那一个；少了它，第 22 步做完就收摊，显示退回无 GPU
+的软件路径。）这个移植的其余细节在 `devices/alioth/hardware.md`。
 
 ## 从源码构建
 

@@ -54,6 +54,37 @@ Not in the repository, never:
 | `/private/var` kept across reboots (`var_store=1 ufs_write=1`) | |
 | Sileo, Procursus packages, SSH into the phone | |
 
+### The Redmi K40 (`alioth`) port
+
+The second phone is the **Redmi K40** (`alioth`, Snapdragon 870, 12 GB). The kernel, loader and user
+space are the same; what differs is collected in `devices/alioth/`. It boots the same iOS 16.5 user
+space to a home screen with a wallpaper, widgets and working touch, on a 120 Hz panel.
+
+| Works on the K40 | Not yet on the K40 |
+|---|---|
+| The kernel boots to SpringBoard; lock screen, home screen, stock apps | Wi-Fi: the QCA6390 is a PCIe part and `hakios.wifi.c` is still the WCN6750 version; the PCIe link has never trained |
+| All 8 cores; `bootcpu=7` on the big core; EPSS frequency scaling | Microphone: the WCD938x hangs off SoundWire behind the ADSP and has not been done |
+| Touch (FT3658U), multitouch, coordinates verified against the panel | Brightness (the slider moves, then nothing) and volume-up (not a TLMM pin; the firmware leaves it unpulled) -- two separate causes |
+| GPU: a real A650 through freedreno, CoreAnimation rendered by it (`gl=1 adreno=22 adreno_keep=1`) | Metal: this port has none |
+| Display: 120 Hz (`display_hz=120`); DCS brightness (`display_bl=N`) | Battery colour under the status-bar number |
+| Wallpaper and widgets (`SYSTEM=1` in the image build: 407 launchd jobs instead of 25) | Camera |
+| `/private/var` kept across reboots (`var_store=1 ufs_write=1`) | |
+| ADSP firmware loaded (steps 1-2, read-only); audio and amp are wired but not initialised | |
+
+Two things are worth knowing before reading the port notes, because each of them has cost a night:
+
+- **The root file system is a 2.3 GB `userland/system.apfs` uploaded into the loader's RAM**, not a
+  partition on the phone. A cold start empties that RAM, but the note file `xl` keeps beside the phone
+  does not empty with it, so `xl run` silently uploads nothing and the kernel panics at
+  `Process 1 exec of /sbin/launchd failed, errno 2`. That is never a bad image. `xl enter` now drops the
+  note; a `fastboot boot` that sidesteps `xl enter` does not.
+- **`mkxnuimg.py` defaults to `poco-x5-pro`**, whose UEFI lives at a different address. An image built
+  without `DEVICE=alioth` will not boot here. A good one is 1,992,704 bytes; a POCO one is 1,470,464.
+
+The day-by-day log of the port, including the hypotheses that turned out to be wrong, is `PROGRESS.md`;
+its head carries an index. `devices/alioth/README.md` is the map of the port and
+`devices/alioth/hardware.md` the register-level facts.
+
 ## Quick start in QEMU
 
 Linux x86-64, about 12 GB of disk, 7-Zip 23 or newer, `lz4`, `qemu-system-aarch64`, `edk2-aarch64`.
@@ -102,6 +133,18 @@ The main kernel arguments (the full list is in `docs/ru/notes.md`):
 | `modem_step=N` | the modem step by step, for debugging (`docs/cellular.md`) |
 | `var_store=1 ufs_write=1` | keep `/private/var` across reboots |
 
+On the Redmi K40 (alioth, `devices/alioth/`) two of these differ, and the difference is not a
+mistake: **`gpu=1` is refused there by design** -- that shorthand is the steps of the POCO's
+Adreno 642L, and the SM8250's Adreno 650 has only the standalone steps 1 to 22. What works is
+
+```sh
+DEVICE=alioth XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 rd=md0 battery=1"
+```
+
+(`adreno_keep=1` is what keeps the GPU for the system to draw with; without it step 22 is the end
+and the display falls back to drawing without a GPU). The rest of that port is in
+`devices/alioth/hardware.md`.
+
 ## Building from source
 
 The kernel (Linux: theos with its cctools and `iPhoneOS16.5.sdk`; macOS: Xcode or cctools, the SDK
@@ -131,16 +174,20 @@ module, or the open lzfse library gets built). User space and the images: `REST=
 | `userland/` | my programs and libraries (`src/`), the image build, launchd jobs |
 | `sysimage/` | scripts that fetch and unpack the OS files from the IPSW (none of the files themselves) |
 | `devices/poco-x5-pro/` | one phone: its UEFI port, device tree, prebuilt UEFI images, firmware script, tools |
+| `devices/alioth/` | a second phone (Redmi K40): the same list for a different SoC, plus `hardware.md`, the register-level facts |
 | `tools/` | APFS, firmware, QMI tests, run scripts |
 | `qemu/` | running in QEMU |
-| `docs/` | `notes.md`: the detailed notes (Russian); `cellular.md`: cellular; `air.md`, `metal.md`: the GPU |
+| `docs/` | `notes.md`: the detailed notes (Russian); `cellular.md`: cellular; `air.md`: the GPU; `metal.md`: Metal |
 | `prebuilt/` | the built loader and libraries (the kernel is not kept here) |
+| `PROGRESS.md` | the port log, day by day, newest last; its head says how to read it |
 
 ## Devices
 
 The kernel, loader and user space are shared. Everything about one phone lives in
-`devices/<name>/`: its UEFI, device tree, firmware list and tools. Today there is one,
-`devices/poco-x5-pro/`, and its README is the map of what a port to another Qualcomm phone must bring.
+`devices/<name>/`: its UEFI, device tree, firmware list and tools. The POCO's README
+(`devices/poco-x5-pro/`) is the map of what a port to another Qualcomm phone must bring, and
+`devices/alioth/` is that map followed a second time on a different SoC: compare the two before
+starting a third.
 The phone's drivers are the files `xnu/files/bsd/dev/hakios.*.c`; the head of each says where its
 numbers came from.
 
