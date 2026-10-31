@@ -26,7 +26,14 @@
 # Logs land in logs/. Environment for `run`:
 #   XL_CMDLINE  extra kernel boot-args; default "-v": the boot is shown as text on the phone's screen
 #               (XL_CMDLINE="" for a blank screen, XL_CMDLINE="-v systrace=1" to trace failing syscalls)
-#   XL_SECS     seconds after which the kernel returns to the loader on its own (default 8)
+#   XL_SECS     seconds after which the kernel returns to the loader on its own (default 0: never.
+#               The run goes on until "xl stop", which is what a system being used needs; a positive
+#               value is for bench scripts and for runs nobody is watching)
+#               A positive value is a promise the loader holds the kernel to (loader.c,
+#               OTHER_CPU_OVERRAN): still running 60 s past it, the kernel is declared stuck, what
+#               it logged is staged ("result: overrun") for a minute, and the loader cold-resets the
+#               phone by itself. A hung kernel with its timers still running is not silent, so
+#               nothing else would ever end such a run.
 #   XL_SB_DELAY seconds SpringBoard waits before it starts (default 8; see userland/src/inject_sb.c)
 #               Among XL_CMDLINE, for the phone: bootcpu=7 runs the kernel on the biggest core instead of
 #               the small one the firmware starts on (the loader then watches from the first core, and a
@@ -42,7 +49,8 @@
 # which outlives both the lock and any note beside it and belongs to whoever uploaded it last. So
 # `ramdisk` records who uploaded what, and how big it was, in $PHONE.ramdisk, and `run` prints that
 # when the last upload was not from this copy. The record starts empty -- an upload by a copy without
-# this change leaves none -- and `run` says so rather than assuming.
+# this change leaves none -- and `run` says so rather than assuming. `enter` drops it when it starts
+# a loader, because that loader's memory is empty: the image outlives runs, not reboots.
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 # On a Mac: flock, GNU timeout and stat, and Android's platform-tools, from tools/macos-bin (see its README)
 [ "$(uname)" = Darwin ] && PATH=$PWD/tools/macos-bin:$PWD/tools/macos-bin/platform-tools:$PATH
@@ -59,7 +67,22 @@ mkdir -p logs
 PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone
 
 # one fastboot at a time (a run in one terminal, "xl screenshot" in another): each takes the lock for itself
-fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
+#
+# A call that times out is not always the phone's fault: in WSL the fastboot here is a wrapper around
+# Windows's fastboot.exe, `timeout` kills only the wrapper, and the fastboot.exe behind it stays alive
+# holding the device -- after which every later call (this one's own poller included) answers "no
+# device" or 121, and a phone that is fine looks dead. On 31 October twenty probes in a row were read
+# that way. So after a timeout, under WSL only, the stray is killed before anyone believes the answer.
+fb() {
+	local out rc
+	out=$(flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1)
+	rc=$?
+	if [ $rc -eq 124 ] && grep -qi microsoft /proc/version 2>/dev/null; then
+		powershell.exe -NoProfile -Command "Stop-Process -Name fastboot -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1
+	fi
+	[ -n "$out" ] && printf '%s\n' "$out"
+	return $rc
+}
 # does the loader answer while its kernel runs (0.5 and later)? an older one answers only when the run is over
 live_loader() { fb getvar version | grep -Eq 'version: 0\.([5-9]|[1-9][0-9])'; }
 in_fastboot() { fastboot devices 2>/dev/null | grep -q fastboot; }
@@ -93,7 +116,15 @@ enter() {
 	for try in 1 2; do
 		FB_TIMEOUT=40 fb boot xnu-usb.img | grep -q OKAY || { sleep 3; continue; }
 		sleep 6
-		wait_for loader 30 && return 0
+		if wait_for loader 30; then
+			# This loader has just started, so its memory holds no resident image; the note beside
+			# the phone was written for the loader that is gone. Left in place it is believed:
+			# `run` sees a record from this copy and uploads nothing, and the kernel dies at
+			# "Process 1 exec of /sbin/launchd failed, errno 2" -- on 31 October, after a power
+			# cycle, that was one wasted boot before the note and the failure were put together.
+			rm -f $PHONE.ramdisk
+			return 0
+		fi
 		[ "$(state)" = fastboot ] || break
 	done
 	echo "xl: loader did not come up on USB (state: $(state))"; return 1
@@ -144,7 +175,7 @@ run() { # run <oem command> <label>
 		case " $args " in
 		*" wifi="*|*" wifi_step="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
 		esac
-		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
+		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-0} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
 		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
 	fi
 	local live=; live_loader && live=1
@@ -153,11 +184,18 @@ run() { # run <oem command> <label>
 		# the loader goes on answering: ask every two seconds until the result is no longer "running".
 		# XL_FOLLOW=N: fetch the log as it stands every N seconds as well, so that a phone that
 		# resets without a word leaves all it said up to then ($log.live)
-		local deadline=$(( $(date +%s) + ${XL_SECS:-8} + 100 )) followed=$(date +%s)
+		# XL_SECS=0 (the default) tells the kernel loader_return_after=0, which it reads as "never": the
+		# run then ends only when "xl stop" asks for it, so there is no deadline here either -- a long
+		# run is not a hang.
+		local deadline= followed=$(date +%s)
+		# ... and it is the loader that holds the kernel to it: 60 s past the promise the kernel is
+		# declared stuck and 60 s later the phone is reset by the loader itself (loader.c,
+		# OTHER_CPU_OVERRAN), so this waits past both before it gives up on the phone.
+		[ "${XL_SECS:-0}" != 0 ] && deadline=$(( $(date +%s) + ${XL_SECS:-0} + 150 ))
 		while :; do
 			result=$(FB_TIMEOUT=15 fb getvar result | grep '^result:')
 			case "$result" in ""|*running*) ;; *) break ;; esac
-			[ "$(date +%s)" -ge "$deadline" ] && { result=; break; }
+			[ -n "$deadline" ] && [ "$(date +%s)" -ge "$deadline" ] && { result=; break; }
 			if [ -n "$XL_FOLLOW" ] && [ $(( $(date +%s) - followed )) -ge "$XL_FOLLOW" ]; then
 				followed=$(date +%s)
 				# (XL_FOLLOW_KEEP=1: every one kept, $log.live.1, .2, ...: a long run's middle, which the log
@@ -168,7 +206,7 @@ run() { # run <oem command> <label>
 			sleep 2
 		done
 	else
-		result=$(FB_TIMEOUT=$(( ${XL_SECS:-8} + 100 )) fb getvar result | grep '^result:')
+		result=$(FB_TIMEOUT=$(( ${XL_SECS:-0} + 100 )) fb getvar result | grep '^result:')
 	fi
 	if [ -z "$result" ]; then
 		echo "xl: no answer — the kernel hung; waiting for the watchdog to reset the phone"
@@ -183,6 +221,12 @@ run() { # run <oem command> <label>
 		# (bootcpu=N) the kernel is stuck on the core it was given and nothing can take the core back
 		echo "xl: the kernel did not come back from its core; restarting the phone"
 		fb reboot >/dev/null
+		return 2 ;;
+	*overrun*)
+		# (bootcpu=N, XL_SECS=N) the kernel said it would be back and was not. The loader staged
+		# what it logged (fetched above) and resets the phone itself after a minute, so nothing
+		# is asked of it here -- a fastboot command would race the reset.
+		echo "xl: the kernel did not return within its time; the loader is restarting the phone"
 		return 2 ;;
 	esac
 }

@@ -464,6 +464,16 @@ loader_return_timer_init(void)
 	if (!PE_parse_boot_argn("loader_return_after", &seconds, sizeof(seconds)) || seconds == 0) {
 		return;
 	}
+	/*
+	 * For testing what the loader does with a kernel that never comes back (loader.c,
+	 * OTHER_CPU_OVERRAN): boot-arg loader_return_skip=1 leaves the promise in the command line
+	 * and does not keep it. Nothing but a test passes it; without it this does nothing.
+	 */
+	uint32_t skip = 0;
+	if (PE_parse_boot_argn("loader_return_skip", &skip, sizeof(skip)) && skip != 0) {
+		printf("loader_return_after=%u was asked for, and not armed (loader_return_skip)\n", seconds);
+		return;
+	}
 	thread_call_t call = thread_call_allocate(loader_return_timer, NULL);
 	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(call, deadline);

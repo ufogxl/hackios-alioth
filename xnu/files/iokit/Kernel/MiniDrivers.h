@@ -5,6 +5,7 @@
  *
  *   MiniIOSurface.cpp              IOSurface: pixel buffers shared between processes
  *   MiniIOMobileFramebuffer.cpp    IOMobileFramebuffer: the display (the boot framebuffer)
+ *   MiniAppleBacklight.cpp         AppleBacklight: the panel's brightness, DCS 0x51 behind it
  *   MiniAppleKeyStore.cpp          AppleKeyStore: the keybag of a device without a passcode
  *   MiniIONetworkStack.cpp         IONetworkStack: what configd's interface namer waits for
  */
@@ -15,6 +16,7 @@
 
 void MiniIOSurfaceStart(IOService * provider);
 void MiniIOMobileFramebufferStart(IOService * provider);
+void MiniAppleBacklightStart(IOService * provider);
 void MiniAppleKeyStoreStart(void);
 void MiniIONetworkStackStart(void);
 

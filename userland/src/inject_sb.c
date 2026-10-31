@@ -32,6 +32,7 @@
  *     answered, with that program's layers.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <ctype.h>
 #include <time.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
@@ -592,11 +593,107 @@ battery_view_charge_percent(id self, SEL sel)
 	return original_battery_view_charge_percent ? original_battery_view_charge_percent(self, sel) : 0.0;
 }
 
+/*
+ * What the battery view is made of, once. The survey below says which methods the classes have; this
+ * says what the drawn thing is: every subview to two levels down, its frame, whether it is hidden,
+ * and the colours it is drawn in -- the view's own and the ones on its layer, where a shape layer's
+ * fillColor is what actually paints the fill. The colour question ("white here, green on a phone
+ * that charges") is answered by one of these lines, not by guessing a method name.
+ *
+ * Said three seconds after the first level is set, so the view has been laid out.
+ */
+static const char *
+battery_text(id object)
+{
+	id text;
+
+	if (object == nil) {
+		return NULL;
+	}
+	text = ((id (*)(id, SEL))objc_msgSend)(object, sel_registerName("description"));
+	return text != nil ? ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String")) : NULL;
+}
+
+static void
+battery_dump_colour(const char *what, id object)
+{
+	const char *text = battery_text(object);
+
+	if (text != NULL) {
+		say("hakios: battery view:       %s %s\n", what, text);
+	}
+}
+
+typedef struct {
+	double x, y, width, height;
+} battery_frame_t;
+
+static void
+battery_dump_view(id view, int depth)
+{
+	static int left = 16;
+	battery_frame_t f;
+	id colour, layer, subviews;
+	const char *name;
+	unsigned long count = 0;
+
+	if (view == nil || depth > 2 || left <= 0) {
+		return;
+	}
+	left--;
+
+	name = class_getName(object_getClass(view));
+	f = ((battery_frame_t (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
+	say("hakios: battery view: %*s%s %.0fx%.0f at %.0f,%.0f hidden %d alpha %.2f\n", depth * 4, "",
+	    name != NULL ? name : "?", f.width, f.height, f.x, f.y,
+	    (int)((BOOL (*)(id, SEL))objc_msgSend)(view, sel_registerName("isHidden")),
+	    (double)((double (*)(id, SEL))objc_msgSend)(view, sel_registerName("alpha")));
+	colour = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("backgroundColor"));
+	battery_dump_colour("background", colour);
+	colour = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("tintColor"));
+	battery_dump_colour("tint", colour);
+	layer = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("layer"));
+	if (layer != nil) {
+		name = class_getName(object_getClass(layer));
+		say("hakios: battery view:       layer %s\n", name != NULL ? name : "?");
+		/* fillColor and strokeColor are a CAShapeLayer's, not a CALayer's: ask before sending. */
+		if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(layer, sel_registerName("respondsToSelector:"),
+		    sel_registerName("fillColor"))) {
+			battery_dump_colour("fill", ((id (*)(id, SEL))objc_msgSend)(layer, sel_registerName("fillColor")));
+		}
+		if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(layer, sel_registerName("respondsToSelector:"),
+		    sel_registerName("strokeColor"))) {
+			battery_dump_colour("stroke", ((id (*)(id, SEL))objc_msgSend)(layer, sel_registerName("strokeColor")));
+		}
+		colour = ((id (*)(id, SEL))objc_msgSend)(layer, sel_registerName("backgroundColor"));
+		battery_dump_colour("layer background", colour);
+	}
+	subviews = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("subviews"));
+	if (subviews != nil) {
+		count = ((unsigned long (*)(id, SEL))objc_msgSend)(subviews, sel_registerName("count"));
+		for (unsigned long i = 0; i < count && i < 8; i++) {
+			battery_dump_view(((id (*)(id, SEL, unsigned long))objc_msgSend)(subviews,
+			    sel_registerName("objectAtIndex:"), i), depth + 1);
+		}
+	}
+}
+
 static void
 battery_view_set_charge_percent(id self, SEL sel, double p)
 {
+	static int seen;
 	int soc = sysctl_int("kern.hakios.battery_soc");
 
+	if (seen++ == 0) {
+		id view = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("retain"));
+
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			say("hakios: battery view: the tree of %s:\n",
+			    class_getName(object_getClass(view)) != NULL ? class_getName(object_getClass(view)) : "?");
+			battery_dump_view(view, 0);
+			((void (*)(id, SEL))objc_msgSend)(view, sel_registerName("release"));
+		});
+	}
 	original_battery_view_set_charge_percent(self, sel, (soc >= 0 && soc <= 100 && !battery_power_source()) ? (double)soc / 100.0 : p);
 }
 
@@ -629,6 +726,159 @@ battery_post_notifications(void)
 	}
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
 		battery_post_notifications();
+	});
+}
+
+/* ---- the status bar's battery, surveyed ---------------------------------------------------------- */
+
+/*
+ * Which methods the views that draw the battery have, and at which unslid addresses.
+ *
+ * The hooks above settle the fill fraction (chargePercent), the number (showsPercentage) and the
+ * bolt (_shouldShowBolt). A real phone also turns the fill green while it charges, and that is a
+ * property of neither: it is chosen inside _UIBatteryView from a state it is given -- batteryState,
+ * chargingState, or a colour of its own -- and hooking the wrong one would paint a white icon
+ * green on a phone that is not charging, or paint nothing at all. So the log says who has what:
+ * every method whose name mentions the battery, the charge, the colour or the fill, with its type
+ * encoding, and every ivar named that way.
+ *
+ * Said twice, 90 s and 240 s after SpringBoard starts: the loader fetches only the tail of its log,
+ * and a line printed once at startup can fall between two fetches and be lost.
+ */
+static bool
+battery_name_interesting(const char *name)
+{
+	static const char *const words[] = {
+		"battery", "charge", "percent", "bolt", "color", "colour", "fill", "level", "state",
+	};
+	char lower[256];
+	size_t n = strlen(name);
+
+	if (n >= sizeof(lower)) {
+		n = sizeof(lower) - 1;
+	}
+	for (size_t i = 0; i < n; i++) {
+		lower[i] = (char)tolower((unsigned char)name[i]);
+	}
+	lower[n] = '\0';
+	for (unsigned i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		if (strstr(lower, words[i]) != NULL) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+battery_survey_class(const char *name)
+{
+	Class cls = objc_getClass(name);
+	unsigned total = 0;
+
+	if (cls == NULL) {
+		say("hakios: battery survey: there is no class called %s\n", name);
+		return;
+	}
+	for (int meta = 0; meta < 2; meta++) {
+		Class owner = meta ? object_getClass((id)cls) : cls;
+		unsigned count = 0;
+		Method *methods = class_copyMethodList(owner, &count);
+
+		total += count;
+		for (unsigned i = 0; methods != NULL && i < count; i++) {
+			const char *sel = sel_getName(method_getName(methods[i]));
+			const char *types;
+
+			if (!battery_name_interesting(sel)) {
+				continue;
+			}
+			types = method_getTypeEncoding(methods[i]);
+			say("hakios: battery survey: %c[%s %s] %#lx \"%s\"\n", meta ? '+' : '-', name, sel,
+			    (uintptr_t)method_getImplementation(methods[i]) - slide, types != NULL ? types : "?");
+		}
+		free(methods);
+	}
+	{
+		unsigned count = 0;
+		Ivar *ivars = class_copyIvarList(cls, &count);
+
+		for (unsigned i = 0; ivars != NULL && i < count; i++) {
+			const char *ivar = ivar_getName(ivars[i]);
+			const char *types = ivar_getTypeEncoding(ivars[i]);
+
+			if (ivar == NULL || !battery_name_interesting(ivar)) {
+				continue;
+			}
+			say("hakios: battery survey: [%s] ivar %s at +%td \"%s\"\n", name, ivar, ivar_getOffset(ivars[i]),
+			    types != NULL ? types : "?");
+		}
+		free(ivars);
+	}
+	say("hakios: battery survey: %s has %u methods, instance size %zu\n", name, total, (size_t)class_getInstanceSize(cls));
+}
+
+static void
+battery_survey(void)
+{
+	static const char *const classes[] = {
+		"_UIBatteryView", "UIStatusBarBatteryItemView", "UIStatusBarBatteryPercentItemView",
+		"_UIStaticBatteryView", "_UIStatusBarBatteryItem",
+	};
+
+	for (unsigned i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) {
+		battery_survey_class(classes[i]);
+	}
+}
+
+static void
+battery_survey_later(int seconds)
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)seconds * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		say("hakios: battery survey: %d s after SpringBoard's start\n", seconds);
+		battery_survey();
+	});
+}
+
+/* ---- is the kernel's stand-in backlight service visible from inside iOS? -------------------------- */
+
+/*
+ * The kernel publishes a service whose class is AppleBacklight (and, with backlight_arm=1, also
+ * AppleARMBacklight): iokit/Kernel/MiniAppleBacklight.cpp. Whether CoreBrightness finds it is the
+ * question the "asked for N times" line answers; this asks it from the other side, from inside the
+ * system, and says where in the registry the service sits. A match with no path would mean the
+ * service is there but nobody has its parent right; no match at all would mean the userland cannot
+ * see it and the class name is beside the point.
+ */
+static void
+backlight_probe(void)
+{
+	static const char *const names[] = { "AppleBacklight", "AppleARMBacklight" };
+
+	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		io_service_t service = IOServiceGetMatchingService(0, IOServiceMatching(names[i]));
+
+		if (service == 0) {
+			say("hakios: backlight probe: %s: no such service in the registry\n", names[i]);
+			continue;
+		}
+		{
+			io_string_t path = "";
+
+			if (IORegistryEntryGetPath(service, kIOServicePlane, path) == KERN_SUCCESS) {
+				say("hakios: backlight probe: %s -> %s\n", names[i], path);
+			} else {
+				say("hakios: backlight probe: %s: found, but it has no registry path\n", names[i]);
+			}
+		}
+		IOObjectRelease(service);
+	}
+}
+
+static void
+backlight_probe_later(int seconds)
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)seconds * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		backlight_probe();
 	});
 }
 
@@ -1360,6 +1610,12 @@ hakios_springboard_init(void)
 	    original_battery_view_charge_percent ? "ok" : "NO",
 	    original_battery_view_set_charge_percent ? "ok" : "NO",
 	    original_ring_charging_level ? "ok" : "NO");
+	/* ... and what those views can be asked, said once the system is up (see battery_survey). */
+	battery_survey_later(90);
+	battery_survey_later(240);
+	/* ... and whether the backlight service the kernel publishes can be seen from here (backlight_probe). */
+	backlight_probe_later(95);
+	backlight_probe_later(245);
 	{
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;

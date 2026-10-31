@@ -31,7 +31,8 @@ not there yet (that file, and not `xnu-clang`, is the mark of a finished setup: 
 tracked in the repository).
 
 The kernel: `xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837`.
-`./xl run` and `qemu/run-ios.sh` take it from there (`prebuilt/` only when it is missing).
+`./xl run` and `qemu/run-ios.sh` take it from there and nowhere else: `prebuilt/` no longer carries a
+copy, so a run without a build of this tree refuses instead of quietly running an old one.
 
 Things to know:
 

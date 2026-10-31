@@ -916,8 +916,11 @@ static uint64_t sound_len;
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
+#define OTHER_CPU_OVERRAN       1002    /* ... the kernel said when it would be back and is not */
 #define START_SECONDS           5
 #define SILENCE_SECONDS         50
+#define RETURN_GRACE_SECONDS    60      /* past its promise a kernel is given this long before it is stuck */
+#define OVERRUN_LINGER_SECONDS  60      /* ... and the host this long to fetch what it logged before the reset */
 #define NOTE_SECONDS            24      /* how long the kernel's progress is written down as it happens */
 static void wdt_pet(void);
 static int wdt_armed;
@@ -2221,7 +2224,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		 * the kernel does it too, but whether that counts from another core is not known.
 		 * After that a kernel that neither returns nor hangs visibly meets the watchdog.
 		 */
-		if (wdt_armed && seconds_since(last_pet) >= 5 && seconds_since(started) < budget + 60) {
+		if (wdt_armed && seconds_since(last_pet) >= 5 && seconds_since(started) < budget + RETURN_GRACE_SECONDS) {
 			wdt_pet();
 			last_pet = READ_SYSREG(CNTVCT_EL0);
 		}
@@ -2239,6 +2242,19 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 				log_of_hung_kernel(live, slide);
 				status = OTHER_CPU_HUNG;
 			}
+		}
+		/*
+		 * A kernel that hangs with its timers still running is not silent: the heartbeat above
+		 * never goes quiet, no watchdog here is armed (the Haven one is redwood's), and the run
+		 * goes on until somebody holds the power button. But the kernel said when it would be
+		 * back -- loader_return_after=N is in the command line of every run with XL_SECS set --
+		 * and the host counts on it. So the promise is kept: RETURN_GRACE_SECONDS past it the
+		 * kernel is declared stuck and its log is taken while it is still in memory.
+		 * (budget 0 is the ordinary run: no promise, no deadline, it ends with "xl stop".)
+		 */
+		if (budget != 0 && arrived && live != NULL && seconds_since(started) >= budget + RETURN_GRACE_SECONDS) {
+			log_of_hung_kernel(live, slide);
+			status = OTHER_CPU_OVERRAN;
 		}
 		if (block_enabled) {
 			block_poll();
@@ -3194,7 +3210,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			wdt_set_ms(WDT_BITE_MS);
 			if (status != 0) {
 				/* a kernel that hung may have left its own transfer list in the controller */
-				hc_take_back(status == OTHER_CPU_HUNG ? "the kernel hung" : "the kernel did not start");
+				hc_take_back(status == OTHER_CPU_HUNG ? "the kernel hung" :
+				    status == OTHER_CPU_OVERRAN ? "the kernel did not come back" : "the kernel did not start");
 			}
 			if (status == OTHER_CPU_HUNG) {
 				/* the kernel still has that core; what it logged can be had all the same */
@@ -3202,6 +3219,33 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				    (uint64_t)SILENCE_SECONDS);
 				set_result("hung", loader_ctx[CTX_LOG_LEN], 0);
 				write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
+				return 1;
+			} else if (status == OTHER_CPU_OVERRAN) {
+				/*
+				 * The kernel said it would be back and it is not. Whatever holds it -- a driver
+				 * waiting on a clock, a panic that could not print -- the phone is out of reach
+				 * from here: only a reset takes it back, and nobody may be there to press the
+				 * button. So what it logged is staged for the host first ("result: overrun"),
+				 * the host gets OVERRUN_LINGER_SECONDS to fetch it, and then the phone is
+				 * started over whether or not anyone asked.
+				 */
+				print("THE KERNEL DID NOT RETURN: it said %d seconds, its log follows; the phone is restarted in %d seconds\n",
+				    kernel_budget, (uint64_t)OVERRUN_LINGER_SECONDS);
+				set_result("overrun", loader_ctx[CTX_LOG_LEN], 0);
+				write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
+				uint64_t ling = READ_SYSREG(CNTVCT_EL0), ling_pet = ling;
+				while (seconds_since(ling) < OVERRUN_LINGER_SECONDS) {
+					/* (where the Haven one is armed -- redwood -- it is not to bite during the
+					 * minute the host has, and the reset below is the one that is to happen) */
+					if (wdt_armed && seconds_since(ling_pet) >= 5) {
+						wdt_pet();
+						ling_pet = READ_SYSREG(CNTVCT_EL0);
+					}
+					usb_poll_command();
+				}
+				print("restarting the phone\n");
+				flush_log();
+				ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 				return 1;
 			} else if (status != 0) {
 				/* the kernel was told it would be on that core (return path, device tree): no second try */
@@ -3867,9 +3911,16 @@ efi_main(efi_handle image, efi_system_table *st)
 		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
 			if (platforms[i]->fb_base == SCREEN.base)
 				PLAT = platforms[i];
-		if (PLAT == &platform_qemu_virt)
-			ramfb_phone_screen();
+		/*
+		 * The line comes before ramfb_phone_screen(), not after: that call is QEMU's, and it
+		 * writes fw_cfg at 0x09020000. A phone whose firmware reported a framebuffer base this
+		 * loader does not know used to take that path and fault on the write (a synchronous
+		 * exception, 0x26d8 into the image, before the hook was installed), with the one line
+		 * that says which base it was never printed. It runs only for QEMU's own ramfb now.
+		 */
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
+		if (PLAT == &platform_qemu_virt && SCREEN.base == platform_qemu_virt.fb_base)
+			ramfb_phone_screen();
 	}
 	print("platform %s\n", PLAT->name);
 	install_exception_hook();

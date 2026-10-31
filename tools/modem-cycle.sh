@@ -4,7 +4,11 @@
 # (or fastboot) for the next run (XL_END=android: back to Android).
 # The phone is never flashed: the kernel is booted with "fastboot boot"-like upload through xl.
 cd "$(dirname "$0")/.." || exit 1
-PATH=$PWD/tools/macos-bin/platform-tools:$PWD/tools/macos-bin:$PATH
+# On a Mac: flock and GNU timeout from tools/macos-bin, as xl does. Only there: those are shims that
+# exec /opt/local/bin/gtimeout and /opt/local/bin/gstat, which do not exist on Linux -- and with them in
+# front, xl's "timeout 10 fastboot getvar" fails, so it reads a loader as plain fastboot, enter() never
+# boots it, and every run ends with "the run never started".
+[ "$(uname)" = Darwin ] && PATH=$PWD/tools/macos-bin/platform-tools:$PWD/tools/macos-bin:$PATH
 ARGS=$1; SECS=${2:-300}
 # A port's SoC addresses (devices/<name>/soc.args, made by devices/<name>/pull-soc.sh): added to the
 # kernel command line so hakios.mpss.c / hakios.ipa.c map that phone's blocks. SOC_ARGS names the file;
