@@ -155,35 +155,132 @@ XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 bootcpu=7 cpus=8 rd=md0 b
 
 完整清单在 `docs/ru/notes.md`。
 
-## 亮度回读为什么读不到
+## 亮度：控制中心能调了
 
-写亮度正常（DCS 0x51）。**任何读命令都拿不到数据**，七种组合全部试过：
+### 控制中心能调亮度：缺的是 `backlight-control` 一个属性
 
-| 尝试 | `status0` | `ack err` | 数据 |
+**现象**：设置里拖亮度条，滑杆动、控制中心的数字也变，屏幕亮度不变；控制中心里那条拖不动。
+
+**原因**：CoreBrightness 找背光服务的条件**不是类名**。它有三种控制器可选——
+`BCAppleBacklightBrtControl`（真实）、`BCHIDBrtControl`（HID）、`BCVirtualBrtControl`（虚拟：只改 UI
+数值、不碰硬件）。缺条件时它退回第三个，所以滑杆动、屏幕不动。
+
+真正的条件是（来自 sheng 的 `AppleARMBacklight.cpp`，通过 asteroids 端口的
+`package/AsteroidsBacklight.cpp` 读到）：**服务要有 `backlight-control = true`，且 conforms to
+`AppleARMBacklight`**；range 从 `IODisplayParameters` 读；电平通过 `setProperties` 以**扁平的**
+`{brightness, FadePeriod}` 送来（不是嵌套在 `IODisplayParameters` 下）。
+
+`xnu/files/iokit/Kernel/MiniAppleBacklight.cpp` 现在：
+
+```c
+setProperty("NativeSandboxGrantProcess", "backboardd");   /* 沙盒允许 backboardd 写这些属性 */
+setProperty("backlight-control", true);                    /* CoreBrightness 的匹配条件 */
+```
+
+`setProperties` 也接受扁平格式。改完实测：控制中心拖动，`dcs 51` 一次会话发出 **55 次**，
+每个中间电平都到了面板。
+
+**教训**：`IOServiceMatching` 类名对上了不等于 CoreBrightness 会用——它还要属性。遇到 iOS 侧
+不认的服务，先去 [unixnu.com/devices](https://unixnu.com/devices/) 里搜别的机型的 `porting.toml`
+（搜 `brightness`/`backlight`），比啃二进制快得多。这次就是从 `rootstockos/UniXNU-asteroids`
+（Nothing Phone 3a）的 T37 记录里找到的。
+
+### 读回（DCS 0x52）仍然不通，但不影响
+
+```
+display: brightness 1140: dcs 52 answered 00000000 ... no level in it
+```
+
+写亮度不依赖读回。vendor 自己也从不读背光（`dsi_panel.c` 里写着"理想情况下应该从面板读，现在只设
+默认值"），所以这块面板支不支持读回从未被验证过。详见下面一节。
+
+### 曾经能调、后来不能调：`CMD_DMA_CTRL` 的 bit 28 是借来的
+
+`display_bl=N` 和 `display_bl_ramp=1` 有一夜是好用的，第二天同一份代码同一份参数就纹丝不动。
+根因不在包格式、不在地址、不在时序，而在**一个从没被显式设置过的寄存器位**：
+
+| 启动 | `CMD_DMA_CTRL` 原始值 | bit 28（embedded mode） | 亮度 |
 |---|---|---|---|
-| 命令 DMA，`0x05` 当读命令 | `0x5` | 0 | 全 0 |
-| 命令 DMA，改成 `0x06` | `0x0` | 0 | 全 0 |
-| TPG FIFO（参考项目那条） | `0x0` | 0 | 全 0 |
-| `0x37` 与读命令批处理 | `0x5` | `0x1000800` | 全 0 |
-| `0x37` + RDBK 双写复位 | `0x5` | `0x1000800` | 全 0 |
-| `0x37` + MDP 空闲等待 | `0x5` | `0x1000800` | 全 0 |
-| `0x37` + HS 模式（`display_hs=1`） | `0x5` | `0x1000800` | 全 0 |
+| 10-31 凌晨 | `0x14000000` | **有** | 能调 |
+| 10-31 深夜 | `0x4000001` | **无** | 不动 |
 
-`ack err` 的 bit 24 是 `DSI_PERIPH_ERROR_PKT`——**面板回了错误包**，它收到了命令但拒绝执行。
+bit 28 决定命令引擎**是否去内存里取包**。没有它，引擎照样置 `CMD_DMA_DONE`、日志全绿，
+但包根本没发出去，面板什么也没收到。
 
-换成 MIPI 最基础的读命令 `0x0a`（get power mode）测试，**一样被拒**。所以不是 0x52 不被支持，
-而是这块面板在 cmd 模式下不接受任何 DCS 读。
+这套代码一直继承 bootloader 留下的值。vendor 的每个 kickoff 路径都显式写
+（`dsi_ctrl_hw_cmn.c`：`reg |= BIT(28); reg &= ~BIT(24); reg &= ~BIT(29);`）。现在 `dsi_power_mode()`
+每次发包前把这几位写死：
 
-**vendor 从不读背光**：`dsi_panel.c` 和 `dsi_ctrl.c` 里搜不到任何发 DCS 0x52 的地方。厂商自己
-只写不读，所以“面板在什么条件下允许读”从来没有被验证过。参考项目的 `porting.toml` 里那条同样
-写着 "Not verified on hardware"。
+```c
+ctrl &= ~((1u << 31) | (1u << 30));     /* broadcast off, master on */
+ctrl |= (1u << 28);                      /* embedded mode：从内存取包 */
+ctrl &= ~((1u << 24) | (1u << 29));     /* packet type 0, WC_SEL 0 */
+```
 
-往下走需要 k11a 的 datasheet，或厂商初始化序列里有没有开启读的配置——两样手上都没有。
+改后 `0x4000001` → `0x14000001`，**屏幕能变暗了**（`display_bl=32` 实测可见）。
 
-### 顺带修掉的一个真缺陷
+**教训**：`CMD_DMA_DONE` 只证明主机跑完一次传输，不证明包上了线。寄存器里"能读到就以为对"的位，
+要么自己设，要么别信它。
 
-`dsi_read()` 一直把 **`0x05`（DCS short write）当读命令**用，正确的是 **`0x06`**（DCS read）。
-这影响所有走它的路径，包括 `display_read=N`。另外 `0x37` 不能单独发——vendor 的
-`dsi_set_max_return_size` 清掉它的 last 标志，和读命令**批处理进同一次传输**。
+### 读回：面板回的是错误包，而 vendor 从没实现过读
 
-代码里两条路都会走，失败时打 `no answer on either path`，不会假装读到了电平。
+同一个 bit 28 的修复顺带让读回从"完全沉默"变成"有回应"：
+
+```
+dcs read 52: intr 0x100501, status0 0, timeout 0, ack err 0x1003b04, rdbk ctrl 0x40000, data 全 0
+```
+
+`rdbk ctrl 0x40000 >> 16 = 4`。一开始以为收到了 4 字节数据，继续查才看清：
+
+- **`timeout 0`**：不是总线超时，控制器认为传输正常完成
+- **`ack err` 的 bit 24** 是 `DSI_PERIPH_ERROR_PKT`——**外设错误包**
+- MIPI 错误包正好 4 字节（DI + 2 字节错误码 + ECC）
+
+所以那 4 字节不是数据，是**面板回的错误包本身**；硬件把它解析成 `ack err` 的位，所以
+`RDBK_DATA` 里没有载荷。`ack err` 的低 16 位 `0x3b04` 应该就是面板报的错误码——vendor 只解码
+bit 15/16/17/20/23/24，这几位没有名字。
+
+换 `0x0a`（get power mode）和 `0x04`（get display ID）测试，**结果完全一样**。不是 0x52 特殊，
+是所有 DCS 读都被拒。
+
+**然后看到了这句。** vendor 自己的 `dsi_panel.c:1041`：
+
+```c
+case DSI_BACKLIGHT_DCS:
+case DSI_BACKLIGHT_EXTERNAL:
+case DSI_BACKLIGHT_PWM:
+default:
+	/*
+	 * Ideally, we should read the backlight level from the
+	 * panel. For now, just set it default value.
+	 */
+	break;
+```
+
+我们的面板正是 `DSI_BACKLIGHT_DCS`（`bl_ctrl_dcs`）。**高通自己写着"理想情况下应该从面板读，
+现在只设默认值"。** 而且在整个 `techpack/display/` 里搜 `MIPI_DSI_DCS_READ`，只有一处，是
+`dsi_ctrl.c:1093` 设置 BTA 标志的判断——**没有任何地方真正发起过 DCS 读**。
+
+结论：这不是我们能修的 bug，是厂商留着没做的一段。写亮度可用（`display_bl=N`、
+`display_bl_ramp=1` 都实测有效），读回要知道面板到底支不支持、需要什么前置条件，
+只能查 k11a 的 datasheet——手上没有。
+
+### 顺带修掉的一个自己写的 bug
+
+`dsi_tpg_read()` 里 `ctrl` 变量先存 `CMD_DMA_CTRL`、后又被拿去读 `RDBK_DATA_CTRL`，最后那句恢复
+**把 RDBK 的值写进了命令引擎的控制字**。现在用 `dma_ctrl_saved` 单独保存。
+
+### 一路试过的（留作记录）
+
+| 尝试 | 结果 |
+|---|---|
+| `0x05` 当读命令 | `status0 0x5`，面板拒绝 |
+| 改成 `0x06`（DCS read） | `status0 0x0`，接受但仍无数据 |
+| TPG FIFO（参考项目那条） | 传输 `done`，仍无数据 |
+| `0x37` 与读命令批处理（vendor 的正确做法） | `ack err 0x1000800` |
+| `+ RDBK` 双写复位 / `+ MDP` 空闲等待 / `+ HS` 模式 | 同上 |
+| **显式设置 bit 28** | **写亮度恢复；读回字节数 0 → 4** |
+
+`ack err` 的 bit 24 是 `DSI_PERIPH_ERROR_PKT`。vendor 树里从不读背光
+（`dsi_panel.c`、`dsi_ctrl.c` 无 `0x52`），参考项目同样标着 "Not verified on hardware"。
+

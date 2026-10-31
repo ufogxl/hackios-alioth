@@ -301,7 +301,8 @@ GenericARMPE::start(IOService * provider)
 	/* Stand-ins for the closed graphics drivers that the iOS window server talks to. */
 	MiniIOSurfaceStart(this);
 	MiniIOMobileFramebufferStart(this);
-	MiniAppleBacklightStart(this);
+	/* MiniAppleBacklightStart(this): moved into IOMobileFramebuffer::start, so the service sits
+	 * under the display the way iOS expects to find it. */
 	MiniAppleKeyStoreStart();
 	MiniIONetworkStackStart();
 	return true;

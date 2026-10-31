@@ -3612,3 +3612,328 @@ cpus=8 rd=md0 battery=1`：
 **重建镜像一律用 `GL=1 REST=1 SYSTEM=1 ./build.sh`**，三个都不能省：
 `GL` 少了停在 logo，`REST` 少了壁纸黑+小组件空白，`SYSTEM` 少了 dylib 改了镜像不更新。
 判断手上的镜像属于哪套：`ls /redwood/LaunchDaemons | wc -l` → **25 = 精简，407 = 全量**。
+## 2026-10-31 23:55 亮度曾能调后来不能调：`CMD_DMA_CTRL` 的 bit 28 是借来的
+
+### 现象
+
+`display_bl_ramp=1` 跑完，日志全绿——渐变循环完整、每包 `intr 0x501`、`CMD_DMA_DONE` 置位——
+**屏幕纹丝不动**。而 `PROGRESS.md` 里明确记着 10-31 凌晨亮度过："换 `display_dma_at=0x9aead000`
+重跑——亮度变了"。同一份代码、同一个参数，一次能用一次不能用。
+
+### 根因
+
+把寄存器原值打出来，`CMD_DMA_CTRL` 在两个不同的启动里完全不同：
+
+| 启动 | 原始值 | bit 28（embedded mode） | 亮度 |
+|---|---|---|---|
+| 10-31 凌晨 | `0x14000000` | **有** | 能调 |
+| 10-31 深夜 | `0x4000001` | **无** | 不动 |
+
+bit 28 决定命令引擎**是否去内存里取包**。没有它，引擎照样把传输"跑完"并置 `CMD_DMA_DONE`，
+包根本没发出去——所以日志全绿而面板毫无反应。
+
+这套代码从没自己设过这一位，一直继承 bootloader 的余温。vendor 的每个 kickoff 路径都显式写
+（`dsi_ctrl_hw_cmn.c:673`：`reg |= BIT(28); reg &= ~BIT(24); reg &= ~BIT(29);`），我们没做。
+
+### 修法
+
+`dsi_power_mode()` 现在每次发包前写死这几位：
+
+```c
+ctrl &= ~((1U << 31) | (1U << 30));     /* broadcast off, master on */
+ctrl |= (1U << 28);                      /* embedded mode：从内存取包 */
+ctrl &= ~((1U << 24) | (1U << 29));     /* packet type 0, WC_SEL 0 */
+```
+
+`0x4000001` → `0x14000001`。实测 `display_bl=32` 屏幕**明显变暗**，`display_bl_ramp=1` 渐变可见。
+
+### 顺带修掉的一个自己写的 bug
+
+`dsi_tpg_read()` 里 `ctrl` 先存 `CMD_DMA_CTRL`、后又被拿去读 `RDBK_DATA_CTRL`，最后那句
+`wr(dsi + DSI_CMD_DMA_CTRL, ctrl & ~CMD_DMA_EMBEDDED)` **把 RDBK 寄存器的值写进了命令引擎的控制字**。
+现在用 `dma_ctrl_saved` 单独保存原值。这个 bug 会让每次读回尝试之后，后续所有写亮度都失败。
+
+### 读回：从沉默变成"回了 4 字节，但内容是 0"
+
+同一个修复顺带让读回有响应：
+
+```
+dcs read 52: intr 0x100501, status0 0, ack err 0x1003b04, rdbk ctrl 0x40000, data 00000000 ...
+```
+
+`rdbk ctrl 0x40000` 的 bit 31:16 是读回字节数，`>> 16` = **4**。面板确实回了 4 个字节，
+但四个 RDBK 字读出来全是 0。下一步查这 4 字节落在哪（读序，或需要更长等待）。
+
+### 教训
+
+**`CMD_DMA_DONE` 只证明主机跑完一次传输，不证明包上了线。** 寄存器里"能读到就以为对"的位，
+要么自己设，要么别信——否则同一份代码会在不同启动下表现相反，而日志里每一行都是绿的。
+## 2026-11-01 00:40 亮度读回查到尽头：vendor 自己写着"理想情况下应该读，现在只设默认值"
+
+### 从"4 字节"到"错误包"
+
+bit 28 修好之后，读回从完全沉默变成有回应：
+
+```
+dcs read 52: intr 0x100501, status0 0, timeout 0, ack err 0x1003b04, rdbk ctrl 0x40000, data 全 0
+```
+
+`rdbk ctrl 0x40000 >> 16 = 4`。先按"收到 4 字节数据"理解，做了两个实验排除：
+
+| 实验 | 结果 | 说明 |
+|---|---|---|
+| 清除后立即读 `rdbk ctrl` | `0` | 清除有效，那 4 不是残留 |
+| 读完后等 5 ms 再读一次 | 完全相同 | 不是数据写入滞后 |
+
+再读 `DSI_TIMEOUT_STATUS`（`0x0c0`）：
+
+```
+timeout 0
+```
+
+没有超时。结合 `ack err` bit 24 = `DSI_PERIPH_ERROR_PKT`，结论是：**那 4 字节是 MIPI 错误包本身**
+（短包正好 4 字节：DI + 2 字节错误码 + ECC）。硬件把错误包解析成状态位，所以 `RDBK_DATA` 里没有载荷。
+
+`ack err` 低 16 位 `0x3b04` 应该就是面板的错误码——vendor 只解码 bit 15/16/17/20/23/24，这几位没名字。
+
+换 `0x0a`（get power mode）和 `0x04`（get display ID）测试，**结果完全一样**。所以不是 0x52 特殊，
+是所有 DCS 读都被拒。
+
+### 决定性证据
+
+拉下完整的 vendor 源码（`techpack/display` 等，见下）后，在 `dsi_panel.c:1041` 找到这段：
+
+```c
+case DSI_BACKLIGHT_DCS:
+case DSI_BACKLIGHT_EXTERNAL:
+case DSI_BACKLIGHT_PWM:
+default:
+	/*
+	 * Ideally, we should read the backlight level from the
+	 * panel. For now, just set it default value.
+	 */
+	break;
+```
+
+我们的面板是 `DSI_BACKLIGHT_DCS`。**高通自己写着"理想情况下应该从面板读背光级别，现在只设默认值"。**
+
+并且在整个 `techpack/display/` 里搜 `MIPI_DSI_DCS_READ`，只有一处：
+
+```
+techpack/display/msm/dsi/dsi_ctrl.c:1093:	if ((cmd_type == MIPI_DSI_DCS_READ) ||
+```
+
+那是 `dsi_ctrl_copy_and_pad_cmd` 里设置 BTA 标志的判断，**不是发起读**。整个显示子系统没有任何
+地方真正执行过 DCS 读。
+
+### 结论
+
+读回不是我们写错的 bug，是厂商留着没做的一段。已经试过且排除的：
+
+- 命令类型（`0x05` → `0x06`）——修掉了一个真缺陷
+- `0x37` 批处理（vendor 的正确做法）
+- RDBK 双写复位
+- MDP 空闲等待
+- HS 模式（`display_hs=1`）
+- TPG FIFO 路径
+- 二次读取（排除时序）
+
+写亮度**可用**（`display_bl=N`、`display_bl_ramp=1` 实测都有效）。读回要知道面板支不支持、
+需要什么前置条件，只能查 k11a 的 datasheet。
+
+### 顺带：完整 vendor 源码落到 C 盘
+
+`<主机>\Develop\iOSOnAndroid\k40-ref`，LineageOS `android_kernel_xiaomi_sm8250`
+分支 `lineage-22.2`，commit `a04dba039`，74329 个文件（完整内核树）。
+
+Windows 上直接 clone 会失败：`drivers/gpu/drm/nouveau/nvkm/subdev/i2c/aux.c` 里的 `aux` 是保留设备名，
+`git checkout` 整个工作树全部失败。逐文件 rsync 到 `/mnt/c` 只有 6 文件/秒（要 3 小时）。
+最后走的路：WSL 里完整 clone → `tar` 打包（1.4 G，5 秒）→ 拷到 C 盘 → Windows `tar` 解压（30 秒）
+→ `git reset --hard` 检出 74342 个文件。16 个仍缺失，全是保留名或只差大小写的文件
+（`xt_DSCP.h` 对 `xt_dscp.h` 这类），都在 netfilter 和 nouveau，与本机工作无关。
+## 2026-11-01 01:50 控制中心调不了亮度：CoreBrightness 选了虚拟背光，不碰硬件
+
+### 现象（用户描述，两个都要紧）
+
+- **设置里拖亮度条**：滑杆动、控制中心的数字也跟着变，**屏幕亮度不变**
+- **控制中心里拖亮度条**：**拖不动**
+
+### 已经排掉的，一层一层
+
+| 环节 | 证据 | 结论 |
+|---|---|---|
+| 内核发布服务 | `AppleBacklight: 2 services published` | ✅ |
+| iOS 侧能查到 | `probe: AppleBacklight -> IOService:/GenericARMPE/disp0/AppleBacklight` | ✅ |
+| sandbox 不挡 | `probe: IOServiceOpen ok (type 0)` | ✅ |
+| user client 协议 | `probe: method 0 -> kr 0x0, 4 out` | ✅ |
+| backboardd 收到滑杆 | `brightness change:0.351675 reason:setDisplayBrightness (permanent)` | ✅ |
+| **CoreBrightness 往下传** | `dcs 51` 0 次、`properties written` 0 次、`CLIENT OPENED` 0 次 | ❌ |
+
+服务的**两条接收通道都实测可用**（user client 的 externalMethod 返回 `kr 0x0`，属性路径也实现了），但
+CoreBrightness 一条都不走。
+
+### 从 dyld 缓存里找到的原因
+
+`strings` 搜出 CoreBrightness 有**三个**背光控制器：
+
+```
+BCAppleBacklightBrtControl     真实背光（IOKit 服务）
+BCHIDBrtControl                HID 背光
+BCVirtualBrtControl            虚拟背光：只改 UI 数值，不动硬件
+```
+
+现象和第三个完全吻合：滑杆动、数字变、屏幕不变，控制中心的滑杆还拖不动（虚拟控制读不到真实范围）。
+**它退回了 `BCVirtualBrtControl`。**
+
+### 试过的位置和属性（全部无效）
+
+| 尝试 | 结果 |
+|---|---|
+| 服务挂平台专家 `GenericARMPE` 下 | ❌ 不调用 |
+| 服务挂显示服务 `disp0` 下（`IOService:/GenericARMPE/disp0/AppleBacklight`） | ❌ 不调用 |
+| `IODisplayParameters` 只在背光服务上 | ❌ |
+| `IODisplayParameters` 同时放到显示服务上 | ❌ |
+
+挂载位置改到 `disp0` 下之后路径和真实设备的层级一致了，但 CoreBrightness 仍然不认。
+
+### 代码状态（三处位置调整留在树里）
+
+- `MiniIOMobileFramebuffer.cpp`：`start()` 里调 `MiniAppleBacklightStart(this)`，背光挂显示服务下
+- `GenericARMPE.cpp`：原来的挂载点注释掉
+- `MiniAppleBacklight.cpp`：`IODisplayParameters` 同时发布到 provider 上
+
+方向是对的（层级正确），但不足以让 CoreBrightness 用它。
+
+### 下一步：只能反汇编
+
+需要看 `BCAppleBacklightBrtControl` 的 `initWithService:` **调用者**在什么条件下才构造真实控制器，
+而不是退回虚拟的。这要：
+
+1. 从 `sysimage/20F66__iPhone10,3_6/dyld_shared_cache_arm64*` 里提取
+   `BrightnessControl.framework` 的二进制（仓库里没有提取工具，`ipsw` 或自己解析都行）
+2. 反汇编找 `BCAppleBacklightBrtControl` 的构造点，看它检查了什么
+
+在这之前，内核侧已经没有可做的事了。
+
+### 一个副产品：内核 printf 在 IOKit 上下文会被抑制
+
+`method 0` 明明返回成功，但内核的 `CLIENT OPENED`、`services published` 都没进日志。这解释了为什么
+之前一直看不到 `asked for N times`。判断调用有没有发生，只能靠用户态的返回值（probe），不能靠内核日志。
+## 2026-11-01 02:30 控制中心的亮度条通了：缺的是 `backlight-control` 一个属性
+
+### 结果
+
+```
+display: brightness 908:  dcs 51 ...
+display: brightness 948:  dcs 51 ...
+display: brightness 1015: dcs 51 ...
+display: brightness 1140: dcs 51 ...
+```
+
+控制中心拖动亮度条，屏幕跟着变。一次会话里 `dcs 51` 发了 **55 次**，每一个中间电平都到了面板。
+
+### 根因
+
+CoreBrightness 找背光服务的条件**不是类名**。查 sheng 的 `AppleARMBacklight.cpp`（通过 asteroids 端口的
+`package/AsteroidsBacklight.cpp` 读到）原文：
+
+> CoreBrightness (backboardd) finds a service **with `backlight-control = true`** that **conforms to
+> AppleARMBacklight**, reads min and max from IODisplayParameters brightness, and sets
+> `{brightness, FadePeriod (16.16 s)}` through **setProperties**.
+
+我们的 `MiniAppleBacklight.cpp` 把类名取成 `AppleBacklight` / `AppleARMBacklight`，就以为匹配上了。
+类名只是其中一半，缺的是那个属性，于是 CoreBrightness 退到它自己的第三个选择
+`BCVirtualBrtControl`——一个只改滑杆和数字、不碰硬件的控制器，正是之前看到的现象。
+
+### 改了什么
+
+`iokit/Kernel/MiniAppleBacklight.cpp`：
+
+```c
+setProperty("NativeSandboxGrantProcess", "backboardd");   /* 沙盒允许 backboardd 写这些属性 */
+setProperty("backlight-control", true);                    /* CoreBrightness 的匹配条件 */
+```
+
+还有 `setProperties` 的协议：CoreBrightness 发的是**扁平**的字典，`brightness` 和 `FadePeriod`
+直接在顶层，不是嵌套在 `IODisplayParameters` 下。原来的实现只认嵌套格式，所以即使被调用也读不到。
+
+### 这一路怎么排除过来的
+
+| 环节 | 什么时候确认的 |
+|---|---|
+| 服务发布 / iOS 可见 / sandbox / user client 协议 | 探针验证，全部可用 |
+| 挂平台专家下 → 挂显示服务 `disp0` 下 | 层级改了，仍不调用 |
+| `IODisplayParameters` 放背光服务 / 也放 provider | 仍不调用 |
+| **加 `backlight-control` 属性** | **调用立刻开始** |
+
+前面每一项都"看起来对"，但都不够。差别只有最后那一个属性。
+
+### 读回仍然不通，但不影响
+
+`dcs 52 answered 00000000` 每次都打，读回还是拿不到数据（面板回错误包，前面查过：vendor 自己也从不读背光）。
+写亮度不依赖它。
+
+### 参考来源
+
+这是从别的机型学来的，值得记住怎么找到的：
+[unixnu.com/devices](https://unixnu.com/devices/) 里搜各机型的 `porting.toml` 找 `brightness`/`backlight`，
+命中 **rootstockos/UniXNU-asteroids**（Nothing Phone 3a），它的 T37 记录写着 iOS 设亮度、睡眠开关面板
+都已经可用。它的 `package/AsteroidsBacklight.cpp` 头注释把 CoreBrightness 的全部条件写了出来。
+
+**遇到 iOS 侧不认的服务，先看别人怎么让 iOS 认的，比啃二进制快得多。**
+## 2026-11-01 03:55 亮度和电池改成默认开启：功能不该靠启动参数
+
+### 用户的意见
+
+> 为啥搞到启动参数里，这个固化不是更好吗，需要调试的才用启动参数吧？
+
+对的。`backlight=1`、`backlight_arm=1`、`backlight_dcs=1`、`battery=1` 四个参数原本都是
+opt-in——**忘了任何一个，现象和"驱动坏了"一模一样**。今晚前面几小时的排查里，有一半时间
+是在跟"参数没带"较劲，而不是跟代码。
+
+### 改法：全部 opt-out
+
+| 位置 | 原来 | 现在 |
+|---|---|---|
+| `MiniAppleBacklight.cpp` | `backlight=1` 才发布 | 默认发布，`backlight=0` 关 |
+| 同上 | `backlight_arm=1` 才发第二个类 | 默认发，`backlight_arm=0` 关 |
+| 同上 | `backlight_dcs=1` 才真发 DCS | 默认发，`backlight_dcs=0` 关 |
+| `hakios.battery.c` | `battery=1` 才初始化 | 默认初始化，`battery=0` 关 |
+| `xnuloader/loader.c` | 命令行有 `battery=1` 才传 `battery_shared_pa` | 默认传，`battery=0` 不传 |
+
+### 实测（命令行只有 `gl=1 adreno=22 adreno_keep=1 touchscreen=1 bootcpu=7 cpus=8 rd=md0`）
+
+```
+cmdline: debug=0x8 battery_shared_pa=0x00000000a1012000 loader_return_after=150 ...
+hakios: battery: SOC=98% battery=1 charger=1 charging=1
+display: brightness 1024: dcs 51 ...
+```
+
+电池从 `SOC=-1% battery=0 charger=0 charging=0` 变成正常读数，亮度不用任何参数就能被
+CoreBrightness 调到。
+
+### 顺带发现的一个坑：`xl enter` 在 loader 状态不重建镜像
+
+```sh
+enter() {
+	case "$(state)" in
+	loader) return 0 ;;      ← 手机已经在 loader，直接返回
+```
+
+所以改完 loader 之后如果手机还停在 loader，`xl enter` 不会重新打包 `xnu-usb.img`，**新 loader
+一直不生效**。今晚就卡在这里：`loader.efi` 是 01:30 编译的，`xnu-usb.img` 却还是 22:15 的。
+
+绕过的办法：先让手机离开 loader（`fastboot reboot bootloader` 或 `xl reload`），再 `xl enter`。
+手动打也可以，但记得带 `DEVICE=alioth`：
+
+```sh
+xnuloader/mkpayload.py -o usb-payload.bin loader.efi=xnuloader/loader.efi --usb
+DEVICE=alioth ./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img
+```
+
+判断手上镜像是不是新的：`xnu-usb.img` 的时间戳和 `xnuloader/loader.efi` 比。正确镜像
+1,994,752 字节（打成 POCO 会是 1,470,464）。
+
+### 状态
+
+亮度和电池都默认可用，不再需要任何启动参数。参数保留下来只做关闭和调试用。

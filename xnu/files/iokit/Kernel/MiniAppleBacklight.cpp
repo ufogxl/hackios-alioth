@@ -154,9 +154,33 @@ MiniBacklightService::start(IOService * provider)
 	/* IODisplayParameters before registerService(): a caller that finds the service reads its
 	 * range in the same breath, and a match with no range is a backlight that cannot move. */
 	publishBrightnessParameters(this, gPanelLevel);
+	/*
+	 * The same parameters on the provider as well. CoreBrightness has three controllers to choose
+	 * from -- BCAppleBacklightBrtControl, BCHIDBrtControl and BCVirtualBrtControl -- and the last
+	 * one moves the slider and the number without touching the panel, which is exactly what this
+	 * boot does. If it reads the range from the display rather than from the backlight node, a
+	 * range published only on the backlight is a range it never sees, and it falls back to the
+	 * virtual control. Cheap to try: one more property, and the backlight node keeps its own.
+	 */
+	if (provider != NULL) {
+		publishBrightnessParameters(provider, gPanelLevel);
+	}
 	IOLog("AppleBacklight: published as %s, provider %s, brightness %#x of %#x\n",
 	    getMetaClass()->getClassName(),
 	    provider != NULL ? provider->getMetaClass()->getClassName() : "none", gPanelLevel, kPanelMaxLevel);
+	/*
+	 * What CoreBrightness looks for is not the class name alone. From sheng's AppleARMBacklight.cpp
+	 * (read through the asteroids port, package/AsteroidsBacklight.cpp): it finds a service that
+	 * has backlight-control = true and conforms to AppleARMBacklight, reads the range from
+	 * IODisplayParameters, and sets {brightness, FadePeriod} with setProperties. A service that is
+	 * merely *named* AppleBacklight has neither, which is why it was never called and
+	 * CoreBrightness fell back to BCVirtualBrtControl -- a control that moves the slider and the
+	 * number and touches no hardware, exactly what this board showed.
+	 *
+	 * NativeSandboxGrantProcess names backboardd so the sandbox lets it set these properties.
+	 */
+	setProperty("NativeSandboxGrantProcess", "backboardd");
+	setProperty("backlight-control", true);
 	registerService();
 	return true;
 }
@@ -209,6 +233,29 @@ MiniBacklightService::setProperties(OSObject * properties)
 	}
 	printf("AppleBacklight: %u properties written on %s\n", dict->getCount(), getMetaClass()->getClassName());
 	showProperties(dict, 1);
+
+	/*
+	 * CoreBrightness sends the level flat -- the dictionary carries "brightness" and "FadePeriod"
+	 * directly, not nested under IODisplayParameters -- so this is the form a real request arrives
+	 * in. FadePeriod is 16.16 seconds; the fade is not stepped here yet, the level is written at once.
+	 */
+	{
+		OSNumber *direct = OSDynamicCast(OSNumber, dict->getObject("brightness"));
+
+		if (direct != NULL) {
+			uint32_t level = direct->unsigned32BitValue();
+
+			if (level > kPanelMaxLevel) {
+				level = kPanelMaxLevel;
+			}
+			gPanelLevel = level;
+			publishBrightnessParameters(this, level);
+			if (gHakiosBacklightLevel != 0) {
+				hakios_display_set_brightness(level);
+			}
+			return kIOReturnSuccess;
+		}
+	}
 
 	params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
 	bright = params != NULL ? OSDynamicCast(OSDictionary, params->getObject("brightness")) : NULL;
@@ -438,14 +485,21 @@ startReportThread(void)
 void
 MiniAppleBacklightStart(IOService * provider)
 {
-	uint32_t on = 0, arm = 0, dcs = 0;
+	/*
+	 * On by default. A working backlight is what the system expects, not something a boot has to
+	 * ask for; backlight=0, backlight_arm=0 and backlight_dcs=0 turn it off, which is what the
+	 * debugging rounds use. The old opt-in form meant a run that forgot one of the three
+	 * arguments looked exactly like a broken driver.
+	 */
+	uint32_t on = 1, arm = 1, dcs = 1;
 
-	if (!PE_parse_boot_argn("backlight", &on, sizeof(on)) || on == 0) {
+	PE_parse_boot_argn("backlight", &on, sizeof(on));
+	PE_parse_boot_argn("backlight_arm", &arm, sizeof(arm));
+	PE_parse_boot_argn("backlight_dcs", &dcs, sizeof(dcs));
+	if (on == 0) {
 		return;
 	}
-	if (PE_parse_boot_argn("backlight_arm", &arm, sizeof(arm)) && arm != 0) {
-	}
-	if (PE_parse_boot_argn("backlight_dcs", &dcs, sizeof(dcs)) && dcs != 0) {
+	if (dcs != 0) {
 		gHakiosBacklightLevel = 1;
 	}
 	publishBacklightClass(provider, false);

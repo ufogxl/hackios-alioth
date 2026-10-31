@@ -2769,7 +2769,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
-	int more_cores = 0, battery_requested = 0, ufs_requested = 0;
+	/* battery_requested is on unless battery=0 on the command line: the cache is what the
+	 * kernel's battery monitor reads, and a working battery is the normal state, not a
+	 * debug-flag state. It also decides whether battery_shared_pa goes on the command line. */
+	int more_cores = 0, battery_requested = 1, ufs_requested = 0;
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/redwood_torch.c) */
 	int torch_requested = 0;
 	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/redwood_camera.c) */
@@ -2787,8 +2790,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		}
 		paint_off |= starts_with(c, "paint=0") && (c == pi.cmdline || c[-1] == ' ') && (c[7] == 0 || c[7] == ' ');
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
-		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
-		    (c[9] == 0 || c[9] == ' ');
+		if (starts_with(c, "battery=0") && (c == pi.cmdline || c[-1] == ' ') && (c[9] == 0 || c[9] == ' ')) {
+			battery_requested = 0;
+		}
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');

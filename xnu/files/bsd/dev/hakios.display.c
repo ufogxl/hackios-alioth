@@ -396,6 +396,7 @@ te_thread(void *parameter, __unused wait_result_t result)
 #define DSI_TRIG_DMA            0x090
 #define DSI_INTR_CTRL           0x110
 #define DSI_ACK_ERR_STATUS      0x068
+#define DSI_TIMEOUT_STATUS      0x0c0    /* bit 0 HS TX, bit 4 LP RX, bit 8 BTA: which wait expired */
 #define DSI_RDBK_DATA_CTRL      0x1d4
 #define DSI_RDBK(n)             (0x06c + 4 * (n))
 /*
@@ -422,17 +423,30 @@ static bool dsi_quiet;                  /* a ramp sends dozens of packets; its o
 static uint32_t dsi_in_flight;          /* the command DMA is one engine: one packet at a time */
 
 /*
- * The bootloader left CMD_DMA_CTRL with LOW_POWER set, which sends commands in low power mode. The
- * vendor's driver does the opposite for a normal DCS write: msm_dsi_host_xfer_prepare() calls
- * dsi_set_tx_power_mode(0), i.e. *clears* LOW_POWER, sends, and puts it back afterwards; only the
- * messages flagged MIPI_DSI_MSG_USE_LPM (the timing switch is one) stay in low power. So this is a
- * boot-arg and not a constant: which of the two the panel listens to is what the experiments say.
+ * The command engine's control word, written out in full on every transfer the way the vendor
+ * writes it (dsi_ctrl_hw_cmn.c, the kickoff paths): broadcast off, this controller the master,
+ * the packet fetched from memory, and the speed following the argument.
+ *
+ * Bit 28, embedded mode, is not a detail that can be inherited. The bootloader leaves it set on
+ * some boots -- 0x14000000, the value the first successful brightness round saw -- and clear on
+ * others, where the register reads 0x4000001 and the engine announces a transfer it never made:
+ * the packet is not fetched, the panel is never asked, every write comes back with an error packet,
+ * and every register still looks healthy. Inheriting it is what made brightness work one night and
+ * not the next, with the same code and the same packet.
+ *
+ * LOW_POWER is the one bit here that stays a boot-arg (display_hs). The bootloader leaves it set;
+ * the vendor clears it for a normal DCS write and sets it back afterwards, keeping it only for
+ * messages flagged MIPI_DSI_MSG_USE_LPM, of which the timing switch is one. Which of the two this
+ * panel listens to is what the experiments say, so it is not fixed here.
  */
 static void
 dsi_power_mode(bool high_speed)
 {
 	uint32_t ctrl = rd(dsi + DSI_CMD_DMA_CTRL);
 
+	ctrl &= ~((1u << 31) | (1u << 30));     /* broadcast off, master on */
+	ctrl |= (1u << 28);                     /* embedded mode: fetch the packet from memory */
+	ctrl &= ~((1u << 24) | (1u << 29));     /* packet type 0, WC_SEL 0 */
 	if (high_speed) {
 		ctrl &= ~CMD_DMA_LOW_POWER;
 	} else {
@@ -654,7 +668,6 @@ dsi_read(uint8_t command, uint32_t *reply)
 		wr(dsi + DSI_RDBK_DATA_CTRL, 1);
 		wr(dsi + DSI_RDBK_DATA_CTRL, 0);
 		__asm__ volatile ("dsb sy" ::: "memory");
-
 		packet[0] = 0x02;               /* the 0x37 packet carries two bytes */
 		packet[1] = 0x00;
 		packet[2] = 0x37;               /* SET_MAXIMUM_RETURN_PACKET_SIZE */
@@ -703,9 +716,9 @@ dsi_read(uint8_t command, uint32_t *reply)
 	reply[1] = rd(dsi + DSI_RDBK(1));
 	reply[2] = rd(dsi + DSI_RDBK(2));
 	reply[3] = rd(dsi + DSI_RDBK(3));
-	printf("display: dcs read %02x: %u us, intr %#x, status0 %#x, ack err %#x, rdbk ctrl %#x, data %08x %08x %08x %08x\n",
+	printf("display: dcs read %02x: %u us, intr %#x, status0 %#x, ack err %#x, timeout %#x, rdbk ctrl %#x, data %08x %08x %08x %08x\n",
 	    command, waited * 100, rd(dsi + DSI_INTR_CTRL), rd(dsi + DSI_STATUS0), rd(dsi + DSI_ACK_ERR_STATUS),
-	    ctrl, reply[0], reply[1], reply[2], reply[3]);
+	    rd(dsi + DSI_TIMEOUT_STATUS), ctrl, reply[0], reply[1], reply[2], reply[3]);
 	dsi_power_mode(false);
 	wr(dsi + DSI_DMA_BASE, dsi_buffer_bootloader);
 	if ((rd(dsi + DSI_INTR_CTRL) & CMD_DMA_DONE) != 0) {
@@ -743,7 +756,7 @@ static bool
 dsi_tpg_read(uint8_t command, uint32_t *reply)
 {
 	uint32_t words[2];
-	uint32_t waited, ctrl;
+	uint32_t waited, ctrl, rdbk, dma_ctrl_saved;
 	bool done = false;
 
 	if (!dsi_buffer_ready()) {
@@ -766,7 +779,8 @@ dsi_tpg_read(uint8_t command, uint32_t *reply)
 	words[1] = 0;
 	wr(dsi + DSI_TPG_INIT, words[0]);
 	wr(dsi + DSI_TPG_INIT, words[1]);
-	ctrl = rd(dsi + DSI_CMD_DMA_CTRL) & ~((1u << 31) | (1u << 30));
+	dma_ctrl_saved = rd(dsi + DSI_CMD_DMA_CTRL);   /* exactly what to put back afterwards */
+	ctrl = dma_ctrl_saved & ~((1u << 31) | (1u << 30));
 	wr(dsi + DSI_CMD_DMA_CTRL, ctrl | CMD_DMA_EMBEDDED);
 	wr(dsi + DSI_DMA_LEN, 8);
 	wr(dsi + DSI_TRIG_DMA, 1);
@@ -783,15 +797,22 @@ dsi_tpg_read(uint8_t command, uint32_t *reply)
 	delay_for_interval(1, NSEC_PER_USEC);
 	wr(dsi + DSI_TPG_FIFO_RESET, 0);
 	delay_for_interval(2000, NSEC_PER_USEC);                /* the answer arrives after the turnaround */
-	ctrl = rd(dsi + DSI_RDBK_DATA_CTRL);
+	rdbk = rd(dsi + DSI_RDBK_DATA_CTRL);
 	reply[0] = rd(dsi + DSI_RDBK(0));
 	reply[1] = rd(dsi + DSI_RDBK(1));
 	reply[2] = rd(dsi + DSI_RDBK(2));
 	reply[3] = rd(dsi + DSI_RDBK(3));
 	printf("display: dcs 52 via tpg: %s, intr %#x, status0 %#x, rdbk ctrl %#x, data %08x %08x %08x %08x\n",
-	    done ? "done" : "no done bit", rd(dsi + DSI_INTR_CTRL), rd(dsi + DSI_STATUS0), ctrl,
+	    done ? "done" : "no done bit", rd(dsi + DSI_INTR_CTRL), rd(dsi + DSI_STATUS0), rdbk,
 	    reply[0], reply[1], reply[2], reply[3]);
-	wr(dsi + DSI_CMD_DMA_CTRL, ctrl & ~CMD_DMA_EMBEDDED);
+	/*
+	 * Put CMD_DMA_CTRL back to exactly what it was, from the value saved before the embedded
+	 * bit went in. It used to be restored from the variable that then held RDBK_DATA_CTRL, so
+	 * every read left the command engine programmed with a read-back register's contents --
+	 * dma 0x4000001 instead of 0x14000000 -- and every brightness write after it failed with an
+	 * error packet.
+	 */
+	wr(dsi + DSI_CMD_DMA_CTRL, dma_ctrl_saved);
 	wr(dsi + DSI_DMA_BASE, dsi_buffer_bootloader);
 	if (dsi_buffer_restore) {
 		for (uint32_t i = 0; i < 4; i++) {

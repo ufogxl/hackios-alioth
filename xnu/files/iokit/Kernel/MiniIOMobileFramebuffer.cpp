@@ -28,6 +28,9 @@
 #include <sys/systm.h>
 #include <sys/proc.h>
 
+/* The backlight service this display owns (MiniAppleBacklight.cpp), published below. */
+extern void MiniAppleBacklightStart(IOService * provider);
+
 extern "C" {
 #include <console/video_console.h>
 extern struct vc_info vinfo;            /* the boot framebuffer, as the text console knows it */
@@ -489,6 +492,13 @@ IOMobileFramebuffer::start(IOService * provider)
 	publishModes();
 	setName("disp0");
 	registerService();
+	/*
+	 * The panel's brightness service, attached here rather than to the platform expert:
+	 * on this phone the backlight belongs to the display, and iOS looks for it from the
+	 * display down. Whether that is what CoreBrightness wants is the open question; the
+	 * earlier placement under GenericARMPE published fine and was never called.
+	 */
+	MiniAppleBacklightStart(this);
 	return true;
 }
 

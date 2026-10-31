@@ -175,12 +175,14 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 void
 hakios_battery_init(void)
 {
-	uint32_t enabled = 0;
+	uint32_t enabled = 1;
 	uint64_t shared_pa = 0;
 	vm_offset_t page;
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) return;
+	/* On by default, as the backlight is: battery=0 turns it off for a debugging round. */
+	PE_parse_boot_argn("battery", &enabled, sizeof(enabled));
+	if (!enabled) return;
 	if (!PE_parse_boot_argn("battery_shared_pa", &shared_pa, sizeof(shared_pa)) || shared_pa == 0) {
 		printf("battery: xnuloader did not provide battery_shared_pa\n");
 		return;
