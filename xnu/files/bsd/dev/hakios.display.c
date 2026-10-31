@@ -398,6 +398,17 @@ te_thread(void *parameter, __unused wait_result_t result)
 #define DSI_ACK_ERR_STATUS      0x068
 #define DSI_RDBK_DATA_CTRL      0x1d4
 #define DSI_RDBK(n)             (0x06c + 4 * (n))
+/*
+ * The test-pattern generator's command FIFO, the other way into the panel and the one the
+ * reference port uses for both a write and a read. The two differ in where the packet is kept:
+ * the command DMA above fetches it from memory through DMA_BASE, while this one is handed the
+ * words a DWORD at a time and the engine reads nothing from memory. A read-back needs the bus
+ * turned around, which the reference port only ever asks for through this path.
+ */
+#define DSI_TPG_CTRL            0x15c
+#define DSI_TPG_INIT            0x17c
+#define DSI_TPG_FIFO_RESET      0x1ec
+#define CMD_DMA_EMBEDDED        0x10000000      /* bit 28: take the packet from the FIFO, not memory */
 #define READ_BACK               0x20    /* data[3] bit 5: the panel is asked to answer */
 #define CMD_DMA_DONE            0x1
 
@@ -601,13 +612,69 @@ dsi_read(uint8_t command, uint32_t *reply)
 	if (!os_atomic_cmpxchg(&dsi_in_flight, 0, 1, relaxed)) {
 		return false;
 	}
-	wr(dsi + DSI_RDBK_DATA_CTRL, 1);        /* CLR: drop whatever the last read left */
-	wr(dsi_buffer_stop + 0, command);
-	wr(dsi_buffer_stop + 4, 0x00);
-	wr(dsi_buffer_stop + 8, 0x05);          /* DCS short read, no parameter */
-	wr(dsi_buffer_stop + 12, 0x80 | READ_BACK);
-	wr(dsi + DSI_DMA_BASE, dsi_buffer_phys);
-	wr(dsi + DSI_DMA_LEN, 4);
+	/*
+	 * The command path must be idle before a packet goes in. STATUS bit 2 is the command-mode MDP
+	 * busy flag, and the vendor waits for it on every transfer (sendPacket's idle loop). Sent
+	 * while it is set, the packet meets an engine already running and the controller reports an
+	 * error packet instead of a read -- which is what status0 0x5 alongside ack err 0x1000800 said.
+	 */
+	for (waited = 0; waited < 2000; waited++) {
+		if ((rd(dsi + DSI_STATUS0) & 0x04) == 0) {
+			break;
+		}
+		delay_for_interval(2, NSEC_PER_USEC);
+	}
+	if ((rd(dsi + DSI_STATUS0) & 0x04) != 0) {
+		printf("display: dcs read %02x: the command path never went idle (status0 %#x)\n",
+		    command, rd(dsi + DSI_STATUS0));
+		os_atomic_store(&dsi_in_flight, 0, relaxed);
+		return false;
+	}
+	/*
+	 * appends SET_MAXIMUM_RETURN_PACKET_SIZE to the same command buffer and clears that
+	 * packet's last-command flag (dsi_ctrl.c, dsi_set_max_return_size: "batch max packet cmd
+	 * to read command"), so the engine sends both and only the read ends the transfer. Sent
+	 * separately, as this driver first did, the size goes out in one packet and the read in
+	 * another with no size in force -- which latches no bytes at all.
+	 *
+	 * The bytes are laid out the way dsi_ctrl_copy_and_pad_cmd lays a packet out: length in
+	 * bytes 0-1, the data type in byte 2, the flags in byte 3 (bit 6 payload present, bit 5 turn
+	 * the lane around, bit 7 last command), then the payload, padded with 0xFF to a whole word.
+	 * The 0x37 packet is eight bytes, the short read four, and both fit in the sixteen this
+	 * driver already saves and puts back.
+	 */
+	{
+		uint8_t packet[12];
+
+		/*
+		 * Drop whatever the last read left, after the size is set and before the packet goes
+		 * out -- the order dsi_message_rx keeps (dsi_ctrl.c): set_max_return_size, then
+		 * clear_rdbk_register, then the read itself.
+		 */
+		wr(dsi + DSI_RDBK_DATA_CTRL, 1);
+		wr(dsi + DSI_RDBK_DATA_CTRL, 0);
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		packet[0] = 0x02;               /* the 0x37 packet carries two bytes */
+		packet[1] = 0x00;
+		packet[2] = 0x37;               /* SET_MAXIMUM_RETURN_PACKET_SIZE */
+		packet[3] = 0x40;               /* long packet only: bit 7 would end the transfer here */
+		packet[4] = 0x02;               /* size, low byte first (tx[2] = {size, size >> 8}) */
+		packet[5] = 0x00;
+		packet[6] = 0xff;               /* the pad a short packet gets */
+		packet[7] = 0xff;
+		packet[8] = command;            /* the DCS read itself */
+		packet[9] = 0x00;
+		packet[10] = 0x06;              /* DCS read; 0x05 is a short write and asks nothing */
+		packet[11] = 0x80 | READ_BACK;  /* last command, and turn the lane around */
+
+		for (uint32_t i = 0; i < 3; i++) {
+			wr(dsi_buffer_stop + 4 * i,
+			    (uint32_t)packet[4 * i] | (uint32_t)packet[4 * i + 1] << 8 |
+			    (uint32_t)packet[4 * i + 2] << 16 | (uint32_t)packet[4 * i + 3] << 24);
+		}
+	}
+	wr(dsi + DSI_DMA_LEN, 12);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	if ((rd(dsi + DSI_INTR_CTRL) & CMD_DMA_DONE) != 0) {
 		wr(dsi + DSI_INTR_CTRL, CMD_DMA_DONE);
@@ -651,6 +718,156 @@ dsi_read(uint8_t command, uint32_t *reply)
 	}
 	os_atomic_store(&dsi_in_flight, 0, relaxed);
 	return waited < 1000;
+}
+
+/*
+ * DCS 0x52 the way the reference port reads it: through the test-pattern generator command FIFO
+ * rather than the command DMA, so a read that comes back empty through the DMA is retried here.
+ *
+ * Measured on this phone: the transfer completes (intr 0x100000, status0 0) and the byte count in
+ * RDBK_DATA_CTRL is still 0, so this path does not receive an answer either. It is kept because it
+ * is the one the reference port uses, and the two paths failing the same way is what says the fault
+ * is not in the transport -- a panel that answers neither has not been made to answer yet, rather
+ * than having been asked wrongly twice.
+ *
+ *
+ * The sequence is BacklightProbe.cpp sendPacket: wait for the command path to idle, arm the
+ * generator for FIFO mode, hand it the words, ask the DMA engine to take them from the FIFO
+ * (CMD_DMA_EMBEDDED) instead of memory, trigger, wait for the done bit, then put the generator
+ * back. An odd word count needs one more zero because the FIFO works in pairs.
+ *
+ * Returns the four RDBK words as the DMA read leaves them, or false when the transfer did not
+ * complete. It does not decode: the caller already knows how, and the raw words are worth seeing.
+ */
+static bool
+dsi_tpg_read(uint8_t command, uint32_t *reply)
+{
+	uint32_t words[2];
+	uint32_t waited, ctrl;
+	bool done = false;
+
+	if (!dsi_buffer_ready()) {
+		return false;
+	}
+	if (!os_atomic_cmpxchg(&dsi_in_flight, 0, 1, relaxed)) {
+		return false;
+	}
+	for (waited = 0; waited < 2000; waited++) {             /* the command path must be idle */
+		if ((rd(dsi + DSI_STATUS0) & 0x04) == 0) {       /* bit 2: command-mode MDP busy */
+			break;
+		}
+		delay_for_interval(2, NSEC_PER_USEC);
+	}
+	wr(dsi + DSI_RDBK_DATA_CTRL, 1);                        /* drop whatever the last read left */
+	wr(dsi + DSI_INTR_CTRL, (rd(dsi + DSI_INTR_CTRL) & ~0x10100000u) | CMD_DMA_DONE);
+	wr(dsi + DSI_TPG_CTRL, (1u << 1) | (1u << 2) | (3u << 16));
+	/* A DCS read is one header word: 0xA0060000 | command (BTA, last, type 0x06). */
+	words[0] = 0xA0060000u | (uint32_t)command;
+	words[1] = 0;
+	wr(dsi + DSI_TPG_INIT, words[0]);
+	wr(dsi + DSI_TPG_INIT, words[1]);
+	ctrl = rd(dsi + DSI_CMD_DMA_CTRL) & ~((1u << 31) | (1u << 30));
+	wr(dsi + DSI_CMD_DMA_CTRL, ctrl | CMD_DMA_EMBEDDED);
+	wr(dsi + DSI_DMA_LEN, 8);
+	wr(dsi + DSI_TRIG_DMA, 1);
+	for (waited = 0; waited < 2500; waited++) {
+		if ((rd(dsi + DSI_INTR_CTRL) & CMD_DMA_DONE) != 0) {
+			done = true;
+			break;
+		}
+		delay_for_interval(20, NSEC_PER_USEC);
+	}
+	wr(dsi + DSI_INTR_CTRL, (rd(dsi + DSI_INTR_CTRL) & ~0x10100000u) | CMD_DMA_DONE);
+	wr(dsi + DSI_TPG_CTRL, 0);
+	wr(dsi + DSI_TPG_FIFO_RESET, 1);
+	delay_for_interval(1, NSEC_PER_USEC);
+	wr(dsi + DSI_TPG_FIFO_RESET, 0);
+	delay_for_interval(2000, NSEC_PER_USEC);                /* the answer arrives after the turnaround */
+	ctrl = rd(dsi + DSI_RDBK_DATA_CTRL);
+	reply[0] = rd(dsi + DSI_RDBK(0));
+	reply[1] = rd(dsi + DSI_RDBK(1));
+	reply[2] = rd(dsi + DSI_RDBK(2));
+	reply[3] = rd(dsi + DSI_RDBK(3));
+	printf("display: dcs 52 via tpg: %s, intr %#x, status0 %#x, rdbk ctrl %#x, data %08x %08x %08x %08x\n",
+	    done ? "done" : "no done bit", rd(dsi + DSI_INTR_CTRL), rd(dsi + DSI_STATUS0), ctrl,
+	    reply[0], reply[1], reply[2], reply[3]);
+	wr(dsi + DSI_CMD_DMA_CTRL, ctrl & ~CMD_DMA_EMBEDDED);
+	wr(dsi + DSI_DMA_BASE, dsi_buffer_bootloader);
+	if (dsi_buffer_restore) {
+		for (uint32_t i = 0; i < 4; i++) {
+			wr(dsi_buffer_stop + 4 * i, dsi_buffer_saved[i]);
+		}
+	}
+	os_atomic_store(&dsi_in_flight, 0, relaxed);
+	return done && (ctrl >> 16) != 0;
+}
+
+/*
+ * What the panel says its brightness is, after a level has been written to it.
+ *
+ * A write only proves the host put bytes on the wire; DCS 0x52 is the command that proves the
+ * panel took them. Its answer is the level in the same two bytes 0x51 was given -- big-endian on
+ * this panel (mi,mdss-dsi-bl-dcs-big-endian-type), 0x01..0x7ff -- and anything outside that range
+ * is the panel refusing the command, not a level to believe.
+ *
+ * The reply lands in the first RDBK word rather than being spread over the four, so the level is
+ * read out of it by whichever of the two plausible layouts puts a number inside the range: high
+ * half for a two-byte answer, top byte for a one-byte answer. The four words are printed as they
+ * came, so a panel that answers in some third layout can be recognised from the log instead of
+ * being silently mis-read.
+ *
+ * Returns the level the panel reported, or UINT32_MAX if it did not report one.
+ */
+static uint32_t
+dsi_brightness_readback(uint32_t written)
+{
+	uint32_t reply[4] = { 0, 0, 0, 0 };
+	uint32_t level, swapped;
+
+	/*
+	 * Two ways in, tried in the order of what is known to work. The command DMA is what this tree
+	 * already sends the timing switch through, so it goes first; when it completes and latches no
+	 * bytes, the test-pattern FIFO is asked, because that is the path the reference port reads
+	 * through and the only one on record to have received an answer from this panel.
+	 */
+	if (!dsi_read(0x52, reply) || ((rd(dsi + DSI_RDBK_DATA_CTRL) >> 16) & 0xff) == 0) {
+		uint32_t again[4] = { 0, 0, 0, 0 };
+
+		if (dsi_tpg_read(0x52, again)) {
+			memcpy(reply, again, sizeof(reply));
+		}
+	}
+	if (((rd(dsi + DSI_RDBK_DATA_CTRL) >> 16) & 0xff) == 0 &&
+	    reply[0] == 0 && reply[1] == 0 && reply[2] == 0 && reply[3] == 0) {
+		printf("display: brightness %u: no answer on either path\n", written);
+		return UINT32_MAX;
+	}
+	/*
+	 * The controller latches the answer highest word first and byte-swaps it
+	 * (dsi_ctrl_hw_cmn.c get_cmd_read_data), so a two-byte level is reply[0] low two bytes, high
+	 * byte first. The other layouts are tried only when that one lands outside the panels declared
+	 * range, so a reply in a layout this was not written for is still read rather than called a
+	 * refusal -- and the raw words are printed either way.
+	 */
+	swapped = __builtin_bswap32(reply[0]);
+	level = swapped & 0xffff;
+	if (level < 0x01 || level > 0x7ff) {
+		level = (swapped >> 16) & 0xffff;
+	}
+	if (level < 0x01 || level > 0x7ff) {
+		level = reply[0] >> 16;
+	}
+	if (level < 0x01 || level > 0x7ff) {
+		level = reply[0] >> 24;
+	}
+	if (level < 0x01 || level > 0x7ff) {
+		printf("display: brightness %u: dcs 52 answered %08x %08x %08x %08x, no level in it\n",
+		    written, reply[0], reply[1], reply[2], reply[3]);
+		return UINT32_MAX;
+	}
+	printf("display: brightness %u: the panel reads back %u%s\n", written, level,
+	    level == written ? "" : " (not what was written)");
+	return level;
 }
 
 /* The three timing-switch sequences of this panel, from the phone's own device tree (k11a). */
@@ -723,6 +940,7 @@ hz_thread(void *parameter, __unused wait_result_t result)
 		uint8_t level[3] = { 0x51, (uint8_t)(brightness >> 8), (uint8_t)(brightness & 0xff) };
 		printf("display: brightness %u: dcs 51 %02x %02x\n", brightness, level[1], level[2]);
 		dsi_send(level, 3);
+		dsi_brightness_readback(brightness);
 	}
 	/*
 	 * display_bl_ramp: the same command, swept from the top of the range down and back up, three
@@ -795,6 +1013,7 @@ hakios_display_set_brightness(uint32_t level)
 	dsi_quiet = true;
 	dsi_send(bytes, 3);
 	dsi_quiet = false;
+	dsi_brightness_readback(level);
 }
 
 void
