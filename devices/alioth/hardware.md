@@ -6,12 +6,63 @@
 - **[本仓 DTS]** = `devices/alioth/dts/` 里入库的设备树（`alioth-sm8250.dtsi`、`kona-*.dtsi`）
 - **[真机 FDT]** = 本机 dump 出来的 `twrp-fdt.dts`，反编译自手机自己的 dtbo（**优先级最高**——
   入库的 DTS 是 LineageOS 的，与本机批次可能不同）
+- **[厂商内核]** = 高通的 vendor 内核源码，见下面「厂商源码从哪来」
 - **[实测]** = 在这台手机上跑出来的，`PROGRESS.md` 里有对应的日志
 - **[公开]** = 公开规格；**[TBD]** = 还没确认
 
 真机 dump、旧工具、备份都不在仓库里，在 `<主机>\Develop\alioth-local`
 （`dump/twrp-fdt.dts` 是其中最有用的一份，36,301 行）。设备本地的大文件（固件、`soc.args`、
 日志）另见 `~/alioth-device-state`，同样不入库。
+
+## 厂商源码从哪来：**[厂商内核]**
+
+设备树只说了「是什么」，没说「怎么驱动」。寄存器位定义、时序常数、初始化序列这些，
+在设备树里没有，在高通放出来的 vendor 内核里有——**它是公开的**，不用拆机、不用逆向。
+
+用的是 LineageOS 维护的那棵树（SM8250 同 SoC，正是本机）：
+
+```
+https://github.com/LineageOS/android_kernel_xiaomi_sm8250    分支 lineage-22.2
+```
+
+**按子系统找**（路径都在上面这个仓库里逐条验证过）：
+
+| 要找什么 | 路径 |
+|---|---|
+| DSI / 面板 / 背光 | `techpack/display/msm/dsi/` |
+| GPU（KGSL） | `drivers/gpu/msm/` |
+| 触摸（FT3658U） | `drivers/input/touchscreen/focaltech_touch/` |
+| 音频 codec（WCD938x） | `techpack/audio/asoc/codecs/wcd938x/` |
+| SPMI 仲裁器（按键、PMIC） | `drivers/spmi/spmi-pmic-arb.c` |
+| GENI I2C / SPI | `drivers/i2c/busses/i2c-qcom-geni.c`、`drivers/spi/spi-geni-qcom.c` |
+| ADC（电池温度等） | `drivers/iio/adc/qcom-spmi-adc5.c` |
+| 充电 / 电量计 | `drivers/power/supply/qcom/` |
+| RPMh（时钟、供电投票） | `drivers/soc/qcom/rpmh.c` |
+| **Wi-Fi** | `drivers/staging/qcacld-3.0/`（高通自家 WLAN 驱动） |
+
+**Wi-Fi 这条要注意**：这棵树里**没有 ath11k**（`drivers/net/wireless/ath/` 只到 ath10k）。
+K40 的 QCA6390 走的是高通的 `qcacld-3.0`，不是主线 ath11k。所以想照 ath11k 移植这条路在
+本机 vendor 树里没有参考；反过来，`qcacld-3.0` 才是这台机器实际在用的驱动。
+
+显示相关的几个文件最常查：
+
+| 文件 | 里面有什么 |
+|---|---|
+| `dsi_ctrl_reg.h` | 所有 DSI 寄存器的偏移（`DSI_RDBK_DATA_CTRL 0x01D4` 这类） |
+| `dsi_ctrl_hw_cmn.c` | 每个寄存器的**位定义和用法**：读回、FIFO 发包、时钟、PHY |
+| `dsi_ctrl.c` | 上层流程：什么时候清读回寄存器、什么时候取数据 |
+| `dsi_catalog.c` | 控制器版本到实现的映射（本机 `qcom,dsi-ctrl-hw-v2.4`） |
+
+**不要 clone 整棵树**：Linux 内核树在 Windows 上 checkout 会踩路径长度和大小写问题
+（`git sparse-checkout` 会让 `git status` 显示七万多个 `D`，`git reset` 甚至段错误）。
+按需下载单个文件即可：
+
+```bash
+BASE=https://raw.githubusercontent.com/LineageOS/android_kernel_xiaomi_sm8250/lineage-22.2
+curl -O $BASE/techpack/display/msm/dsi/dsi_ctrl_hw_cmn.c
+```
+
+（国内网络取 raw.githubusercontent 可能要代理。）
 
 ---
 
