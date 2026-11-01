@@ -153,6 +153,7 @@
 #include <sys/hakios.sparse.h>
 /* bsd/dev/hakios.display.c: boot-arg display_step=N reads the display controller's registers */
 extern void hakios_display_init(void);
+extern void hakios_pcie_init(void);
 extern void hakios_backlight_report(void);
 /* bsd/dev/hakios.amp.c: boot-arg amp_step=N finds the speakers' amplifiers on their I2C bus */
 extern void hakios_amp_init(void);
@@ -991,6 +992,7 @@ bsd_init(void)
 		hakios_input_init();           /* /dev/hakios-touch */
 		hakios_audio_init();           /* /dev/hakios-audio */
 		hakios_display_init();         /* boot-arg display_step=N: read the display controller's registers */
+		hakios_pcie_init();            /* boot-arg pcie_step=N: read the PCIe root complex's registers */
 		hakios_backlight_report();     /* the backlight service the window server's brightness looks for */
 		hakios_amp_init();             /* boot-arg amp_step=N: find the speakers' amplifiers on their I2C bus */
 		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */

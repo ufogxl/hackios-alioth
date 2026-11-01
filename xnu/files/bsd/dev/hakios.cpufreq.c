@@ -336,9 +336,16 @@ struct cmd_db_bcm {                             /* a BCM's auxiliary data (Linux
 static bool
 cpufreq_wanted(void)
 {
-	uint32_t on = 0;
+	uint32_t off = 0;
 
-	return PE_parse_boot_argn("cpufreq", &on, sizeof(on)) && on != 0;
+	/*
+	 * On unless cpufreq=0 says otherwise. It was opt-in, and a run without it left every core at
+	 * the boot loader's "modest frequency" -- the whole system slow, and no sign of why: the same
+	 * mistake brightness and the battery were making (PROGRESS.md, 2026-11-01 03:55). Measured on
+	 * this phone with it: group 0 1804 MHz, group 1 2419 MHz, group 2 3187 MHz, and a loop on the
+	 * big core 3.4 times faster than without. The cost is heat, which cpufreq=0 avoids.
+	 */
+	return !PE_parse_boot_argn("cpufreq", &off, sizeof(off)) || off == 0;
 }
 
 static void
@@ -569,8 +576,7 @@ hakios_cpufreq_init(void)
 	} else if (enabled == 2 && cpufreq_wanted()) {
 		ddr_raise();
 	}
-	enabled = 0;
-	if (!PE_parse_boot_argn("cpufreq", &enabled, sizeof(enabled)) || !enabled) {
+	if (!cpufreq_wanted()) {                        /* (cpufreq=0: leave the cores where they are) */
 		return;
 	}
 	for (unsigned int i = 0; i < topology->num_cpus; i++) {

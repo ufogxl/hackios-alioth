@@ -13,7 +13,7 @@
 # brightness slider started working, README.md still listed brightness as "the slider moves, then
 # nothing". A status written in two places drifts; one written in one place cannot.
 
-display     works    the panel's 60 Hz timing, or its 120 Hz one with display_hz=120; the picture itself stays at 60 frames a second, so the panel is not the limit
+display     works    the panel's 60 Hz timing, or its 120 Hz one with display_hz=120; the picture stays at 60 frames a second, so the panel is not the limit. A frame is copied into the panel's memory in 2 ms and the copy is timed to the panel's own fetch (fb_fetch_align=2), which removed the moving tears; a fixed narrow band under the status bar still tears while the interface animates, and is not explained yet
 touch       works    FT3658U, multitouch, coordinates checked against the panel
 buttons     partial  power and volume-down come through the PMIC; volume-up is not a TLMM pin and the firmware leaves it unpulled, and the PON status word reads 0x4
 cpu         works    all eight cores; bootcpu=7 on the big core; EPSS frequency scaling

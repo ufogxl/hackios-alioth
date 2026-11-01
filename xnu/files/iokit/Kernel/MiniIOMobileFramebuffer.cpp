@@ -156,7 +156,43 @@ static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
  */
 static TUNABLE(uint32_t, gFilter, "fb_filter", 0);
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
+/*
+ * Boot-arg fb_ca_hz=N: the rate told to CoreAnimation (IOMFBDisplayRefresh) when it is not to be
+ * fb_hz's. On this system CoreAnimation draws at half the rate it is told unless something asks it
+ * for more -- told 120 it gave 60, with or without CADisableMinimumFrameDurationOnPhone,
+ * CA_FORCE_120HZ and CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION=0 (the POCO X5 Pro's port measured that
+ * on 30 October; the refreshes themselves still come at fb_hz). Taken from that port's
+ * MiniIOMobileFramebuffer.cpp, which is where everything in this section comes from.
+ */
+static TUNABLE(uint32_t, gCARefreshHz, "fb_ca_hz", 0);
 static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
+/*
+ * Boot-arg fb_fetch_align=1 (the default): start the copy into the panel's memory when the panel's
+ * own fetch of the frame begins, rather than whenever the swap arrives.
+ *
+ * The panel's memory is one buffer, and the display controller fetches it continuously (its line
+ * counter sweeps 0 to 2400 once a refresh, measured 1 November: the same number of samples in every
+ * hundred lines). A copy that starts while the fetch is part way down leaves the rows above it
+ * already fetched (the previous frame) and the rows below it the new one -- one horizontal seam at
+ * the phase the copy happened to start at, which is what the stripes under the status bar were.
+ *
+ * The copy is about eight times faster than the fetch (2.1 ms against 16.7 ms for the same 10 MB),
+ * so a copy that starts level with the fetch stays ahead of it and there is no seam at all. The
+ * cost is the wait for the next fetch to begin, up to one refresh; fb_measure's report says how
+ * long it was. fb_fetch_align=0 copies as it used to.
+ */
+static TUNABLE(uint32_t, gFetchAlign, "fb_fetch_align", 2);
+/*
+ * Boot-arg fb_log_layers=N: write N lines about the swaps that are not the plain case -- more than
+ * one layer, or a layer whose destination is not the whole panel. The stripes under the status bar
+ * appear only when an application opens, when the App Library slides in, when Search is pulled down
+ * and while Settings scrolls, and never on the home screen's own swipe; the guess is that those
+ * frames carry a second layer (the status bar, an application's top bar) drawn after the first, and
+ * this is what says whether they do.
+ */
+static TUNABLE(uint32_t, gLogLayers, "fb_log_layers", 0);
+
+extern "C" uint32_t hakios_display_line(void);      /* (bsd/dev/hakios.display.c) */
 /*
  * Boot-arg fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see
  * drawRows()). Eight by default: a frame is in the panel's memory 2.0 ms after its turn instead of
@@ -283,6 +319,9 @@ public:
 	uint64_t        fBeat;                  /* the beat the last frame was shown on */
 	uint64_t        fReady;                 /* when the last frame was ready to be shown */
 	uint32_t        fStatOnBeat;            /* frames that waited for a refresh, and for how long together */
+	uint32_t        fOddLogged;             /* swaps written about so far (fb_log_layers) */
+	uint32_t        fStatFetchWaited;       /* frames that waited for the fetch to begin (fb_fetch_align) */
+	uint64_t        fStatFetchWait;         /* ... and how long together */
 	uint64_t        fStatBeatWait;
 	uint32_t        fStatSurfaces[8];       /* the first different surfaces the bottom layer was given */
 	uint32_t        fStatHeld, fStatLost;   /* swaps that waited for the one before; that gave up waiting */
@@ -312,12 +351,14 @@ public:
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
+	void publishRefresh(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
+	void waitForFetch(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
 	static void helperMain(void * self, wait_result_t result);
@@ -353,6 +394,45 @@ setNumber(OSDictionary * dict, const char * key, uint64_t value)
  */
 #define kFBTimingID     1
 #define kFBColorID      1
+
+/*
+ * The refresh the window server clocks its frames by: the property IOMFBDisplayRefresh, a dictionary
+ * of the shortest interval between refreshes, the longest, and the step between them (QuartzCore,
+ * windowserver-apple-display.cpp: displayMinRefreshInterval, displayRefreshStepMachTime; CoreMedia's
+ * FPSupport: displayMaxRefreshInterval, displayRefreshStep).
+ *
+ * Without it CoreAnimation takes a built-in panel for a 60 Hz one whatever its timing says: the mode
+ * it makes is "internal_panel (fixed)" at 60, UIScreen's maximumFramesPerSecond is 60, and frames
+ * come at 60 on a 120 Hz panel. TimingElements' SyncRate is not that property and does not reach it.
+ *
+ * The intervals are in units of 2^-32 of a second (32.32 fixed point), not in mach_absolute_time's:
+ * given 1/120 s in the phone's ticks (160000 of 19.2 MHz) CoreAnimation answered a refresh rate of
+ * 26844 a second, which is 2^32 / 160000. Only the step whose name says MachTime is in ticks.
+ *
+ * This panel does not vary its rate, so all three intervals are the one rate, fb_hz's, unless
+ * fb_ca_hz says otherwise.
+ */
+void
+IOMobileFramebuffer::publishRefresh(void)
+{
+	OSDictionary * refresh = OSDictionary::withCapacity(4);
+	const uint32_t told = gCARefreshHz >= 1 && gCARefreshHz <= 480 ? gCARefreshHz : refreshHz();
+	const uint64_t interval = (1ULL << 32) / told;
+	uint64_t ticks;
+
+	if (refresh == NULL) {
+		return;
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / told, &ticks);
+	setNumber(refresh, "displayMinRefreshInterval", interval);
+	setNumber(refresh, "displayMaxRefreshInterval", interval);
+	setNumber(refresh, "displayRefreshStep", interval);
+	setNumber(refresh, "displayRefreshStepMachTime", ticks);
+	setProperty("IOMFBDisplayRefresh", refresh);
+	refresh->release();
+	IOLog("MiniIOMobileFramebuffer: IOMFBDisplayRefresh: %u Hz (fb_hz %u), an interval of %llu (2^-32 s), %llu ticks\n",
+	    told, refreshHz(), interval, ticks);
+}
 
 void
 IOMobileFramebuffer::publishModes(void)
@@ -397,6 +477,7 @@ IOMobileFramebuffer::publishModes(void)
 
 	setProperty("TimingElements", timings);
 	setProperty("ColorElements", colors);
+	publishRefresh();
 	OSSafeReleaseNULL(timings);
 	OSSafeReleaseNULL(colors);
 	OSSafeReleaseNULL(timing);
@@ -982,10 +1063,88 @@ IOMobileFramebuffer::presenter(void)
 	}
 }
 
+/* (fb_fetch_align) how far into a frame the fetch may already be when the copy starts */
+/*
+ * How long the copy into the panel's memory is, in lines of the panel: fb_fetch_align=2 starts that
+ * many lines before the frame's end, so that the copy finishes before the next frame begins. 300 was
+ * the first guess (2.1 ms of copying over a 2400-line panel) and it was too short: the whole frame
+ * took about 3 ms, 430 lines, so the copy ran 130 lines past the wrap and those 130 lines -- the
+ * band just under the status bar -- were written after the fetch had passed them. That band is the
+ * stripe. fb_fetch_lead=N sets it without a new kernel.
+ */
+static TUNABLE(uint32_t, gFetchLead, "fb_fetch_lead", 600);
+
+/*
+ * Wait for the panel's fetch of a frame to begin: fb_fetch_align, see the boot-argument's comment.
+ *
+ * The line counter sweeps 0 to the panel's height once a refresh and the copy runs about eight
+ * times faster than that sweep, so starting level with it keeps the copy ahead of it. What is
+ * waited for here is the wrap itself; a slice of the refresh is spent asleep and the last of it
+ * looking at the counter, because a hundredth of a refresh is a hundred lines.
+ */
+void
+IOMobileFramebuffer::waitForFetch(void)
+{
+	uint64_t period, slice, limit;
+	uint32_t line, target;
+
+	if (!gFetchAlign) {
+		return;
+	}
+	line = hakios_display_line();
+	if (line == 0xffffffffu) {                          /* (no counter: copy as always) */
+		return;
+	}
+	/*
+	 * fb_fetch_align=1 waits for the count to wrap (the frame has just begun) and =2 for it to
+	 * reach the end of the panel, which is the other half of the same guess.
+	 *
+	 * 1 was tried first and the stripes stayed. The count is uniform over the frame -- 433098
+	 * samples in half a second, spread evenly over every hundred lines -- which says it is the
+	 * panel's own scan and not how far the controller has read; the controller most likely reads
+	 * the frame in one burst at the start of it, so a copy that begins at the wrap begins after
+	 * the burst and lands in the next frame. =2 writes at the end of the frame instead: 300 lines
+	 * is what a 2.1 ms copy covers, so from 2100 to the panel's last line there is room to finish
+	 * before the next burst.
+	 */
+	target = gFetchAlign == 2 ? (fPanelHeight > gFetchLead ? fPanelHeight - gFetchLead : 0) : 120;
+	if (gFetchAlign == 2 ? line >= target : line < target) {
+		return;                                 /* already where it should start */
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
+	slice = period / 48;                        /* (about half a millisecond at 60 Hz) */
+	limit = mach_absolute_time() + period + period / 8;
+	for (;;) {
+		uint64_t now = mach_absolute_time();
+
+		line = hakios_display_line();
+		if (line == 0xffffffffu || now >= limit ||
+		    (gFetchAlign == 2 ? line >= target : line < target)) {
+			return;
+		}
+		clock_delay_until(now + slice < limit ? now + slice : limit);
+	}
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
+
+	/*
+	 * Once, when the first frame goes up: what was published to CoreAnimation. The line in
+	 * publishRefresh() is written before there is a log to keep it in, so it is said again here,
+	 * where the log is being read.
+	 */
+	{
+		static bool said = false;
+
+		if (!said) {
+			said = true;
+			IOLog("MiniIOMobileFramebuffer: the refresh published to CoreAnimation: %u Hz (fb_hz %u)\n",
+			    gCARefreshHz >= 1 && gCARefreshHz <= 480 ? gCARefreshHz : refreshHz(), refreshHz());
+		}
+	}
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
 	uint32_t layers = 0;
@@ -1022,6 +1181,16 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			fStatOnBeat++;
 			fStatBeatWait += mach_absolute_time() - began;
 			began = mach_absolute_time();
+		}
+	}
+	if (gFetchAlign) {
+		uint64_t before = mach_absolute_time();
+
+		waitForFetch();
+		began = mach_absolute_time();
+		if (began > before) {
+			fStatFetchWaited++;
+			fStatFetchWait += began - before;
 		}
 	}
 	shown = began;
@@ -1075,6 +1244,15 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
 		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
 		s = surfaces[layer];
+		if (gLogLayers != 0 && fOddLogged < gLogLayers &&
+		    ((set & ~1u) != 0 || dst[0] != 0 || dst[1] != 0 || dst[2] != (int32_t) fPanelWidth ||
+		    dst[3] != (int32_t) fPanelHeight)) {
+			fOddLogged++;
+			IOLog("MiniIOMobileFramebuffer: odd swap %u (#%u): layers set 0x%x, layer %u: surface %u%s, "
+			    "from %d,%d %dx%d to %d,%d %dx%d (panel %ux%u)\n", swapWord(swap, SWAP_ID), fSwapsShown,
+			    set, layer, sid, s ? "" : " MISSING", src[0], src[1], src[2], src[3],
+			    dst[0], dst[1], dst[2], dst[3], fPanelWidth, fPanelHeight);
+		}
 		if (report) {
 			IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
 			    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), layer, sid,
@@ -1125,18 +1303,21 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - fStatSince, &nanos);
 	if (nanos >= 5 * NSEC_PER_SEC) {
-		uint64_t drawing, waiting, beat;
+		uint64_t drawing, waiting, beat, fetch;
 		unsigned different;
 
 		absolutetime_to_nanoseconds(fStatDrawing, &drawing);
 		absolutetime_to_nanoseconds(fStatWaiting, &waiting);
 		absolutetime_to_nanoseconds(fStatBeatWait, &beat);
+		absolutetime_to_nanoseconds(fStatFetchWait, &fetch);
 		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
 		    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
 		    "%u gave up; %u swaps came a refresh late themselves\n", fStatFrames, nanos / NSEC_PER_MSEC,
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
+		IOLog("MiniIOMobileFramebuffer: %u of those waited for the fetch to begin, %llu us each; it is at line %u\n",
+		    fStatFetchWaited, fStatFetchWaited ? fetch / fStatFetchWaited / NSEC_PER_USEC : 0, hakios_display_line());
 		fStatSwapsLate = 0;
 		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {
 		}

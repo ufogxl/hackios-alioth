@@ -118,6 +118,7 @@ bsd/dev/hakios.ufs.c	standard
 bsd/dev/hakios.ufshc.c	standard
 bsd/dev/hakios.net.c		standard
 bsd/dev/hakios.shared.c		standard
+bsd/dev/hakios.pcie.c		standard
 # The Wi-Fi of the POCO X5 Pro (WCN6750: hakios.wifi.c, hakios.wlfw.c, hakios.lx.c,
 # hakios.sta.c, hakios.apple80211.c) is NOT built here. The K40's radio is a QCA6390 on
 # PCIe and shares no code with it, and a driver written for another phone's addresses,

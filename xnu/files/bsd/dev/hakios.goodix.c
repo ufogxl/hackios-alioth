@@ -1496,7 +1496,13 @@ static void
 goodix_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	unsigned idle = 0, idle_looks;
-	uint32_t poll_us = 8000, latency = 0, reads = 0;
+	/*
+	 * 500 us, not 8000: the part reports 240 times a second, so a line looked at every 8 ms waits
+	 * for one report and then some -- up to 12 ms of the delay between a finger and the system
+	 * seeing it. At 500 us the wait is under one report's worth. The cost is a thread that wakes
+	 * 2000 times a second instead of 125; touch_poll_us=N still sets it (250 to 100000).
+	 */
+	uint32_t poll_us = 500, latency = 0, reads = 0;
 	uint64_t before = 0, reading = 0;
 
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));

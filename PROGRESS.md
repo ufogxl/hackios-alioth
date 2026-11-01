@@ -4920,3 +4920,230 @@ cmdline: debug=0x8 rd=md0 battery_shared_pa=0x1012000 loader_return_after=150 sb
 - `hakios.mpss.c` / `ipa.c` / `cell.c` / `nas.c` / `qmi.c` 仍然是树里编着的 POCO 版本，
   它们靠 `modem=1` 之类参数才动，现在命令行上已经没有这些参数了。要像 Wi-Fi 那样整组摘掉，
   得先弄清 `hakios.net.c` 和它们之间的依赖（`cell.c` 会调 `hakios_net_input_unit`）。
+
+## 2026-11-01 15:30 Wi-Fi 攻坚第一轮：GDSC 上电成功，读 PARF 外部中止
+
+用户决定先攻 Wi-Fi（"其他看社区进展"）。这一轮只做了两件只读/只上电的事，但每一步都出数。
+
+### 新增 `hakios.pcie.c`（`pcie_step=N`）
+
+地址全部来自设备树 `kona-pcie.dtsi:4`（`qcom,pcie@1c00000`），寄存器偏移来自 vendor 内核
+的 `drivers/pci/controller/pci-msm.c`（`compatible = "qcom,pci-msm"`，同一个 SoC）：
+
+| 窗口 | 物理地址 | 大小 |
+|---|---|---|
+| `parf` | `0x01c00000` | `0x3000` |
+| `phy` | `0x01c06000` | `0x1000` |
+| `dm_core`（DBI） | `0x60000000` | `0xf1d` |
+| `elbi` | `0x60000f20` | `0xa8` |
+| `iatu` | `0x60001000` | `0x1000` |
+| `conf`（ECAM） | `0x60100000` | `0x100000` |
+
+### step 1：GDSC 上电，和参考项目的数字**逐位一致**
+
+GDSC 是设备树里的 `qcom,gdsc@16b004`（`kona.dtsi:2567`），也就是 **GCC + 0x6b004**
+（GCC 窗口 `0x00100000`、大小 `0x80000`，`hakios.adreno.c:306` 已经在用）。
+
+```
+pcie: 1: pcie_0_gdsc 0x22f001 -> off (power on 0, sw collapse 1, hw ctrl 0)
+pcie: 1: after writing 0x22f000 it reads 0xf822f000 -> THE SWITCH IS ON
+```
+
+参考项目（UniXNU）记的是：
+
+```
+PCIE 1: gcc pcie_0_gdscr = 0x22f001
+PCIE 2: about to write 0x22f000 → after = 0xf822f000
+PCIE 2: THE CONTROLLER HAS POWER (gdscr 0xf822f000, 1 ms)
+```
+
+**0x22f001 → 0x22f000 → 0xf822f000，一模一样，也是约 1 ms。** 偏移对、SoC 行为一致、
+而且我们确实能把 PCIe 控制器拉起来。手机正常回到 loader。
+
+### 两个失败，但都是有信息量的失败
+
+**失败一（读之前没上电）**：最早那版直接读 PARF，内核**挂死**，日志只捕获到 270 字节、
+一条 `pcie:` 都没有。未上电的块在这个互连上不回应，读请求永远不完成。
+
+**失败二（上电了，但读 PARF → 外部中止）**：
+
+```
+pcie: 2: reading parf sys_ctrl (0) -- if nothing follows this line, that read hung
+panic(cpu 0 caller 0xfffffff007431904): Unhandled implementation specific error
+```
+
+也就是说：**GDSC 上电之后，互连不再挂死，而是回一个中止**——块还在，但它不应答。
+
+### 结论：还缺时钟和两路电
+
+vendor 驱动（`pci-msm.c:3453` 起）在碰 PARF 之前做的事，我们只做了 GDSC。设备树
+`kona-pcie.dtsi:57-84` 列着它还要什么：
+
+**11 个时钟**（`clock-names`）：`pcie_0_pipe_clk`、`pcie_0_ref_clk_src`、`pcie_0_aux_clk`
+（19.2 MHz）、`pcie_0_cfg_ahb_clk`、`pcie_0_mstr_axi_clk`、`pcie_0_slv_axi_clk`、`pcie_0_ldo`、
+`pcie_0_slv_q2a_axi_clk`、`pcie_tbu_clk`、`pcie_phy_refgen_clk`、`pcie_ddrss_sf_tbu_clk`。
+
+**两个复位**：`GCC_PCIE_0_BCR`（core）、`GCC_PCIE_0_PHY_BCR`。
+
+**两路电**：`pm8150_l9`（1.8 V）、`pm8150_l5`（0.9 V），外加 `VDD_CX`。
+
+**两条 SID**（顺带记下）：`qcom,smmu-sid-base = <0x1c00>`，`iommu-map` 给了 `0x1c00` 和 `0x1c01`。
+
+所以下一步是 **GCC 里那 11 个时钟门 + 2 个复位**。这些和 `hakios.cpufreq.c` / `hakios.ufs.c`
+用的是同一个 GCC 块，门控寄存器的偏移可以从 `gcc-kona.c` 的 clock 表里逐个查到
+（`clk_branch` 的 `.cbcr` 字段）。做完这一步再读 PARF，就知道链路状态机到底动不动。
+
+### 成本记账
+
+这一轮触发 **3 次内核死亡**（挂死 2 次、panic 1 次），每次都靠 `fastboot reboot` 回 Android
+再进 loader 恢复，手机没坏。教训：**这个块在没有时钟的时候，读一下就死**，所以每一步都要
+先把「读之前必须准备好什么」查清楚再动手。
+
+### 15:55 追加：时钟和复位都到位了，PARF 仍然不应答
+
+`pcie_step` 现在四步：1 电源开关、2 时钟、3 复位、4 读 PARF。
+
+**step 2 读数（全部来自 GCC，寄存器偏移见下）**：
+
+```
+pcie: 2: gcc +0x52008 (the six PCIe 0 branches) reads 0x4100040; setting the low six bits
+pcie: 2: gcc +0x52008 now reads 0x410007f
+pcie: 2:   slv_axi_clk      0x6b014: 0x220        -> running
+pcie: 2:   mstr_axi_clk     0x6b01c: 0x220        -> running
+pcie: 2:   cfg_ahb_clk      0x6b024: 0            -> running
+pcie: 2:   aux_clk          0x6b028: 0            -> running
+pcie: 2:   pipe_clk         0x6b02c: 0x80000000   -> running
+pcie: 2:   slv_q2a_axi_clk  0x6b010: 0            -> running
+pcie: 2:   pcie0_phy_refgen_clk   0x6f02c: 0x1  -> 0x1
+pcie: 2:   pcie_wifi_clkref_en    0x8c004: 0x80000000 -> 0x80000001
+pcie: 2:   aggre_noc_pcie_tbu_clk 0x9000c: 0x4221 -> 0x4221
+pcie: 2:   ddrss_pcie_sf_tbu_clk  0x8d058: 0x100001 -> 0x100001
+```
+
+**step 3 读数**：`pcie_0_core_reset`(`0x6b000`) 和 `pcie_0_phy_reset`(`0x6c01c`) **本来就是 0**
+（未被断言），`link_down`(`0x6c014`)、`nocsr_com_phy`(`0x6c020`) 也都是 0。
+
+**step 4 仍然中止**：
+
+```
+pcie: 4: reading parf sys_ctrl (0) -- if nothing follows this line, that read hung
+panic(cpu 0 ...): Unhandled implementation specific error
+```
+
+### 查到的寄存器，全部记下来（省下次重查）
+
+`gcc-kona.c` 里 `clk_branch` 的 `enable_reg` 才是使能位，`halt_reg` 是状态位——这点容易看错：
+
+| 寄存器（GCC +） | 内容 |
+|---|---|
+| `0x52008` | PCIe0 六个分支的使能位：bit0 slv_axi、bit1 mstr_axi、bit2 cfg_ahb、bit3 aux、bit4 pipe、bit5 slv_q2a |
+| `0x6b014` / `0x6b01c` / `0x6b024` / `0x6b028` / `0x6b02c` / `0x6b010` | 上面六个的 halt 状态 |
+| `0x6f02c` | `pcie0_phy_refgen_clk`（自己的 CBCR，bit0） |
+| `0x6f004` | `pcie_phy_aux_clk`（**还没开**） |
+| `0x8c004` | `pcie_wifi_clkref_en` |
+| `0x9000c` | `aggre_noc_pcie_tbu_clk` |
+| `0x8d058` | `ddrss_pcie_sf_tbu_clk` |
+| `0x6b000` | `GCC_PCIE_0_BCR`（core 复位，bit0 断言） |
+| `0x6c01c` | `GCC_PCIE_0_PHY_BCR` |
+| `0x6c014` / `0x6c020` | `GCC_PCIE_0_LINK_DOWN_BCR` / `NOCSR_COM_PHY_BCR` |
+| `0x6b004` | `pcie_0_gdsc`（GDSCR，bit0 SW_COLLAPSE、bit31 POWER_ON） |
+
+### 两个新教训
+
+1. **`ml_io_map` 的窗口大小必须自己核对**：`hakios.adreno.c` 给 GCC 映射 `0x80000`，而 PCIe 的门控
+   一直用到 `+0x9000c`——第一次跑到 `+0x8c004` 就是一个数据中止。现在这个文件单独映射 1 MB。
+2. **状态跨运行保留**：GDSC 上电之后，下一轮 `xl run` 读出来已经是 `0xf822f000`（on），
+   因为手机在 loader 里没有重新走 ABL。所以"上电成功"这种结论必须记下**是哪一轮**读到的。
+
+### 下一步（还没做的两件）
+
+- **`gcc_pcie_phy_aux_clk`（`GCC + 0x6f004`）没开**——这是白捡的一个，下次一轮就能试。
+- **两路电**：`pm8150_l9`（1.8 V）、`pm8150_l5`（0.9 V）。这两个不在 GCC 里，是 PMIC 的
+  LDO，走 SPMI/RPMh，属于另一套子系统（`hakios.battery.c` 有 SPMI、`hakios.adsp.c` 有 RPMh
+  的用法可以参考）。**如果开了 PHY aux 时钟还不行，就只剩这一条路。**
+
+## 2026-11-01 17:40 延迟不是显示的问题：主频和触摸轮询；撕裂收窄但没消掉
+
+用户一句"没你想的那么差，60 Hz 也不稳定，点击和滑动都有明显延迟"把方向拨正了。这一轮的三条
+结论都有实测支撑，而且**复制那 2 ms 从来不是主要矛盾**。
+
+### 一、CPU 一直跑在 bootloader 的"modest frequency"上
+
+`hakios.cpufreq.c` 开头就写着：
+
+> The boot loader leaves each group of cores at a modest frequency and expects the operating
+> system to ask for more.
+
+而 `cpufreq=1` 是 **opt-in**，我们之前每一轮都没带。带上之后：
+
+```
+cpufreq: group 0 (3 cores): 1804 MHz
+cpufreq: group 1 (3 cores): 2419 MHz
+cpufreq: group 2 (1 core):  3187 MHz
+cpufreq: on core 7 a loop ran at 166, now at 565 thousand iterations/ms     ← 3.4 倍
+```
+
+用户当场反馈"响应稍微快了点"。**这和 10-31 那次亮度/电池是同一个错误模式**（opt-in 漏带参数）。
+
+### 二、触摸是每 8 ms 轮询一次中断线
+
+`hakios.goodix.c`：`poll_us` 默认 **8000**，而芯片上报是 **240 Hz（4.17 ms）**。所以实际感知延迟
+可能到 **8+4 = 12 ms**。改成 500 µs 后上限降到 ~4.7 ms（4.17 ms 是硬件地板）。
+
+### 三、"GL 一帧 15.9 ms"其实是在等刷新
+
+`15883 us (1938 handing on, 843 waiting, 2 copying out)`——总时长 15.9 ms，真正花掉的只有 2.8 ms，
+剩下的时间在等下一次刷新（15.9 ≈ 60 Hz 周期）。**主频上去以后它也没变快，因为瓶颈本来就不在计算。**
+
+### 四、撕裂：`fb_fetch_align`，收窄了但没消掉
+
+思路：面板内存是单缓冲，MDP 持续取帧；拷贝比取帧快约 8 倍，所以**起笔对齐到帧的某个位置**，
+让拷贝跑在取帧前面。
+
+| 版本 | 做法 | 结果 |
+|---|---|---|
+| `=1` | 等行计数**归零**（帧刚开始）再写 | 等待 7.8 ms/帧，条纹**没变** |
+| `=2` | 等行计数到**帧尾前 N 行**再写 | 等待 3.0 ms/帧，**移动的整屏撕裂基本消失**，剩一条固定窄带 |
+
+被这条实验排除掉的三条：
+
+1. **不是相位**：`fb_fetch_lead` 从 300 改到 600 行，窄带**位置一点没动**；
+2. **不是缩放**：`fbwidth=1080 fbheight=2400`（不缩放、纯 memcpy）后窄带仍在；
+3. **不是多层**：`fb_log_layers=300` 打出来的 **所有 swap 都是 `layers set 0x1`**、单层全屏，
+   从来没有第二层或局部矩形。
+
+**剩下的那条窄带**在状态栏正下方，只在 App 打开 / App 资源库 / 下拉搜索 / 设置滚动时出现，
+桌面滑动没有——而那几处的共同点是**状态栏下面有毛玻璃/背景模糊**。所以下一个嫌疑是
+GL 那条路上的背景采样，但 `hakios-gl` 汇总里是 **0 errors**，没有直接证据。**没有结论，不装懂。**
+
+### 五、顺带确认：1080×2400 不能用
+
+试 `fbwidth=1080 fbheight=2400` 时，**状态栏显示成了 `rdar:45025538`**（Apple 内部问题单号）——
+iOS 认不出 360×800 这个屏幕尺寸，退回调试态。这正好印证了源码里那句注释
+"别的尺寸 MobileGestalt 会报未知屏幕类别、界面没有布局"。**原生尺寸这条路彻底关闭。**
+
+### 六、三个新默认值（都已实测生效，命令行不带任何参数）
+
+| 参数 | 原来 | 现在 | 关掉的方法 |
+|---|---|---|---|
+| `cpufreq` | opt-in（默认不开） | **默认开** | `cpufreq=0` |
+| `touch_poll_us` | 8000 | **500** | `touch_poll_us=8000` |
+| `fb_fetch_align` | 无此功能 | **默认 2**（帧尾前 600 行起笔） | `fb_fetch_align=0` |
+
+`fb_fetch_lead=N` 可调起笔提前量（行）。
+
+### 七、新工具：`userland/rc.jobs.stripe`
+
+用 `rwtouch` 让桌面自己左右滑动约 80 秒（从进桌面后 120 s 起），这样"看不看得见撕裂"这件事
+不需要人一直手动划。构建方式：
+
+```sh
+GL=1 REST=1 SYSTEM=1 RC_JOBS=rc.jobs.stripe userland/build.sh
+```
+
+**踩过的坑**：第一次只传了 `RC_JOBS`，结果壁纸变黑、停靠栏纯白、小组件不加载——因为
+`GL=1 REST=1 SYSTEM=1` 是**构建时烤进镜像**的开关，漏了就等于换了个残缺镜像。这和 10-31
+"桌面回来了：根因是镜像漏了 GL=1 REST=1" 是同一个坑，又踩了一遍。**重建小镜像时这三个必须带。**
+
+（顺带：`userland/root.apfs` 是每次跟着 payload 走的，重建后 `xl run` 自动用新的，
+不需要传 2.4 GB 的 `system.apfs`。）

@@ -73,7 +73,9 @@ ls userland/root/LaunchDaemons | wc -l                      # 25 = 精简，407 
 python3 tools/apfs/apfs.py ls userland/root.apfs /lib | grep -c gl   # 0 = 没 GL
 ```
 
-`cpufreq=1` 默认不要带：它把所有核钉在最高频（3187 MHz），实测渲染只快 4%，代价是发烫。
+`cpufreq` 默认就开：它把所有核钉在最高频（1804 / 2419 / 3187 MHz），大核上一个循环比不开快
+**3.4 倍**。以前记过一句「渲染只快 4%」——那说的是**帧率**，当时被 60 Hz 的节拍卡着，所以看不出来；
+真正变快的是别的一切（点按、滚动、界面响应），用户实测能感觉到。代价是发烫，`cpufreq=0` 关。
 
 ## 装机与运行
 
@@ -152,7 +154,10 @@ XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 bootcpu=7 cpus=8 rd=md0"
 - `gl=1 adreno=22 adreno_keep=1`：GPU 要这三个。`gpu=1` 在这台按设计被拒（那是 POCO 的
   Adreno 642L 的步骤表）；少了 `adreno_keep=1`，第 22 步做完就收摊、显示退回软件路径
 - `bootcpu=7`：内核跑在大核，loader 留在自己核上继续应答。**要在一轮中间读日志就必须带**
-- `cpufreq=1`：钉最高频，默认不带（发烫）
+- `cpufreq=0`：**不要**钉最高频（默认是钉的；代价是发烫）
+- `touch_poll_us=N`：触摸中断线多久看一眼，默认 **500**（原来是 8000，等于每次触摸多等最多 8 ms）
+- `fb_fetch_align=0|1|2`：上屏拷贝的起笔时机，默认 **2**（等面板这一帧快取完再写）；
+  `fb_fetch_lead=N` 是提前多少行，默认 600。`=0` 关掉，退回来一帧写一帧
 - `backlight=0` / `backlight_arm=0` / `backlight_dcs=0` / `battery=0`：**关掉**对应的服务。
   这几样现在默认就发布/初始化，参数只用来关（以前是 opt-in，忘了带一个，现象和驱动坏了
   一模一样——见 `PROGRESS.md` 2026-11-01 03:55）

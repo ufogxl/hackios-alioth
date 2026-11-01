@@ -1458,6 +1458,24 @@ hakios_display_set_brightness(uint32_t level)
 	dsi_brightness_readback(level);
 }
 
+/*
+ * Where the panel's own fetch has got to: INTF_TEAR_LINE_COUNT (0x6b800 + 0x2b0), 0 to the panel's
+ * height, sweeping the frame once per refresh. The framebuffer's presenter uses it to start writing
+ * a frame just as the fetch begins one: the copy runs some eight times faster than the fetch, so a
+ * copy that starts level with it stays ahead of it and every row is written before it is fetched --
+ * which is the difference between a seam part-way down the screen and none at all.
+ *
+ * Returns 0xffffffff when the display controller was never mapped (a run without display_step).
+ */
+uint32_t
+hakios_display_line(void)
+{
+	if (!display_map()) {
+		return 0xffffffffu;
+	}
+	return rd(mdp + 0x6b800 + 0x2b0);
+}
+
 void
 hakios_display_init(void)
 {
