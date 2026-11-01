@@ -118,12 +118,18 @@ bsd/dev/hakios.ufs.c	standard
 bsd/dev/hakios.ufshc.c	standard
 bsd/dev/hakios.net.c		standard
 bsd/dev/hakios.shared.c		standard
+# The Wi-Fi's upper layers are generic -- Apple80211 in the kernel, the station boundary, the
+# primitives the Linux driver's object calls -- so they are built; the radio they were written
+# against (the POCO's WCN6750) is not, and hakios.radio.c answers for a kernel without one.
+bsd/dev/hakios.lx.c		standard
+bsd/dev/hakios.sta.c		standard
+bsd/dev/hakios.apple80211.c	standard
+bsd/dev/hakios.radio.c		standard
 bsd/dev/hakios.pcie.c		standard
-# The Wi-Fi of the POCO X5 Pro (WCN6750: hakios.wifi.c, hakios.wlfw.c, hakios.lx.c,
-# hakios.sta.c, hakios.apple80211.c) is NOT built here. The K40's radio is a QCA6390 on
-# PCIe and shares no code with it, and a driver written for another phone's addresses,
-# pins and rails is the last thing this kernel should carry. The files stay in the tree
-# for the POCO's own build; hakios.net.c (en0) is the generic interface and stays here.
+# What is NOT built of the Wi-Fi: the POCO X5 Pro's radio itself (hakios.wifi.c, hakios.wlfw.c).
+# The K40's radio is a QCA6390 on PCIe and shares no code with a WCN6750 on the WPSS; a driver
+# written for another phone's addresses, pins and rails is the last thing this kernel should
+# carry. The two files stay in the tree for the POCO's own build.
 bsd/dev/hakios.ipa.c		standard
 bsd/dev/hakios.cell.c		standard
 bsd/dev/hakios.virtio_net.c	standard

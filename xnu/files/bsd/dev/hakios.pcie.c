@@ -35,6 +35,38 @@
 
 /* (hakios.display.c declares these the same way: the header that has them is not one the drivers take) */
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern kern_return_t thread_terminate(thread_t thread);
+extern void loader_log_putc(char c);
+extern boolean_t ml_get_interrupts_enabled(void);
+
+/*
+ * Everything this file says goes through here: a character at a time into the LOADER's log, and to
+ * the kernel's own when interrupts are on.
+ *
+ * Why not printf alone: when one of these experiments stops the machine, the kernel's log stops with
+ * it and the loader's poll of it keeps handing back whatever was last flushed -- so the lines that
+ * say how far it got are the ones lost. The loader's own log is in memory the loader owns, and it
+ * survives. (hakios.cpufreq.c does the same for the same reason.)
+ */
+static void
+tell(const char *format, ...) __printflike(1, 2);
+
+static void
+tell(const char *format, ...)
+{
+	char line[256];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	if (ml_get_interrupts_enabled()) {
+		printf("%s", line);
+	}
+}
 
 #define PCIE_PARF_PHYS          0x01c00000UL
 #define PCIE_PARF_SIZE          0x00003000UL
@@ -54,6 +86,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define PARF_AXI_MSTR_HALT      0x1a8
 #define PARF_LTSSM              0x1b0           /* LTSSM_EN bit 8; the state itself is the low bits */
 #define PARF_INT_ALL_STATUS     0x224
+#define PARF_INT_ALL_MASK       0x22c           /* (write 0: everything masked) */
 #define PARF_STATUS             0x230           /* FLUSH_COMPLETED bit 8 */
 #define PARF_DBI_BASE_ADDR      0x350
 #define PARF_SLV_ADDR_SPACE     0x358
@@ -71,6 +104,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define DBI_LINK_CTRL2_STATUS2  (DBI_CAP + 0x30)
 
 static vm_offset_t parf, phy, dbi, elbi;
+static void step_setup(uint32_t steps);  /* (defined below, used by the runner above it) */
 static uint32_t step;
 
 static inline uint32_t
@@ -91,13 +125,15 @@ pcie_map(void)
 	if (parf != 0) {
 		return true;
 	}
-	printf("pcie: about to map the controller's windows\n");
+	tell("pcie: about to map the controller's windows\n");
 	parf = ml_io_map(PCIE_PARF_PHYS, PCIE_PARF_SIZE);
 	if (parf == 0) {
-		printf("pcie: parf (%#lx) could not be mapped\n", (unsigned long) PCIE_PARF_PHYS);
+		tell("pcie: parf (%#lx) could not be mapped\n", (unsigned long) PCIE_PARF_PHYS);
 		return false;
 	}
-	printf("pcie: parf at %#lx\n", parf);
+	tell("pcie: parf at %#lx\n", parf);
+	dbi = ml_io_map(PCIE_DM_CORE_PHYS, PCIE_DM_CORE_SIZE);
+	tell("pcie: dbi at %#lx\n", dbi);
 	return true;
 }
 
@@ -128,12 +164,12 @@ step_power(void)
 	uint32_t gdscr;
 
 	if (gcc == 0) {
-		printf("pcie: 1: GCC could not be mapped\n");
+		tell("pcie: 1: GCC could not be mapped\n");
 		return;
 	}
 	gdscr = rd(gcc + 0x6b004);
 	gdsc_was = gdscr;
-	printf("pcie: 1: pcie_0_gdsc %#x -> %s (power on %u, sw collapse %u, hw ctrl %u)\n", gdscr,
+	tell("pcie: 1: pcie_0_gdsc %#x -> %s (power on %u, sw collapse %u, hw ctrl %u)\n", gdscr,
 	    (gdscr & (1u << 31)) ? "ON" : "off", (gdscr >> 31) & 1, gdscr & 1, (gdscr >> 16) & 1);
 	if ((gdscr & (1u << 31)) == 0) {
 		uint64_t give_up;
@@ -145,7 +181,7 @@ step_power(void)
 		do {
 			gdscr = rd(gcc + 0x6b004);
 		} while ((gdscr & (1u << 31)) == 0 && mach_absolute_time() < give_up);
-		printf("pcie: 1: after writing %#x it reads %#x -> %s\n", now, gdscr,
+		tell("pcie: 1: after writing %#x it reads %#x -> %s\n", now, gdscr,
 		    (gdscr & (1u << 31)) ? "THE SWITCH IS ON" : "IT DID NOT COME ON");
 	}
 }
@@ -185,6 +221,7 @@ static const struct {
 	const char *name;
 } pcie_clock_gates[] = {
 	{ 0x6f02c, 0, "pcie0_phy_refgen_clk" },
+	{ 0x6f004, 0, "pcie_phy_aux_clk" },    /* the PHY's own AHB clock: not in the device tree's list */
 	{ 0x8c004, 0, "pcie_wifi_clkref_en" },
 	{ 0x9000c, 0, "aggre_noc_pcie_tbu_clk" },
 	{ 0x8d058, 0, "ddrss_pcie_sf_tbu_clk" },
@@ -222,25 +259,25 @@ step_clocks(void)
 		gcc_window = ml_io_map(0x00100000UL, 0x00100000UL);
 	}
 	if (gcc_window == 0) {
-		printf("pcie: 2: GCC could not be mapped\n");
+		tell("pcie: 2: GCC could not be mapped\n");
 		return;
 	}
 	vote = rd(gcc_window + GCC_PCIE_0_VOTE);
-	printf("pcie: 2: gcc +%#x (the six PCIe 0 branches) reads %#x; setting the low six bits\n",
+	tell("pcie: 2: gcc +%#x (the six PCIe 0 branches) reads %#x; setting the low six bits\n",
 	    GCC_PCIE_0_VOTE, vote);
 	wr(gcc_window + GCC_PCIE_0_VOTE, vote | 0x3f);
-	printf("pcie: 2: gcc +%#x now reads %#x\n", GCC_PCIE_0_VOTE, rd(gcc_window + GCC_PCIE_0_VOTE));
+	tell("pcie: 2: gcc +%#x now reads %#x\n", GCC_PCIE_0_VOTE, rd(gcc_window + GCC_PCIE_0_VOTE));
 	for (unsigned i = 0; i < sizeof(pcie_0_branches) / sizeof(pcie_0_branches[0]); i++) {
 		uint32_t halt = rd(gcc_window + pcie_0_branches[i].at);
 
-		printf("pcie: 2:   %-16s halt register %#x: %#x -> %s\n", pcie_0_branches[i].name,
+		tell("pcie: 2:   %-16s halt register %#x: %#x -> %s\n", pcie_0_branches[i].name,
 		    pcie_0_branches[i].at, halt, (halt >> 2) & 1 ? "halted" : "running");
 	}
 	for (unsigned i = 0; i < sizeof(pcie_clock_gates) / sizeof(pcie_clock_gates[0]); i++) {
 		uint32_t was = rd(gcc_window + pcie_clock_gates[i].at);
 
 		wr(gcc_window + pcie_clock_gates[i].at, was | (1u << pcie_clock_gates[i].bit));
-		printf("pcie: 2:   %-22s %#x: %#x -> %#x\n", pcie_clock_gates[i].name,
+		tell("pcie: 2:   %-22s %#x: %#x -> %#x\n", pcie_clock_gates[i].name,
 		    pcie_clock_gates[i].at, was, rd(gcc_window + pcie_clock_gates[i].at));
 	}
 }
@@ -288,10 +325,10 @@ step_resets(void)
 		uint32_t now = was & ~1u;
 
 		wr(gcc_window + pcie_resets[i].at, now);
-		printf("pcie: 4:   %s %#x: %#x -> %#x (%s)\n", pcie_resets[i].name, pcie_resets[i].at,
+		tell("pcie: 4:   %s %#x: %#x -> %#x (%s)\n", pcie_resets[i].name, pcie_resets[i].at,
 		    was, rd(gcc_window + pcie_resets[i].at), (was & 1) ? "was asserted" : "was already out");
 	}
-	printf("pcie: 4:   link_down %#x, nocsr_com_phy %#x\n", rd(gcc_window + 0x6c014),
+	tell("pcie: 4:   link_down %#x, nocsr_com_phy %#x\n", rd(gcc_window + 0x6c014),
 	    rd(gcc_window + 0x6c020));
 }
 
@@ -300,32 +337,31 @@ step_read(void)
 {
 	uint32_t v;
 
-	printf("pcie: 4: reading parf sys_ctrl (%#x) -- if nothing follows this line, that read hung\n", PARF_SYS_CTRL);
+	tell("pcie: 4: reading parf sys_ctrl (%#x) -- if nothing follows this line, that read hung\n", PARF_SYS_CTRL);
 	v = rd(parf + PARF_SYS_CTRL);
-	printf("pcie: 4: parf sys_ctrl %#x\n", v);
-	printf("pcie: 4: reading parf pm_ctrl (%#x)\n", PARF_PM_CTRL);
-	printf("pcie: 4: parf pm_ctrl %#x, pm_stts %#x\n", rd(parf + PARF_PM_CTRL), rd(parf + PARF_PM_STTS));
-	printf("pcie: 4: reading parf ltssm (%#x)\n", PARF_LTSSM);
+	tell("pcie: 4: parf sys_ctrl %#x\n", v);
+	tell("pcie: 4: reading parf pm_ctrl (%#x)\n", PARF_PM_CTRL);
+	tell("pcie: 4: parf pm_ctrl %#x, pm_stts %#x\n", rd(parf + PARF_PM_CTRL), rd(parf + PARF_PM_STTS));
+	tell("pcie: 4: reading parf ltssm (%#x)\n", PARF_LTSSM);
 	v = rd(parf + PARF_LTSSM);
-	printf("pcie: 4: parf ltssm %#x -> enabled %u, state %#x\n", v, (v >> 8) & 1, v & 0x3f);
-	printf("pcie: 4: phy_ctrl %#x, mhi_clock_reset %#x, axi_mstr_halt %#x, status %#x\n",
+	tell("pcie: 4: parf ltssm %#x -> enabled %u, state %#x\n", v, (v >> 8) & 1, v & 0x3f);
+	tell("pcie: 4: phy_ctrl %#x, mhi_clock_reset %#x, axi_mstr_halt %#x, status %#x\n",
 	    rd(parf + PARF_PHY_CTRL), rd(parf + PARF_MHI_CLOCK_RESET), rd(parf + PARF_AXI_MSTR_HALT),
 	    rd(parf + PARF_STATUS));
-	printf("pcie: 4: dbi_base %#x, slv_addr_space %#x, device_type %#x, int_all_status %#x\n",
+	tell("pcie: 4: dbi_base %#x, slv_addr_space %#x, device_type %#x, int_all_status %#x\n",
 	    rd(parf + PARF_DBI_BASE_ADDR), rd(parf + PARF_SLV_ADDR_SPACE), rd(parf + PARF_DEVICE_TYPE),
 	    rd(parf + PARF_INT_ALL_STATUS));
 }
 
-void
-hakios_pcie_init(void)
+static void
+pcie_run(uint32_t steps)
 {
-	uint32_t steps = 0;
 
-	if (!PE_parse_boot_argn("pcie_step", &steps, sizeof(steps)) || steps == 0) {
+	if (steps == 0) {
 		return;
 	}
 	step = 1;
-	printf("pcie: step %u of the PCIe root complex\n", steps);
+	tell("pcie: step %u of the PCIe root complex\n", steps);
 	if (steps >= 1) {
 		step_power();
 	}
@@ -336,11 +372,148 @@ hakios_pcie_init(void)
 		step_resets();
 	}
 	if (steps < 4) {
-		printf("pcie: stopping here (pcie_step=%u)\n", steps);
+		tell("pcie: stopping here (pcie_step=%u)\n", steps);
 		return;
 	}
 	if (parf == 0 && !pcie_map()) {
 		return;
 	}
 	step_read();
+	if (steps >= 5) {
+		step_setup(steps);              /* (the windows are mapped by now: see above) */
+	}
+}
+
+/*
+ * Boot-arg pcie_at=N: the same steps, N seconds in, on a thread of their own.
+ *
+ * Everything here otherwise runs inside bsd_init, which the loader sees as the first two seconds of a
+ * log that is already a hundred kilobytes: its lines are gone by the time the log is read back (only
+ * the last 4 KB of each snapshot is kept). Waiting puts the report where it can be read.
+ */
+static void
+pcie_thread(void * parameter, __unused wait_result_t result)
+{
+	uint32_t seconds = (uint32_t)(uintptr_t) parameter;
+	uint32_t steps = 0;
+
+	delay_for_interval(seconds, NSEC_PER_SEC);
+	if (PE_parse_boot_argn("pcie_step", &steps, sizeof(steps)) && steps != 0) {
+		pcie_run(steps);
+	}
+	thread_terminate(current_thread());
+}
+
+/*
+ * Step 5: the two words the vendor's driver writes before it touches the link, and the DBI window.
+ *
+ * They are the same two the reference port's step 9 wrote -- PARF_MHI_CLOCK_RESET_CTRL from 3 to
+ * 0x13, and the master's write-address halt left alone at its 0x80000014 -- plus the one they never
+ * reached: PARF_DBI_BASE_ADDR, which is 0 here. With it zero there is no window in which the root
+ * complex's own configuration space can be read, which is the next thing to want (vendor: pci-msm.c,
+ * msm_pcie_init_parf / msm_pcie_config_dbi).
+ *
+ * Written last, dbi: whatever goes wrong after it can be seen in one boot instead of two.
+ */
+static void
+step_setup(uint32_t steps)
+{
+	uint32_t was;
+
+	if (parf == 0) {
+		return;
+	}
+	/*
+	 * One register a step. Writing them together hung the machine with nothing in the log at all
+	 * (step 5, 21:44: that boot's last line was a launchd one forty seconds in, and the same run
+	 * with pcie_step=4 prints everything), so whichever of them is the one cannot be told apart
+	 * from the others that way -- and each takes a boot to try.
+	 */
+	if (steps >= 5) {
+		tell("pcie: 5: about to write mhi_clock_reset (%#x = %#x); if nothing follows, that write hung\n",
+		    PARF_MHI_CLOCK_RESET, 0x13u);
+		was = rd(parf + PARF_MHI_CLOCK_RESET);
+		wr(parf + PARF_MHI_CLOCK_RESET, (was & ~0x30u) | 0x10u);        /* (bit 4: what 0x13 sets) */
+		tell("pcie: 5: mhi_clock_reset %#x -> %#x\n", was, rd(parf + PARF_MHI_CLOCK_RESET));
+	}
+	if (steps >= 6) {
+		/*
+		 * The rest of what the vendor's driver writes before it touches the configuration space
+		 * (pci-msm.c:4510-4565, msm_pcie_hw_init), in its order:
+		 *
+		 *   PARF_DEVICE_TYPE = 4        "configure PCIe to RC mode" -- this was 0, which is not a
+		 *                               root complex at all, and is the best explanation there is
+		 *                               for the configuration space not answering
+		 *   PARF_PM_CTRL     bit 5 clear   (L1 enabled: REQ_NOT_ENTR_L1)
+		 *   PARF_PHY_CTRL    bit 0 clear
+		 *   PARF_DBI_BASE    = 0         an offset, not an address: the vendor writes zero, and the
+		 *                               window at 0x60000000 is the one the device tree describes
+		 *   PARF_SYS_CTRL    = 0x365E
+		 *   PARF_MHI_CLOCK_RESET_CTRL  bit 4 set  (done in step 5, left here for the order's sake)
+		 *   PARF_INT_ALL_MASK: 0, then the bits the driver wants
+		 *   PARF_SLV_ADDR_SPACE_SIZE = 16 MB
+		 *   PARF_AXI_MSTR_WR_ADDR_HALT: bit 31 with what is already there
+		 *
+		 * Writes have been safe all evening; it was reading the configuration space that stopped
+		 * the machine, and that is step 7.
+		 */
+		was = rd(parf + PARF_DEVICE_TYPE);
+		wr(parf + PARF_DEVICE_TYPE, 4);
+		tell("pcie: 6: device_type %#x -> %#x (root complex mode)\n", was, rd(parf + PARF_DEVICE_TYPE));
+
+		was = rd(parf + PARF_PM_CTRL);
+		wr(parf + PARF_PM_CTRL, was & ~(1u << 5));
+		tell("pcie: 6: pm_ctrl %#x -> %#x (L1 allowed)\n", was, rd(parf + PARF_PM_CTRL));
+
+		was = rd(parf + PARF_PHY_CTRL);
+		wr(parf + PARF_PHY_CTRL, was & ~1u);
+		tell("pcie: 6: phy_ctrl %#x -> %#x\n", was, rd(parf + PARF_PHY_CTRL));
+
+		wr(parf + PARF_DBI_BASE_ADDR, 0);
+		tell("pcie: 6: dbi_base = %#x (an offset; the window is %#lx)\n",
+		    rd(parf + PARF_DBI_BASE_ADDR), (unsigned long) PCIE_DM_CORE_PHYS);
+
+		was = rd(parf + PARF_SYS_CTRL);
+		wr(parf + PARF_SYS_CTRL, 0x365e);
+		tell("pcie: 6: sys_ctrl %#x -> %#x\n", was, rd(parf + PARF_SYS_CTRL));
+
+		wr(parf + PARF_INT_ALL_MASK, 0);
+		tell("pcie: 6: int_all_mask %#x (everything masked for now)\n", rd(parf + PARF_INT_ALL_MASK));
+
+		wr(parf + PARF_SLV_ADDR_SPACE, 0x01000000);
+		tell("pcie: 6: slv_addr_space %#x\n", rd(parf + PARF_SLV_ADDR_SPACE));
+
+		was = rd(parf + PARF_AXI_MSTR_HALT);
+		wr(parf + PARF_AXI_MSTR_HALT, was | (1u << 31));
+		tell("pcie: 6: axi_mstr_halt %#x -> %#x\n", was, rd(parf + PARF_AXI_MSTR_HALT));
+	}
+	if (steps >= 7) {
+		tell("pcie: 7: parf ltssm %#x, status %#x, pm_stts %#x\n", rd(parf + PARF_LTSSM),
+		    rd(parf + PARF_STATUS), rd(parf + PARF_PM_STTS));
+		if (dbi != 0) {
+			tell("pcie: 7: reading the dbi's id (%#x at %#lx) -- if nothing follows, that read hung\n",
+			    DBI_ID, dbi);
+			tell("pcie: 7: dbi id %#x (Qualcomm is 0x17cb), header type %#x, cap %#x\n",
+			    rd(dbi + DBI_ID), rd(dbi + DBI_HEADER_TYPE), rd(dbi + DBI_CAP));
+		}
+	}
+}
+
+void
+hakios_pcie_init(void)
+{
+	uint32_t steps = 0, at = 0;
+
+	if (!PE_parse_boot_argn("pcie_step", &steps, sizeof(steps)) || steps == 0) {
+		return;
+	}
+	if (PE_parse_boot_argn("pcie_at", &at, sizeof(at)) && at >= 1 && at <= 600) {
+		thread_t thread;
+
+		if (kernel_thread_start(pcie_thread, (void *)(uintptr_t) at, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+			return;
+		}
+	}
+	pcie_run(steps);
 }

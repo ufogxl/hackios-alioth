@@ -16,6 +16,9 @@
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
+
+/* (hakios.display.c declares this the same way: the header has the internals, not this one) */
+extern kern_return_t thread_terminate(thread_t thread);
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <net/bpf.h>
@@ -263,11 +266,15 @@ net_ioctl(ifnet_t ifp, u_long command, void *data)
 		break;                          /* the link hands us everything anyway */
 	default:
 		/*
-		 * What iOS's Wi-Fi side asks of a radio's interface. There is no radio here to ask:
-		 * the Wi-Fi cluster of the POCO X5 Pro is not built into this kernel (see
-		 * bsd/conf/files). The link still exists for the interfaces that do have one.
+		 * What iOS's Wi-Fi side asks of a radio's interface: bsd/dev/hakios.apple80211.c.
+		 *
+		 * This was EOPNOTSUPP while the whole Wi-Fi cluster was out of the build (the POCO's
+		 * radio is not this phone's). The upper half is built again -- the radio is what is
+		 * missing, and bsd/dev/hakios.radio.c answers for it -- so the requests have to get
+		 * through: with this line refusing them, wifid asked and was refused, and Apple80211
+		 * never saw a single command.
 		 */
-		error = EOPNOTSUPP;
+		error = n->link->wireless ? hakios_apple80211_ioctl(command, data) : EOPNOTSUPP;
 		break;
 	}
 	return error;
@@ -423,10 +430,77 @@ hakios_net_attach(const struct hakios_net_link *link)
 	return true;
 }
 
+static void wlan_probe_start(void);              /* (the probe is below, with its own comment) */
+
 void
 hakios_net_init(void)
 {
 	PE_parse_boot_argn("net_trace", &net_trace, sizeof(net_trace));
 	PE_parse_boot_argn("net_names", &net_names, sizeof(net_names));
 	hakios_virtio_net_init();
+	wlan_probe_start();
+}
+
+/* ---- boot-arg wlan_step=N: a Wi-Fi interface with no radio behind it ---------------------------- */
+
+/*
+ * The upper half of the Wi-Fi is generic and is built into this kernel: en0 as a wireless interface,
+ * the two registry services by which iOS finds one (iokit/Kernel/hakios.wlan.cpp), and Apple80211
+ * answered through a socket ioctl (bsd/dev/hakios.apple80211.c). The radio underneath them is not
+ * built -- the K40's QCA6390 is a PCIe part that nothing here drives yet, and bsd/dev/hakios.radio.c
+ * answers for a kernel without one.
+ *
+ * So the upper half is dormant, and cannot be looked at: HakiosWLANStart() is called from
+ * hakios_net_attach() when a wireless link appears, and without a radio none does. wlan_step=N
+ * attaches one anyway, N seconds after the kernel starts: an en0 that is Wi-Fi as far as the
+ * interface, configd and wifid are concerned, whose transmit drops everything and which never
+ * reports a frame. Nothing of the phone is touched; what it shows is what iOS asks of a radio it
+ * cannot have, which is the baseline the real driver will be judged against.
+ *
+ * wlan_step=20 is early enough to be in the log beside wifid's own start.
+ */
+static bool
+wlan_dry_transmit(mbuf_t packet, size_t length)
+{
+#pragma unused(packet, length)
+	return false;
+}
+
+static const struct hakios_net_link wlan_dry_link = {
+	.name = "en0 (a radio that is not there)",
+	.unit = 0,
+	.address = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 },      /* locally administered, and not any real part's */
+	.wireless = true,
+	.up = false,
+	.transmit = wlan_dry_transmit,
+	.poll = NULL,
+};
+
+static void
+wlan_probe_thread(void * parameter, __unused wait_result_t result)
+{
+	uint32_t seconds = (uint32_t)(uintptr_t) parameter;
+
+	delay_for_interval(seconds, NSEC_PER_SEC);
+	if (hakios_net_attach(&wlan_dry_link)) {
+		printf("net: en0 attached as a Wi-Fi interface with no radio behind it (wlan_step=%u): what iOS asks of it "
+		    "is what the real driver has to answer\n", seconds);
+	} else {
+		printf("net: en0 already exists; the probe did nothing\n");
+	}
+	thread_terminate(current_thread());
+}
+
+static void
+wlan_probe_start(void)
+{
+	uint32_t seconds = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("wlan_step", &seconds, sizeof(seconds)) || seconds < 1 || seconds > 600) {
+		return;
+	}
+	if (kernel_thread_start(wlan_probe_thread, (void *)(uintptr_t) seconds, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
 }

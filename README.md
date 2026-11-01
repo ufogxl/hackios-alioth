@@ -1,73 +1,51 @@
-# HakiOS
+# HakiOS — the Redmi K40 (`alioth`) port
 
-English · [中文](README.zh.md) · [Українська](README.uk.md)
+English · [中文](README.zh.md)
 
-HakiOS runs the open-source XNU kernel (xnu-8796.121.2) with my own boot loader and my own drivers
+HakiOS runs the open-source XNU kernel (xnu-8796.121.2) with its own boot loader and its own drivers
 on an Android phone with a Qualcomm SoC, and boots the stock iOS 16.5 user space on top of it:
-launchd, backboardd, SpringBoard, the apps. The same thing runs in QEMU (`virt`, aarch64) on a
-Linux PC.
+launchd, backboardd, SpringBoard, the apps. The same kernel runs in QEMU (`virt`, aarch64) on a Linux
+PC, with nothing of Apple's.
 
-Nothing is flashed. The loader goes into RAM through `fastboot boot`, the system lives in RAM for
-the length of a session, and a reboot brings the phone back to its own Android. This is a research
-bench, not a ROM.
+Nothing is flashed. The loader goes into RAM through `fastboot boot`, the system lives in RAM for the
+length of a session, and a reboot brings the phone back to its own Android. This is a research bench,
+not a ROM.
 
-The first phone is the **POCO X5 Pro 5G** (`redwood`, Snapdragon 778G). The kernel knows nothing
-about it in advance: every address, interrupt, power rail and firmware comes from the phone's own
-device tree and its own Android, so a port to another Qualcomm phone is a new directory under
-`devices/`, not a rewrite.
+**This repository is the port to the Redmi K40** (`alioth`, Snapdragon 870, 12 GB). It began as the
+port to the POCO X5 Pro 5G (`redwood`, Snapdragon 778G), which is still the reference and still has
+its own directory; the kernel, the loader and the user space are shared, and what differs is
+collected under `devices/`.
 
 ## What is in the repository
 
-Only my code and my data:
+Only this port's code and data:
 
-- the kernel: a patch to Apple's open-source XNU (`xnu/hakios.patch`, APSL 2.0) and my driver
-  files (`xnu/files/`), laid over a fresh clone by `xnu/apply.sh`;
-- the boot loader (`xnuloader/`), my programs and libraries (`userland/src/`), tools (`tools/`),
-  build and run scripts;
-- `prebuilt/`: the loader and libraries built from this repository (not the kernel: `xnu-build.sh` makes
-  that, and `xl` runs only the one built in this tree);
-- `devices/poco-x5-pro/`: what one phone needs (its UEFI port, device tree, firmware script).
+- the kernel: a patch to Apple's open-source XNU (`xnu/hakios.patch`, APSL 2.0) and the driver files
+  (`xnu/files/`), laid over a fresh clone by `xnu/apply.sh`;
+- the boot loader (`xnuloader/`), the programs and libraries (`userland/src/`), the tools (`tools/`),
+  the build and run scripts;
+- `devices/alioth/`: everything that is one phone's — its UEFI, device tree, firmware script,
+  `hardware.md` (the register-level facts and where each came from), `status` (what works, and how
+  it was seen), `boot-args` (the kernel command line this phone needs);
+- `devices/poco-x5-pro/`: the same for the first phone;
+- `prebuilt/`: the loader and libraries built from this repository. Not the kernel: `xnu-build.sh`
+  makes that and `xl` runs only the one built in this tree.
 
-Not in the repository, never:
-
-- any file of iOS: no binary, image, cache, font, picture or screenshot. You build the system
-  image on your machine from the iOS 16.5 IPSW, which `sysimage/fetch.sh` downloads from Apple's
-  public servers for you, without decrypting or circumventing anything;
-- the phone's firmware (GPU, Wi-Fi, audio DSP, modem, haptics, cameras): it is the vendor's and
-  is pulled from your own phone into `fw-*/`, which git ignores;
-- keys, certificates, activation, or anything that would make the phone pass as an iPhone to
-  Apple's services. Signing in to an Apple account is impossible here and not a goal.
+Never in the repository: any file of iOS (the system image is built on your machine from the iOS
+16.5 IPSW that `sysimage/fetch.sh` downloads from Apple's servers, without decrypting anything); the
+phone's firmware (pulled from your own phone into `fw-*/`, which git ignores); keys, certificates or
+activation.
 
 ## Status
 
-| Works | Not yet |
-|---|---|
-| Lock screen, home screen, Control Center, gestures, the stock apps | Cellular: the modem boots, sees the network, the SIM is bound, the IPA data path and `en1` are in place; registration, the data session and the status bar bars are in progress (`docs/cellular.md`) |
-| Touch screen, multitouch, power and volume buttons | Bluetooth |
-| All 8 CPU cores, the big core at 2.4 GHz | Charging under this kernel |
-| GPU rendering on Adreno (`gpu=1`, OpenGL ES through Mesa) | Metal (there is a shader compiler, no Metal) |
-| Speakers and microphone (`adsp=1 sound=4 mic=4`) | Apple account: no Secure Enclave |
-| Battery level in the UI (through the audio DSP, `adsp=1`) | |
-| Vibration (`haptic=5`) | |
-| Wi-Fi: radio, driver, network connection (`wifi=1`) | |
-| Cameras in Camera.app (`cam=5`) | |
-| `/private/var` kept across reboots (`var_store=1 ufs_write=1`) | |
-| Sileo, Procursus packages, SSH into the phone | |
-
-### The Redmi K40 (`alioth`) port
-
-The second phone is the **Redmi K40** (`alioth`, Snapdragon 870, 12 GB). The kernel, loader and user
-space are the same; what differs is collected in `devices/alioth/`. It boots the same iOS 16.5 user
-space to a home screen with a wallpaper, widgets and working touch, on a 120 Hz panel.
-
-Every area below is a line of `devices/alioth/status`. The table is generated from that file --
-`python3 tools/device-status.py update alioth README.md` -- and must not be edited here: a status
-kept in prose drifts from the phone, and this one did.
+What works on this phone, one line per area, from `devices/alioth/status`. Only what has been seen on
+the phone is `works`; written and not yet seen is `partial`, with a note. The table is generated —
+`python3 tools/device-status.py update alioth README.md` — and must not be edited here.
 
 <!-- status:alioth begin -->
 | Area | State | Note |
 |---|---|---|
-| display | works | the panel's 60 Hz timing, or its 120 Hz one with display_hz=120; the picture stays at 60 frames a second, so the panel is not the limit. A frame is copied into the panel's memory in 2 ms and the copy is timed to the panel's own fetch (fb_fetch_align=2), which removed the moving tears; a fixed narrow band under the status bar still tears while the interface animates, and is not explained yet |
+| display | works | the panel's 60 Hz timing, or its 120 Hz one with display_hz=120; the picture stays at 60 frames a second, so the panel is not the limit. A frame is copied into the panel's memory in 2 ms and the copy is timed to the panel's own fetch (fb_fetch_align=2). A narrow band of what looked like tearing under the status bar turned out to be residue in the display controller from an earlier experiment and went away with a power cycle; how much tearing is left, in a state no experiment has written to, is not measured yet |
 | touch | works | FT3658U, multitouch, coordinates checked against the panel |
 | buttons | partial | power and volume-down come through the PMIC; volume-up is not a TLMM pin and the firmware leaves it unpulled, and the PON status word reads 0x4 |
 | cpu | works | all eight cores; bootcpu=7 on the big core; EPSS frequency scaling |
@@ -87,160 +65,119 @@ kept in prose drifts from the phone, and this one did.
 | sensors | missing | no accelerometer, gyroscope or ambient light |
 <!-- status:alioth end -->
 
-Two things are worth knowing before reading the port notes, because each of them has cost a night:
-
-- **The root file system is a 2.3 GB `userland/system.apfs` uploaded into the loader's RAM**, not a
-  partition on the phone. A cold start empties that RAM, but the note file `xl` keeps beside the phone
-  does not empty with it, so `xl run` silently uploads nothing and the kernel panics at
-  `Process 1 exec of /sbin/launchd failed, errno 2`. That is never a bad image. `xl enter` now drops the
-  note; a `fastboot boot` that sidesteps `xl enter` does not.
-- **`mkxnuimg.py` defaults to `poco-x5-pro`**, whose UEFI lives at a different address. An image built
-  without `DEVICE=alioth` will not boot here. A good one is 1,992,704 bytes; a POCO one is 1,470,464.
-
-The day-by-day log of the port, including the hypotheses that turned out to be wrong, is `PROGRESS.md`;
-its head carries an index. `devices/alioth/README.md` is the map of the port and
-`devices/alioth/hardware.md` the register-level facts.
-
-## Quick start in QEMU
-
-Linux x86-64, about 12 GB of disk, 7-Zip 23 or newer, `lz4`, `qemu-system-aarch64`, `edk2-aarch64`.
-
-```sh
-git clone https://github.com/oosexgang/hakios-os.git hakios
-cd hakios
-sysimage/fetch.sh             # the iOS 16.5 IPSW from Apple's servers, the needed parts unpacked (7.4 GB)
-REST=1 userland/build.sh      # the APFS images: userland/root.apfs and userland/system.apfs
-mkdir -p logs
-qemu/run-ios.sh 1200 -display gtk > logs/qemu.log     # a 20-minute session
-```
-
-The lock screen appears after two or three minutes. The mouse with the button held is a finger;
-`H` is Home, `L` is the power button, `↑`/`↓` are volume.
+The register-level facts behind all of this are in `devices/alioth/hardware.md`, and how each was
+established — including the conclusions that were later overturned — is in `PROGRESS.md`.
 
 ## On the phone
 
-A phone with a port (`devices/poco-x5-pro/`, POCO X5 Pro 5G), its boot loader unlocked, `adb` and
-`fastboot` on the PC, the images from the previous section, and the phone's own firmware:
+A K40 with its boot loader unlocked, `adb` and `fastboot` on the PC, the images built (below), and
+the phone's own firmware pulled:
 
 ```sh
-devices/poco-x5-pro/pull-firmware.sh    # GPU, Wi-Fi, audio/battery, haptics, modem, cameras -> fw-*/
-./xl enter                          # Android -> fastboot -> our loader in RAM
-./xl ramdisk userland/system.apfs   # the system image into the phone's RAM (~80 s), once per loader session
-XL_SB_DELAY=8 XL_SECS=600 \
-XL_CMDLINE="bootcpu=7 cpus=8 cpufreq=1 ufs=2 touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1 haptic=5 modem=1" \
-./xl run                            # a 10-minute session, the log goes to logs/
-./xl reboot                         # back to Android
+adb pull /mnt/fw/image /some/where     # then: devices/alioth/pull-firmware.sh, which knows the paths
+DEVICE=alioth ./xl enter               # Android -> fastboot -> our loader in RAM
+./xl ramdisk userland/system.apfs      # the 2.3 GB system image into RAM (~90 s), once per loader session
+./xl run                               # a session; the log goes to logs/
+./xl stop                              # end it and leave the phone in the loader
 ```
 
-`tools/modem-cycle.sh "ARGS" SECS` does all of that in one command and returns the phone to Android.
+`xl run` needs no arguments: the phone's own command line is `devices/alioth/boot-args`, and
+`make phone SECS=600` runs the whole sequence (`xl enter`, the upload, the run) in one command,
+adding `ARGS=...` to it.
 
-The main kernel arguments (the full list is in `docs/ru/notes.md`):
+**Two things cost a night each, and both look like a bad image:**
 
-| Argument | What it does |
-|---|---|
-| `cpus=8 bootcpu=7 cpufreq=1` | all CPU cores and their clocks |
-| `touchscreen=1` | the touch screen |
-| `gpu=1` | rendering on Adreno (an image built with `GL=1`, firmware in `fw-gpu/`) |
-| `adsp=1 sound=4 mic=4` | the audio DSP: speakers, microphone; battery and charging come with it |
-| `haptic=5` | the vibration motor |
-| `wifi=1` | Wi-Fi (the network from `fw-wifi/network`) |
-| `cam=5` | the cameras |
-| `modem=1` | the modem beside the system: its firmware, file systems, IPA, SIM, NAS |
-| `modem_step=N` | the modem step by step, for debugging (`docs/cellular.md`) |
-| `var_store=1 ufs_write=1` | keep `/private/var` across reboots |
+- `./xl enter` rebuilds the small image and **drops the note about the resident system image**, so the
+  run after it panics with `Process 1 exec of /sbin/launchd failed, errno 2`. That is never a bad
+  image: upload it again with `./xl ramdisk userland/system.apfs`.
+- the small image is built by `userland/build.sh`, and **what the system is** is decided by the
+  environment at that moment: `GL=1 REST=1 SYSTEM=1` gives the GPU path, the full set of launchd
+  jobs, and the wallpaper. Rebuild it without those and the wallpaper is black, the dock is white
+  and the widgets do not load.
 
-On the Redmi K40 (alioth, `devices/alioth/`) two of these differ, and the difference is not a
-mistake: **`gpu=1` is refused there by design** -- that shorthand is the steps of the POCO's
-Adreno 642L, and the SM8250's Adreno 650 has only the standalone steps 1 to 22. What works is
+## Boot arguments
 
-```sh
-DEVICE=alioth XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 rd=md0"
-```
+Only what this phone needs. Everything below is a boot argument to the kernel; the full list is in
+`docs/ru/notes.md`.
 
-(`adreno_keep=1` is what keeps the GPU for the system to draw with; without it step 22 is the end
-and the display falls back to drawing without a GPU). The rest of that port is in
-`devices/alioth/hardware.md`.
+| Argument | Default | What it does |
+|---|---|---|
+| `gl=1 adreno=22 adreno_keep=1` | — | the GPU: step 22 of the Adreno 650's bring-up, and keep it for the system to draw with (`gpu=1` is the POCO's shorthand and is refused here) |
+| `touchscreen=1` | — | the FT3658U |
+| `bootcpu=7 cpus=8` | — | the kernel on a big core (the loader keeps its own and answers during a run), all eight cores |
+| `cpufreq` | **on** | pin every cluster at its top row (1804 / 2419 / 3187 MHz). `cpufreq=0` leaves the boot loader's modest frequency, which is 3.4 times slower |
+| `touch_poll_us` | **500** | how often the touch screen's interrupt line is looked at. The part reports 240 times a second, so 8000 (the old default) added up to 12 ms to every touch |
+| `fb_fetch_align` | **2** | when the frame copy starts: 2 waits for the panel to be nearly done with its own fetch, 1 waits for the fetch to begin, 0 copies as the swap arrives |
+| `fb_fetch_lead` | **600** | how many lines early `fb_fetch_align=2` starts |
+| `fb_threads` | **8** | processors sharing the copy: 2.0 ms a frame, against 3.5 with three and 9–10 with one |
+| `fbwidth` / `fbheight` | 1125 / 2436 | the picture's size, which is the iPhone's, not the panel's. `1080 2400` needs no scaling (1.3 ms) but iOS does not know that screen and falls back to a debug layout |
+| `display_hz` | — | `60` / `90` / `120`: send the panel the timing-switch sequence for that rate |
+| `fb_kick` | **0** | 1 turns autorefresh off and has this kernel start each frame itself. Measured: the panel then never fetches again, because autorefresh is the only thing that starts a fetch |
+| `var_store=1 ufs_write=1` | — | keep `/private/var` across reboots |
+
+Probes that only read, or that only run when asked: `display_step=N` and `display_te=N` (the display
+controller and the panel's TE pin), `display_lines=1` (where in its frame the fetch is),
+`fb_log_layers=N` (the swaps that are not one full-screen layer), `pcie_step=N` (the PCIe root
+complex, for Wi-Fi), `cpuload`/`ddr`.
+
+## Known limits
+
+- **A frame is always copied.** Handing one over uncopied needs the display controller to read memory
+  it can reach, and nothing in this boot chain maps more than the one frame the boot loader left: a
+  new address is not in the SMMU's page table, and a wider stride (4352, which a GPU can write) runs
+  past what is mapped and hangs the machine. Both need a stage-1 domain in `apps_smmu`, which is
+  missing from the whole port, not just from the display.
+- **The picture is 60 frames a second.** The panel's 120 Hz timing works and is stable; what holds the
+  picture at 60 has not been established.
+- **No Metal.** Rendering is OpenGL ES through Mesa; CoreAnimation draws through it.
+- No sound, no network (neither Wi-Fi nor cellular), no camera, no vibration.
+- The copy can still tear while the interface animates. `fb_fetch_align` reduced it; how much of it,
+  in a state no experiment has written to, is not measured yet.
 
 ## Building from source
 
-The kernel (Linux: theos with its cctools and `iPhoneOS16.5.sdk`; macOS: Xcode or cctools, the SDK
-is fetched for you):
+The kernel (Linux: theos with its cctools and `iPhoneOS16.5.sdk`; macOS: Xcode or cctools):
 
 ```sh
-xnu/apply.sh             # XNU sources from Apple's GitHub + my changes -> xnu-src/
+xnu/apply.sh             # XNU from Apple's GitHub + the changes -> xnu-src/
 xnu-deps/setup.sh        # dependencies, tools and the SDK
-./xnu-build.sh -j8 -k    # -> xnu-src/.../BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+./xnu-build.sh -j10      # -> xnu-src/.../BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 ```
 
-The loader: `xnuloader/build.sh` (clang + lld-link, an EFI application without EDK2). The header
-`xnuloader/identity.h`, the properties by which iOS tells which iPhone it is, is not kept in the
-repository: `xnuloader/mkidentity.sh` makes it at build time from the device tree in your own IPSW
-(one 34 KB file; LZFSE is decoded by `lzfse`, macOS's `compression_tool` or the Python `lzfse`
-module, or the open lzfse library gets built). User space and the images: `REST=1 userland/build.sh`
-(`MODEM=1 SYSTEM=1` put the modem's firmware into the system image). Details: `xnu/README.md`,
+`./xnu-build.sh --clean` throws the object tree away first. It is not a convenience: a kernel that
+linked stale objects looks on the phone exactly like broken code, and one evening went into that.
+The build's last lines are harmless errors (export checks and symbol sets); the kernel's timestamp is
+what says whether it was made.
+
+The loader: `xnuloader/build.sh`. User space and the images:
+`GL=1 REST=1 SYSTEM=1 userland/build.sh`. Details: `xnu/README.md`, `devices/alioth/README.md`,
 `docs/ru/notes.md`.
 
 ## Layout
 
 | Directory | Contents |
 |---|---|
-| `xnu/` | the kernel patch and files; `apply.sh`, `export.sh`; a README about the kernel |
-| `xnu/files/bsd/dev/hakios.*.c` | my drivers: display, touch, UFS, GPU, Wi-Fi, audio, modem (`hakios.mpss.c`), its packets (`hakios.ipa.c`, `hakios.cell.c`), SIM/NAS, haptics, cameras |
+| `xnu/` | the kernel patch and files; `apply.sh`, `export.sh` |
+| `xnu/files/bsd/dev/hakios.*.c` | the drivers: display, touch, UFS, GPU, Wi-Fi, audio, modem, haptics, cameras, PCIe. The head of each says where its numbers came from |
 | `xnuloader/` | the boot loader (a UEFI application) |
-| `userland/` | my programs and libraries (`src/`), the image build, launchd jobs |
-| `sysimage/` | scripts that fetch and unpack the OS files from the IPSW (none of the files themselves) |
-| `devices/poco-x5-pro/` | one phone: its UEFI port, device tree, prebuilt UEFI images, firmware script, tools |
-| `devices/alioth/` | a second phone (Redmi K40): the same list for a different SoC, plus `hardware.md`, the register-level facts |
-| `tools/` | APFS, firmware, QMI tests, run scripts |
+| `userland/` | the programs and libraries (`src/`), the image build, the launchd jobs, `rc.jobs.*` (what a session runs) |
+| `sysimage/` | the scripts that fetch and unpack the OS files from the IPSW (none of the files) |
+| `devices/alioth/` | this phone: UEFI, device tree, firmware script, `hardware.md`, `status`, `boot-args` |
+| `devices/poco-x5-pro/` | the first phone, the same list |
+| `tools/` | APFS, firmware, QMI tests, the run scripts, `device-status.py` |
 | `qemu/` | running in QEMU |
-| `docs/` | `notes.md`: the detailed notes (Russian); `cellular.md`: cellular; `air.md`: the GPU; `metal.md`: Metal |
+| `docs/` | `notes.md` (the boot arguments, in Russian), `cellular.md`, `air.md`, `metal.md` |
 | `prebuilt/` | the built loader and libraries (the kernel is not kept here) |
-| `PROGRESS.md` | the port log, day by day, newest last; its head says how to read it |
-
-## Devices
-
-The kernel, loader and user space are shared. Everything about one phone lives in
-`devices/<name>/`: its UEFI, device tree, firmware list and tools. The POCO's README
-(`devices/poco-x5-pro/`) is the map of what a port to another Qualcomm phone must bring, and
-`devices/alioth/` is that map followed a second time on a different SoC: compare the two before
-starting a third.
-The phone's drivers are the files `xnu/files/bsd/dev/hakios.*.c`; the head of each says where its
-numbers came from.
-
-## Cellular
-
-The modem (the Hexagon MPSS) is brought up from XNU: firmware through TrustZone, shared memory,
-SMP2P, GLINK, QRTR, QMI; its file systems are served from the UFS (read-only, writes stay in kernel
-memory), TFTP and the service registry are mine. The IPA packet engine runs with its firmware,
-clock and SMMU context, and the handshake with the modem goes through. The SIM is bound to the
-subscription and NAS reads the signal. The current state and the whole story are in
-`docs/cellular.md`.
-
-## Independent, and Apple-free at the core
-
-HakiOS is an independent research project. It is **not affiliated with or endorsed by Apple**;
-"iOS", "iPhone", "XNU" and "Apple" are named only to describe what the code works with. The core
-kernel, the boot loader and the open tools build and run with nothing of Apple's:
-
-```sh
-make qemu-open      # the open kernel + a placeholder loader + a tiny raw-syscall user space, in QEMU
-```
-
-No IPSW, no iOS user space, no firmware. Booting the stock iOS user space (`make qemu`,
-`make phone`) is an optional path that needs the IPSW and the phone's firmware, which you supply
-from your own device.
+| `PROGRESS.md` | the port log: why things are the way they are, and what was tried and rejected |
 
 ## Licenses and the legal side
 
-My code is under the license of the files it changes: the XNU patch under the Apple Public Source
-License 2.0 (Apple publishes XNU under it; the terms are met: changes are published as source,
-notices are kept), the rest as the file headers say. iOS, its images, Apple's trademarks and the
-phone's firmware belong to their owners, are not in this repository and are not distributed by me;
-everyone takes them from their own phone and their own IPSW. "iOS", "iPhone" and "Apple" are
-named only to describe what the code works with. If you believe a file here infringes anyone's
-rights, open an issue and I will remove it.
+HakiOS is an independent research project, not affiliated with or endorsed by Apple; "iOS",
+"iPhone", "XNU" and "Apple" are named only to describe what the code works with. The kernel, the boot
+loader and the open tools build and run with nothing of Apple's (`make qemu-open`).
 
-The detail is in separate files: `LEGAL.md` (what is and is not distributed, and the limits of
-these statements), `COMPLIANCE.md` (how the APSL 2.0 and other terms are met, and the items still
-to verify), `THIRD_PARTY_LICENSES.md` (every third-party component with origin and license), and
-`NOTICE` (the short canonical list). None of this is legal advice.
+The code is under the license of the files it changes: the XNU patch under the Apple Public Source
+License 2.0 (changes published as source, notices kept), the rest as the file headers say. iOS, its
+images, Apple's trademarks and the phone's firmware belong to their owners and are not in this
+repository. The detail: `LEGAL.md`, `COMPLIANCE.md`, `THIRD_PARTY_LICENSES.md`, `NOTICE`. None of it
+is legal advice.

@@ -1,161 +1,163 @@
-# HakiOS
+# HakiOS —— 红米 K40（`alioth`）移植
 
-[English](README.md) · 中文 · [Українська](README.uk.md)
+[English](README.md) · 中文
 
-HakiOS 在搭载高通 SoC 的 Android 手机上运行开源的 XNU 内核（xnu-8796.121.2），配上我自己写的引导
-程序和驱动，并在其上启动原版 iOS 16.5 用户空间：launchd、backboardd、SpringBoard 和各个应用。同样
-的东西也能在 Linux 电脑上的 QEMU（`virt`，aarch64）里运行。
+HakiOS 把苹果开源的 XNU 内核（xnu-8796.121.2）连同自己的引导程序和自己的驱动，跑在采用高通芯片的
+Android 手机上，并在其上启动原版 iOS 16.5 的用户空间：launchd、backboardd、SpringBoard、各个 App。
+同一个内核也能在 Linux 电脑的 QEMU（`virt`，aarch64）里运行，且不需要苹果的任何文件。
 
-不刷写任何东西。引导程序通过 `fastboot boot` 进入内存，系统在内存里运行一个会话，重启后手机回到
-它自己的 Android。这是一个研究用的试验台，不是 ROM。
+**什么都不刷。** 引导程序通过 `fastboot boot` 进内存，系统在一次会话期间只活在内存里，重启就回到手机
+自己的 Android。这是研究用的台架，不是 ROM。
 
-第一台手机是 **POCO X5 Pro 5G**（`redwood`，骁龙 778G）。内核事先对它一无所知：每个地址、中断、
-电源轨和固件都来自手机自己的设备树和它的 Android，所以移植到另一台高通手机意味着在 `devices/`
-下新建一个目录，而不是重写。
+**这个仓库是红米 K40**（`alioth`，骁龙 870，12 GB）的移植。它起始于 POCO X5 Pro 5G（`redwood`，
+骁龙 778G）的移植——那台是初号机，仍是参考，也仍保留着自己的目录；内核、引导程序和用户空间是共用的，
+不同的部分都收在 `devices/` 下。
 
 ## 仓库里有什么
 
-只有我的代码和我的数据：
+只有这一次移植的代码和数据：
 
-- 内核：对 Apple 开源 XNU 的补丁（`xnu/hakios.patch`，APSL 2.0）和我的驱动文件（`xnu/files/`），
-  由 `xnu/apply.sh` 叠加到一份新克隆上；
-- 引导程序（`xnuloader/`）、我的程序和库（`userland/src/`）、工具（`tools/`）、构建和运行脚本；
-- `prebuilt/`：用本仓库构建出的引导程序和库（**不含内核**——内核由 `xnu-build.sh` 现编，`xl` 只跑本树编出来的那个）；
-- `devices/poco-x5-pro/`：一台手机所需的东西（UEFI 移植、设备树、固件脚本）。
+- 内核：对苹果开源 XNU 的补丁（`xnu/hakios.patch`，APSL 2.0）和驱动文件（`xnu/files/`），由
+  `xnu/apply.sh` 铺到一份全新的克隆上；
+- 引导程序（`xnuloader/`）、程序与库（`userland/src/`）、工具（`tools/`）、构建与运行脚本；
+- `devices/alioth/`：属于这台手机的一切——UEFI、设备树、固件脚本、`hardware.md`（寄存器级事实及每条
+  的出处）、`status`（什么能用，以及是怎么看到的）、`boot-args`（这台手机需要的命令行）；
+- `devices/poco-x5-pro/`：初号机的同一份清单；
+- `prebuilt/`：由本仓库构建出的引导程序和库。**不含内核**——内核由 `xnu-build.sh` 现场构建，`xl` 只跑
+  本树构建出来的那一个。
 
-永远不会有的东西：
-
-- 任何 iOS 文件：没有二进制、镜像、缓存、字体、图片或截图。系统镜像由你在自己机器上用 iOS 16.5
-  的 IPSW 构建，`sysimage/fetch.sh` 从 Apple 的公开服务器为你下载它，不解密、不绕过任何东西；
-- 手机的固件（GPU、Wi-Fi、音频 DSP、调制解调器、振动、摄像头）：属于厂商，从你自己的手机取到
-  `fw-*/`，git 忽略这些目录；
-- 密钥、证书、激活，或任何让手机在 Apple 服务面前冒充 iPhone 的东西。这里无法登录 Apple 账户，
-  这也不是目标。
+仓库里**永远不会有**：任何 iOS 文件（系统镜像在你的机器上从 iOS 16.5 的 IPSW 构建，`sysimage/fetch.sh`
+从苹果公开服务器下载，不解密任何东西）；手机固件（从你自己的手机拉到 `fw-*/`，git 忽略）；密钥、证书、
+激活相关的一切。
 
 ## 现状
 
-| 可用 | 尚未 |
-|---|---|
-| 锁屏、主屏、控制中心、手势、系统自带应用 | 蜂窝网络：调制解调器已启动、能看到网络、SIM 已绑定；注册和状态栏信号格正在进行（`docs/cellular.md`） |
-| 触摸屏、多点触控、电源和音量键 | 蓝牙 |
-| 全部 8 个 CPU 核心，大核 2.4 GHz | 本内核下的充电 |
-| Adreno GPU 渲染（`gpu=1`，经 Mesa 的 OpenGL ES） | Metal（有着色器编译器，没有 Metal） |
-| 扬声器和麦克风（`adsp=1 sound=4 mic=4`） | Apple 账户：没有 Secure Enclave |
-| 界面里的电池电量（经音频 DSP，`adsp=1`） | |
-| 振动（`haptic=5`） | |
-| Wi-Fi：射频、驱动、联网（`wifi=1`） | |
-| 相机应用里的摄像头（`cam=5`） | |
-| `/private/var` 跨重启保留（`var_store=1 ufs_write=1`） | |
-| Sileo、Procursus 软件包、SSH 登录手机 | |
+下面这张表来自 `devices/alioth/status`，一行一个部件。只有**在手机上亲眼看到过**的才写 `works`；
+写了代码但还没验证的是 `partial`，并注明缺什么。**这张表是生成的**
+（`python3 tools/device-status.py update alioth README.md`），不要在这里手改。
 
-### 红米 K40（`alioth`）这一路
+<!-- status:alioth begin -->
+| Area | State | Note |
+|---|---|---|
+| display | works | the panel's 60 Hz timing, or its 120 Hz one with display_hz=120; the picture stays at 60 frames a second, so the panel is not the limit. A frame is copied into the panel's memory in 2 ms and the copy is timed to the panel's own fetch (fb_fetch_align=2). A narrow band of what looked like tearing under the status bar turned out to be residue in the display controller from an earlier experiment and went away with a power cycle; how much tearing is left, in a state no experiment has written to, is not measured yet |
+| touch | works | FT3658U, multitouch, coordinates checked against the panel |
+| buttons | partial | power and volume-down come through the PMIC; volume-up is not a TLMM pin and the firmware leaves it unpulled, and the PON status word reads 0x4 |
+| cpu | works | all eight cores; bootcpu=7 on the big core; EPSS frequency scaling |
+| gpu | works | a real A650 through Mesa's freedreno, CoreAnimation rendered by it (gl=1 adreno=22 adreno_keep=1); no Metal |
+| storage | works | /private/var survives a reboot with var_store=1 ufs_write=1 |
+| audio | partial | the ADSP's firmware loads (steps 1-2, read-only); speaker, sound and microphone are wired but not initialised |
+| battery | works | percentage, charging state and the charger flag from the PMIC, with no boot-arg |
+| thermal | missing | no thermal driver; cpufreq=1 pins the top frequency instead |
+| haptic | missing | the aw8697 answers on I2C and its waveform RAM reads back correctly, but f0 calibration and playback do not pass and no vibration has been felt |
+| camera | missing | IMX582 and the rest |
+| torch | missing | the flash module is on the PMIC's SPMI and has been read, not driven |
+| wifi | missing | the QCA6390 is a PCIe endpoint behind pcie0 (stream ID 0x1c00) and the link has never trained on this SoC; hakios.wifi.c and wifi/lx in this tree are the POCO X5 Pro's (WCN6750, no PCIe) |
+| bluetooth | missing | behind the same QCA6390, so behind the same link |
+| cellular | missing | the modem is not started; hakios.mpss.c in this tree is the POCO X5 Pro's |
+| network | missing | follows wifi and cellular; nothing of iOS's networking has been reached |
+| usb | partial | the loader's USB answers xl during a run; nothing of the kernel's own |
+| sensors | missing | no accelerometer, gyroscope or ambient light |
+<!-- status:alioth end -->
 
-第二台手机是**红米 K40**（`alioth`，骁龙 870，12 GB）。内核、loader 和用户态是同一套，不一样的东西
-全部收在 `devices/alioth/` 里。它跑到的是同一个 iOS 16.5 用户态：桌面有壁纸、有小组件、触摸可用，
-面板跑在 120 Hz。
+寄存器级的依据在 `devices/alioth/hardware.md`；每条结论是怎么来的、以及哪些后来被推翻，在 `PROGRESS.md`。
 
-| K40 上已经能用 | K40 上还不行 |
-|---|---|
-| 内核起到 SpringBoard；锁屏、桌面、自带 app | Wi-Fi：QCA6390 是 PCIe 外挂芯片，`hakios.wifi.c` 仍是 WCN6750 版本；PCIe 链路从来没训练起来过 |
-| 8 核全开；`bootcpu=7` 跑大核；EPSS 调频 | 麦克风：WCD938x 挂在 ADSP 后面的 SoundWire 上，没做过 |
-| 触摸（FT3658U）、多点、坐标按面板实测校正过 | 亮度（滑杆会走，然后什么都没发生）和音量上（不是 TLMM 引脚，固件没给它上拉）——两个不同的原因 |
-| GPU：freedreno 驱动真实 A650，CoreAnimation 由它渲染（`gl=1 adreno=22 adreno_keep=1`） | Metal：这一路完全没有 |
-| 显示：120 Hz（`display_hz=120`）；DCS 背光（`display_bl=N`） | 状态栏数字下面的电池颜色 |
-| 壁纸和小组件（镜像构建带 `SYSTEM=1`：407 个 launchd 作业，而不是 25 个） | 相机 |
-| `/private/var` 跨重启保留（`var_store=1 ufs_write=1`） | |
-| ADSP 固件加载（第 1-2 步，只读）；音频和功放已接线但未初始化 | |
+## 在手机上跑
 
-去读这个端口的笔记之前，有两件事值得先知道——每一件都曾经搭进去一整晚：
-
-- **根文件系统是上传进 loader 内存的 2.3 GB `userland/system.apfs`**，不是手机上的分区。冷启会清空
-  那块内存，但 `xl` 在手机旁边留的那条记录不会被清空，于是 `xl run` 静默地什么都不传，内核在
-  `Process 1 exec of /sbin/launchd failed, errno 2` 处 panic。**这永远不是镜像坏了。**
-  `xl enter` 现在会删那条记录；绕过 `xl enter` 直接用 `fastboot boot` 的不会。
-- **`mkxnuimg.py` 默认是 `poco-x5-pro`**，它的 UEFI 在另一个地址。不带 `DEVICE=alioth` 打出来的镜像
-  在这台手机上起不来。正确的镜像是 1,992,704 字节，POCO 的是 1,470,464。
-
-一天一天记下来的移植日志（包括那些后来被证伪的猜想）在 `PROGRESS.md`，它的开头有索引；
-`devices/alioth/README.md` 是这个端口的说明书，`devices/alioth/hardware.md` 是寄存器级的事实。
-
-## QEMU 快速开始
-
-Linux x86-64，约 12 GB 磁盘，7-Zip 23 或更新，`lz4`，`qemu-system-aarch64`，`edk2-aarch64`。
+一台已解锁 BL 的 K40、电脑上有 `adb` 和 `fastboot`、镜像已经构建好（见下）、手机固件已拉取：
 
 ```sh
-git clone https://github.com/oosexgang/hakios-os.git hakios
-cd hakios
-make fetch        # 从 Apple 服务器取 iOS 16.5 IPSW，解包所需部分（7.4 GB）
-make images       # APFS 镜像：userland/root.apfs 和 userland/system.apfs
-make qemu         # 20 分钟的会话
+devices/alioth/pull-firmware.sh        # 按这个手机自己的路径拉：GPU、Wi-Fi、音频、振动、相机 -> fw-*/
+DEVICE=alioth ./xl enter               # Android -> fastboot -> 我们的 loader 进内存
+./xl ramdisk userland/system.apfs      # 2.3 GB 的系统镜像进内存（约 90 秒），每次 loader 会话一次
+./xl run                               # 跑一次会话，日志在 logs/
+./xl stop                              # 结束，把手机留在 loader
 ```
 
-两三分钟后出现锁屏。按住鼠标键就是手指；`H` 是主屏键，`L` 是电源键，`↑`/`↓` 是音量。
+`xl run` **不需要任何参数**：这台手机自己的命令行在 `devices/alioth/boot-args`。`make phone SECS=600`
+把整条链路（`xl enter`、上传、运行）合成一条命令，`ARGS=...` 追加参数。
 
-## 在手机上
+**两个各值一晚的坑，现象都像"镜像坏了"：**
 
-一台有移植的手机（`devices/poco-x5-pro/`，POCO X5 Pro 5G；Redmi K40 见 `devices/alioth/`，命令前
-加 `DEVICE=alioth`），已解锁引导程序，电脑上有 `adb` 和 `fastboot`，上一节的镜像，以及手机自己的固件：
+- `./xl enter` 会重建小镜像，并**丢掉"resident 系统镜像是谁传的"那条记录**，于是下一次跑会 panic 在
+  `Process 1 exec of /sbin/launchd failed, errno 2`。**这从来不是镜像坏了**，补传一次即可：
+  `./xl ramdisk userland/system.apfs`。
+- 小镜像由 `userland/build.sh` 构建，而**系统长什么样取决于构建那一刻的环境变量**：
+  `GL=1 REST=1 SYSTEM=1` 才有 GPU 渲染路径、全量 launchd 作业和壁纸。少了这几个重建，壁纸会是黑的、
+  停靠栏纯白、小组件不加载。
 
-```sh
-make firmware                       # GPU、Wi-Fi、音频/电池、振动、调制解调器、摄像头 -> fw-*/
-make phone                          # 10 分钟会话，全部硬件开启，然后回到 Android
-make phone ARGS="modem=1" SECS=300  # 或自定义内核参数
-```
+## 启动参数
 
-主要内核参数（完整列表见 `docs/ru/notes.md`）：
+只列这台手机会用到的。全部参数见 `docs/ru/notes.md`。
 
-| 参数 | 作用 |
-|---|---|
-| `cpus=8 bootcpu=7 cpufreq=1` | 全部 CPU 核心及其频率 |
-| `touchscreen=1` | 触摸屏 |
-| `gpu=1` | Adreno 渲染（镜像需以 `GL=1` 构建，固件在 `fw-gpu/`） |
-| `adsp=1 sound=4 mic=4` | 音频 DSP：扬声器、麦克风；电池与充电也经由它 |
-| `haptic=5` | 振动马达 |
-| `wifi=1` | Wi-Fi（网络来自 `fw-wifi/network`） |
-| `cam=5` | 摄像头 |
-| `modem=1` | 与系统并行启动调制解调器：固件、文件系统、IPA、SIM、NAS |
-| `var_store=1 ufs_write=1` | 跨重启保留 `/private/var` |
+| 参数 | 默认 | 作用 |
+|---|---|---|
+| `gl=1 adreno=22 adreno_keep=1` | — | GPU：Adreno 650 引导的第 22 步，并保留给系统渲染用（`gpu=1` 是 POCO 的简写，这台机器按设计拒绝） |
+| `touchscreen=1` | — | FT3658U 触摸 |
+| `bootcpu=7 cpus=8` | — | 内核跑在大核（loader 留在自己核上，运行期间还能应答），八核全开 |
+| `cpufreq` | **开** | 每个簇钉在最高频（1804 / 2419 / 3187 MHz）。`cpufreq=0` 就保留 bootloader 那个"modest"频率，慢 3.4 倍 |
+| `touch_poll_us` | **500** | 多久看一眼触摸的中断线。芯片本身 240 Hz 上报，原来的 8000 等于每次触摸多等最多 12 ms |
+| `fb_fetch_align` | **2** | 上屏拷贝何时起笔：2 = 等面板这一帧快取完，1 = 等它刚开始，0 = 来一帧写一帧 |
+| `fb_fetch_lead` | **600** | `fb_fetch_align=2` 提前多少行起笔 |
+| `fb_threads` | **8** | 分担拷贝的处理器数：每帧 2.0 ms，三线程 3.5 ms，单线程 9–10 ms |
+| `fbwidth` / `fbheight` | 1125 / 2436 | 画面的尺寸，是 iPhone 的，不是面板的。`1080 2400` 不用缩放（1.3 ms），但 iOS 认不出那个尺寸，会退回调试排版 |
+| `display_hz` | — | `60` / `90` / `120`：把面板对应档位的切换序列发下去 |
+| `fb_kick` | **0** | 1 = 关掉 autorefresh，由内核自己启动每一帧。实测：面板此后就不再取帧，因为 **autorefresh 是唯一能启动取帧的东西** |
+| `var_store=1 ufs_write=1` | — | `/private/var` 跨重启保留 |
 
-在红米 K40（alioth，见 `devices/alioth/`）上有两条不一样，而且这是**故意的**：**`gpu=1` 在
-那里一定被拒绝**——那个简写是 POCO 的 Adreno 642L 的步骤，而 SM8250 的 Adreno 650 只有独立的
-1–22 步。能用的是
+只读、或者只在被点名时才动的探针：`display_step=N` 与 `display_te=N`（显示控制器、面板 TE 脚）、
+`display_lines=1`（取帧到了第几行）、`fb_log_layers=N`（不是"单层全屏"的那些 swap）、
+`pcie_step=N`（PCIe 根复合体，Wi-Fi 用）、`cpuload` / `ddr`。
 
-```sh
-DEVICE=alioth XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 rd=md0 battery=1"
-```
+## 已知边界
 
-（`adreno_keep=1` 才是「把 GPU 留给系统画」的那一个；少了它，第 22 步做完就收摊，显示退回无 GPU
-的软件路径。）这个移植的其余细节在 `devices/alioth/hardware.md`。
+- **每一帧都是拷过去的。** 不拷贝直接上屏，需要显示控制器能读到它够得着的内存，而这条引导链里没有任何
+  一环映射的超过 bootloader 留下的那一块帧：换地址不在 SMMU 的页表里，换更宽的 stride（4352，GPU 能写
+  的那种）会越过映射边界并把机器挂死。两条都缺 `apps_smmu` 的 stage-1 域——**缺在整条引导链上，
+  不只是显示**。
+- **画面是 60 帧/秒。** 面板的 120 Hz 档位是通的、也稳；把它按在 60 的原因还没查实。
+- **没有 Metal。** 渲染走 Mesa 的 OpenGL ES，CoreAnimation 通过它画。
+- 没有声音、没有网络（Wi-Fi 和蜂窝都没有）、没有相机、没有振动。
+- 界面动起来时拷贝仍可能撕裂。`fb_fetch_align` 减少了多少，在"没被实验写过"的干净状态下**还没测过**。
 
 ## 从源码构建
 
+内核（Linux：theos 及其 cctools 与 `iPhoneOS16.5.sdk`；macOS：Xcode 或 cctools）：
+
 ```sh
-make kernel       # 从 Apple 的 GitHub 取 XNU 源码 + 我的修改 -> xnu-src/，依赖，构建
-make loader       # 引导程序；identity.h 在构建时由你的 IPSW 生成
-make images       # 用户空间和镜像
+xnu/apply.sh             # 从苹果的 GitHub 取 XNU + 本仓库的改动 -> xnu-src/
+xnu-deps/setup.sh        # 依赖、工具和 SDK
+./xnu-build.sh -j10      # -> xnu-src/.../BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 ```
 
-详情见 `xnu/README.md` 和 `docs/ru/notes.md`。
+`./xnu-build.sh --clean` 会先扔掉整个对象树。这不是顺手：用旧对象链接出来的内核在手机上**和代码写坏了
+一模一样**，已经栽过一晚。构建最后那几条报错（export 检查、symbol set）是无害的，**判断有没有编出来看
+内核文件的时间戳**，不是看 make 的退出码。
+
+引导程序：`xnuloader/build.sh`。用户空间与镜像：`GL=1 REST=1 SYSTEM=1 userland/build.sh`。
+细节见 `xnu/README.md`、`devices/alioth/README.md`、`docs/ru/notes.md`。
 
 ## 目录结构
 
 | 目录 | 内容 |
 |---|---|
-| `xnu/` | 内核补丁和文件；`apply.sh`、`export.sh`；内核 README |
-| `xnu/files/bsd/dev/hakios.*.c` | 我的驱动：显示、触摸、UFS、GPU、Wi-Fi、音频、调制解调器、SIM/NAS、振动、摄像头 |
-| `xnuloader/` | 引导程序（UEFI 应用） |
-| `userland/` | 我的程序和库（`src/`）、镜像构建、launchd 任务 |
-| `sysimage/` | 从 IPSW 取得并解包系统文件的脚本（不含文件本身） |
-| `devices/poco-x5-pro/` | 一台手机：UEFI 移植、设备树、预构建 UEFI 镜像、固件脚本 |
-| `tools/` | APFS、固件、QMI 测试、运行脚本 |
-| `qemu/` | 在 QEMU 中运行 |
-| `docs/` | `cellular.md`：蜂窝网络（英文）；`ru/`：详细的俄文开发日志 |
-| `prebuilt/` | 构建好的引导程序、库（内核不入库） |
+| `xnu/` | 内核补丁与文件；`apply.sh`、`export.sh` |
+| `xnu/files/bsd/dev/hakios.*.c` | 驱动：显示、触摸、UFS、GPU、Wi-Fi、音频、基带、振动、相机、PCIe。每个文件头都写明它的数字从哪来 |
+| `xnuloader/` | 引导程序（一个 UEFI 应用） |
+| `userland/` | 程序与库（`src/`）、镜像构建、launchd 作业、`rc.jobs.*`（一次会话跑什么） |
+| `sysimage/` | 从 IPSW 抓取并解包 OS 文件的脚本（不含任何那个文件本身） |
+| `devices/alioth/` | 这台手机：UEFI、设备树、固件脚本、`hardware.md`、`status`、`boot-args` |
+| `devices/poco-x5-pro/` | 初号机，同一份清单 |
+| `tools/` | APFS、固件、QMI 测试、运行脚本、`device-status.py` |
+| `qemu/` | 在 QEMU 里跑 |
+| `docs/` | `notes.md`（启动参数全表，俄语）、`cellular.md`、`air.md`、`metal.md` |
+| `prebuilt/` | 构建好的引导程序与库（内核不放在这里） |
+| `PROGRESS.md` | 移植日志：为什么是现在这样，试过什么、否决了什么 |
 
 ## 许可与法律
 
-我的代码遵循它所修改文件的许可：XNU 补丁为 Apple Public Source License 2.0（全文在
-`LICENSE.APSL`；条款已满足：修改以源码形式发布，保留了声明），其余为 MIT（`LICENSE`）。iOS、
-其镜像、Apple 商标和手机固件属于各自的所有者，不在本仓库中，也不由我分发；每个人从自己的手机和
-自己的 IPSW 取得它们。第三方组件列于 `NOTICE`。若你认为这里的某个文件侵犯了任何人的权利，请开一
-个 issue，我会删除它。
+HakiOS 是一个独立研究项目，与 Apple Inc. 无关联、未获其认可；"iOS"、"iPhone"、"XNU"、"Apple" 这些名字
+只用来描述代码针对的对象。内核、引导程序和开放工具用不到苹果的任何东西也能构建运行（`make qemu-open`）。
+
+代码遵循它所改动文件的许可：XNU 补丁以 Apple Public Source License 2.0 发布（改动以源码形式公开、
+声明保留），其余按各文件头。iOS、其镜像、Apple 的商标以及手机固件属于各自所有者，**不在本仓库**
+也不分发。细节见 `LEGAL.md`、`COMPLIANCE.md`、`THIRD_PARTY_LICENSES.md`、`NOTICE`。这些都不是法律意见。

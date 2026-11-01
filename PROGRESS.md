@@ -5231,3 +5231,300 @@ MDP 在命令模式下靠 autorefresh 周期性地把整帧推给面板，不是
 `ax_rt=1` 是通过 `libAccessibility` 的 setter 写进 iOS 偏好的（上游注释："which keep them in its
 preferences as Settings does"）。也就是说那个实验**改了系统的持久设置**，Reduce Transparency 可能还是开的。
 要还原：`ax_rt=0` 跑一次，或者去设置里关。
+
+## 2026-11-01 20:20 Wi-Fi 上层复活：iOS 现在会来问它了，241 条命令的全表
+
+### 做了什么
+
+1. **把 Wi-Fi 的"上层"从构建里装回来**。今天早些时候为了把 POCO 的电台摘掉，我把五个文件一起删了，
+   但其中 `apple80211.c`、`sta.c`、`lx.c` 是**通用的**，只有 `wifi.c`/`wlfw.c` 是 WCN6750 的。
+   它们必须一起走，是因为上层引用了 `hakios_wifi_*` 那批符号。
+   → 新建 `hakios.radio.c`：在没有电台时提供那八个符号的空实现（不 up、无固件、无窗口、无地址、
+   无网络）。和 `hakios.shared.c` 同一个套路。三个上层文件重新进 `conf/files`，POCO 的电台仍然排除。
+
+2. **`wlan_step=N` 探针**（`hakios.net.c`）：N 秒后attach 一个 **en0、无线、但发不出任何帧**的接口。
+   没有电台时 `HakiosWLANStart()` 永远不会被调用（它只在一个无线 link 挂上时触发），所以上层是
+   "编进去了但没人找"；这个探针让它被找到。**完全不碰硬件。**
+
+3. **修一个我自己造成的 bug**：摘掉整组时我把 `hakios.net.c` 里转发 Apple80211 的那行改成了
+   `EOPNOTSUPP`，上层装回来时忘了还原。现象很好认：`net: en0 is asked 0xc02c6938 by wifid` 出现在
+   日志里，但 `apple80211:` 一条都没有——**请求死在 net 层**。
+
+### 结果：iOS 认了这个接口
+
+```
+HakiosWLAN: a user client of type N is asked for: there is none     ×8
+net: en0 attached on en0 (a radio that is not there) (a radio), link down
+net: en0 is asked 0xc02c6938 by wifid
+apple80211: wifid gets 12 (CARD_CAPABILITIES), … answered            ← 241 条
+```
+
+也就是说：**注册表那一步、IO80211 找不到 user client 后转 ioctl 路径、Apple80211 在核心里应答，
+整条链是通的**。缺的只有电台。
+
+### wifid 要什么（一次开机的全表，241 条）
+
+| 类型 | 次数 | 结果 | 含义 |
+|---|---|---|---|
+| 97 `CURRENT_NETWORK` | 103 | error 6 | 当前连着的那个 BSS——**wfid 轮询最多的一个** |
+| set 68 `?` | 383 | REFUSED | **没有名字的类型**，被拒了 383 次（见下） |
+| 19 `POWER` | 16 | answered | 开关状态 |
+| 254 `HW_SUPPORTED_CHANNELS` | 13 | error 6 | 电台支持的信道表（4824 字节） |
+| 12 `CARD_CAPABILITIES` | 6 | answered | 能力位 |
+| 27 `SUPPORTED_CHANNELS` | 3 | error 6 | 同上 |
+| 13 `STATE` / 15 `OP_MODE` | 2 / 2 | answered | |
+| 16/17/4/2/1/9 `RSSI`/`NOISE`/`CHANNEL`/`AUTH_TYPE`/`SSID`/`BSSID` | 各 2 | error 6 或 REFUSED | 全都是"当前 BSS 的某个字段" |
+| 51 `COUNTRY_CODE`、57 `MCS`、8 `RATE`、14 `PHY_MODE`、6 `PROTMODE`、5 `POWERSAVE`、18 `INT_MIT`、106 `RSSI_BOUNDS` | 各 1–2 | REFUSED | 未实现 |
+| 207 `CHANNELS_INFO` | 1 | error 6 | 10016 字节的信道表 |
+
+**error 6 = ENXIO**：`hakios.sta.c` 从（不存在的）电台拿不到数据，于是 `apple80211.c` 如实回"没有
+这个设备"。这恰好就是**电台接通以后要填的东西**，一份现成清单：
+
+1. **信道表**（254 / 27 / 207）——`hakios_sta_channels()` 要给出真实信道；
+2. **当前 BSS**（97 / 1 / 9 / 4 / 2 / 16）——需要扫描和关联的状态，也就是 `hakios_sta_*` 的状态机；
+3. 那些 REFUSED 的多半是可选的（`PHY_MODE`/`RATE`/`MCS`/`PROTMODE`…），wifid 被拒了也继续跑。
+
+**没查清的**：`set 68` 是什么。我们的类型表里没有它，`xnu-deps` 里也没有 `Apple80211` 的头文件。
+383 次拒绝里绝大多数是它——很可能是某种周期性的设置（扫描请求的变体？保活？），**下一个要弄明白的
+就是它**。弄明白的办法：从 dyld 缓存里把 `Apple80211` 的常量表反出来（这个项目以前对亮度做过同样的事）。
+
+## 2026-11-01 20:40 Wi-Fi 上层的清单，和一个读错列数的更正
+
+### 一、我读错了一次，先说清楚
+
+上一节那张表我按"类型 / 方向 / 次数 / 名字 / 结果"的列序写成：
+
+```
+383 sets 68 ? REFUSED
+```
+
+**它的意思是"类型 383、被拒 68 次"，不是"类型 68、被拒 383 次"。** 我按后者理解，去查了
+Apple80211 的类型表，得出"68 = CACHE_THRESH_DIRECT（缓存阈值）"这个结论——**那个结论是错的**，
+建立在误读上。后来把"未知 set 的前 32 字节打出来"才发现真正的顽固类型是 **383**。
+
+（顺手仍然做了两件有用的事，留着：把类型表按公开资料补全到 71 —— 31/33-41/45/52-56/58-65/67-71
+这些名字都有了；以及 67/68 作为"接受并忽略的调优参数"。它们不是被反复设的那个，但补全是对的。）
+
+### 二、类型 383 是什么：一条 XML plist
+
+```
+apple80211: an unknown set of type 383, 4104 bytes, and it begins with:
+  01 00 00 00  fc 00 00 00  3c 3f 78 6d 6c 20 76 65 72 73 69 6f 6e 3d 22 31 2e 30 22 20 65 6e 63 6f
+  version = 1  length 252  "<?xml version=\"1.0\" enco…"
+```
+
+**wifid 在往驱动里设一条 XML 配置**（4104 字节），我们整条拒掉，它就一直重试（一次会话 47 次）。
+另一条：类型 419，136 字节，`version = 1` 后面跟 `0x69d0`，形状像"版本 + 计数 + 数据"。
+
+这条 XML 很可能就是 iOS 想告诉驱动的一整套策略（国家码、漫游、省电…）。**把它完整打出来，等于
+直接读到 iOS 的意图**，比猜强得多——这是下一步最值钱的一件小事。
+
+### 三、这次会话 wifid 要的全部（197 条）
+
+| 类型 | 名字 | 次数 | 结果 |
+|---|---|---|---|
+| 103 | `CURRENT_NETWORK` | 83 | error 6（要当前 BSS） |
+| 383 | `?`（**XML 配置**） | 47 | REFUSED |
+| 254 | `HW_SUPPORTED_CHANNELS` | 18 | error 6（要信道表） |
+| 19 | `POWER` | 13 | answered |
+| 13 / 15 | `STATE` / `OP_MODE` | 2 / 2 | answered |
+| 5 / 14 | `POWERSAVE` / `PHY_MODE` | 2 / 2 | REFUSED |
+
+结论没变，反而更清楚：**上层是活的，缺的是电台给的两种数据——信道表和当前 BSS**；
+除此之外就是几条可选的调优参数，以及那条还没读的 XML。
+
+### 四、工具
+
+`wlan_step=N`（`hakios.net.c`）：N 秒后 attach 一个"en0、无线、发不出任何帧"的接口，让
+`HakiosWLANStart()` 被调用。**完全不碰硬件**，只是让 iOS 认这个接口并开始问它问题。这一次会话
+里 iOS 问了 197 条，全部有解码。
+
+### 20:55 类型 383 的真相：不是配置，是一条"DHCP 续约唤醒没排上"
+
+把那条 4104 字节的载荷按文本打出来之后（只打一次）：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>IO80211InterfaceDHCPRenewalWakeScheduled</key>
+	<false/>
+</dict>
+</plist>
+```
+
+**四条键值，后面几千字节全是零填充。** 所以 `set 383` 不是"给电台下发策略"，而是一条**属性通知**：
+wifid 告诉接口"DHCP 续约唤醒没排上"。它不需要驱动做什么，我们整条拒掉才让它一遍遍重说。
+
+接受之后（`case 383: return 0;`，并给类型表补了个我们自己的名字 `INTERFACE_PROPERTIES`）：
+
+| | 之前 | 现在 |
+|---|---|---|
+| 命令总数 | 197 | **118** |
+| `set 383` | 47 次 **REFUSED** | 23 次 **answered** |
+
+剩下的失败只有一类，而且是对的：`254 HW_SUPPORTED_CHANNELS`、`27 SUPPORTED_CHANNELS`、
+`207 CHANNELS_INFO` 全部 **error 6（ENXIO）**——**信道表必须由电台提供**。以及 `CURRENT_NETWORK`
+（类型 103，一次会话 40 次）需要扫描/关联的结果。
+
+也就是说：**上层的每一项现在都有了明确的取舍**——能答的答了（能力、功率、状态、操作模式、接口属性），
+答不了的两样（信道表、当前 BSS）等到电台接上再填。这就是接电台时的验收清单。
+
+### 这一段的工具与经验
+
+- `wlan_step=N`：造一个"无线但发不出帧"的 en0，让 iOS 来问它。**不碰硬件，一次开机 118 条带解码的请求。**
+- **未知的类型值得打前 32 字节**：383 就是靠这个认出来的（`<?xml`）。这条比读别人的逆向文章快得多，
+  而且不会像上一节那样把列数读错。
+- 类型表按公开资料（Jonathan Levin 的 Apple80211 逆向）补到 71；表中没有的 383 用我们自己的名字。
+
+## 2026-11-01 21:25 Wi-Fi 的 PCIe：控制器终于应答了，读数与参考项目逐字对上
+
+### 缺的是 `gcc_pcie_phy_aux_clk`
+
+前面几次 `pcie_step=4` 读 PARF 都是**内核数据中止**。这一轮唯一的改动是把
+**`GCC + 0x6f004`（`gcc_pcie_phy_aux_clk`）** 也打开（它不在设备树 clocks 列表里，是从
+`gcc-kona.c` 的门控表里找出来的），随后读 PARF **全部成功**：
+
+```
+pcie: 4: parf sys_ctrl 0x2000361c
+pcie: 4: parf pm_ctrl 0x20, pm_stts 0x90040400
+pcie: 4: parf ltssm 0 -> enabled 0, state 0
+pcie: 4: phy_ctrl 0x900, mhi_clock_reset 0x3, axi_mstr_halt 0x80000014, status 0
+pcie: 4: dbi_base 0, slv_addr_space 0x1000000, device_type 0, int_all_status 0
+```
+
+### 和参考项目逐字对上
+
+| 寄存器 | 我们 | UniXNU 记的 |
+|---|---|---|
+| `parf_axi_mstr_wr_addr_halt_v2` | `0x80000014` | `0x80000014` |
+| `parf_mhi_clock_reset_ctrl` | `0x3` | `0x3`（他们 step 9 写成 `0x13`） |
+| `parf_ltssm` | **0** | **0** |
+
+**我们正好追平了他们**，而且是靠自己一步步走到的（他们没公开 `phy_aux_clk` 这一步）。
+
+### 这些读数说了什么
+
+- **`ltssm = 0`**：链路状态机**没启动**（bit8 `LTSSM_EN` 是 0）。所以"链路没训练"不是失败，
+  是**根本还没开始**——参考项目卡在同一个位置。
+- **`dbi_base = 0`**：DBI 窗口还没配（`PARF_DBI_BASE_ADDR` = 0）。要读配置空间必须先写它。
+- **`mhi_clock_reset = 0x3`**：MHI 时钟复位控制，vendor 在这一步改成 `0x13`。
+- **`slv_addr_space = 0x1000000`**：16 MB。
+
+### 下一步（顺序来自 `pci-msm.c`，每一步都可验证）
+
+1. `PARF_MHI_CLOCK_RESET_CTRL(0x174)`：`0x3` → `0x13`（参考项目 step 9 做过）；
+2. `PARF_DBI_BASE_ADDR(0x350)` = `0x60000000`，`PARF_SLV_ADDR_SPACE_SIZE(0x358)` 照旧；
+3. **PHY 初始化**：`drivers/phy/qualcomm/phy-qcom-qmp.c` 里有 sm8250 的序列表，要抄一整套；
+4. `LTSSM_EN`（`0x1b0` bit8）置位，然后轮询 `ltssm` 直到 state 进 L0（`0x11`）；
+5. 枚举：`conf` 窗口 `0x60100000` 读配置空间。
+
+### 工具
+
+`pcie_at=N`：探针改成可以在**启动后 N 秒**在独立线程里跑。原因是它的输出落在 bsd_init 时期，
+而那时日志已经有上百 KB，loader 每次只留最后 4 KB——**早先那些"读不到输出"不是没打印，是被冲掉了**。
+这一条对以后所有早期探针都适用。
+
+### 顺带记下的状态保留
+
+这一轮 `gcc +0x52008` 读出来是 `0x41043ff`（六个位早就置上了），说明**上一轮的时钟设置留着**。
+和之前 GDSC 那次是同一个现象：`xl run` 只换内核，这些块的寄存器不复位。**做写实验以后要整机断电**，
+否则下一轮的读数要按"已经被改过"来解读。
+
+### 21:55 PCIe 第 5/6 步都成了，读 DBI 会挂死
+
+拆分之后一次只写一个寄存器，结果很干净：
+
+| 步 | 动作 | 结果 |
+|---|---|---|
+| 5 | `PARF_MHI_CLOCK_RESET_CTRL(0x174)`：`0x3` → `0x13` | ✅ 成功（第二次跑读回已是 `0x13`，状态保留） |
+| 6 | `PARF_DBI_BASE_ADDR(0x350)`：`0` → `0x60000000` | ✅ 成功 |
+| 7 | 读 DBI（`0x60000000`）的 id | ❌ **挂死** |
+
+`0x13` 这一笔和参考项目 step 9 写的完全一致。而读配置空间会挂死，说明**写寄存器这条路是通的，
+访问配置空间还需要别的东西**（vendor 在读 DBI 之前会配 `PARF_DEVICE_TYPE`、`SLV_ADDR_SPACE_SIZE`，
+以及让 core 出复位/链路起来——DesignWare 的 DBI 窗口不是配个基址就能读的）。
+
+### 这一轮的教训（都是自己挖的坑）
+
+1. **`step_setup()` 一开始被插在 `pcie_map()` 之前**，那时 `parf` 还是 0，函数第一行就 return 了——
+   于是"什么都没打印"。**在探针里，静默既可能是"成功"也可能是"没执行"**，所以每一步都要先打
+   "about to ..." 再动手，这次就是靠它把位置钉死的。
+2. **一次写多个寄存器，挂死了就分不清是哪一个**。拆成一步一个，两轮就定位到读 DBI。
+3. **`pcie_at=N`（线程里延迟跑）是必需的**：同一次开机里 `pcie_step=4` 能打印，`pcie_step=5` 完全
+   没有输出——不是没打印，是 bsd_init 时期的日志已经被上百 KB 的其他输出冲掉了。
+
+### 现在 PCIe 的完整状态
+
+| 事 | 状态 |
+|---|---|
+| GDSC 上电 | ✅（与参考项目逐位一致） |
+| 11 个时钟 + `phy_aux_clk` | ✅（后者是参考项目没公开的那一步，也是读通 PARF 的关键） |
+| 两个复位 | ✅ 本来就是松的 |
+| 读 PARF | ✅ 全部寄存器可读 |
+| `MHI_CLOCK_RESET_CTRL` = `0x13` | ✅ |
+| `DBI_BASE_ADDR` = `0x60000000` | ✅ |
+| **读 DBI（配置空间）** | ❌ 挂死，下一步 |
+| PHY 初始化 / `LTSSM_EN` / 链路训练 | 未动 |
+
+**下一步**：读 `pci-msm.c` 的 `msm_pcie_config_dbi` 和它前面那一段，弄清读 DBI 之前还缺什么
+（大概率是 `PARF_DEVICE_TYPE`、`PARF_SLV_ADDR_SPACE_SIZE` 的写法，以及 core 的复位顺序）。
+
+### 22:55 归因成功：PARF 全配好了，DBI 仍然读不通——缺的是 PHY
+
+#### 先修工具，再谈实验
+
+前面两次"挂死且一条输出都没有"，根因是**机器挂住时内核日志的最后几行永远冲不出去**（loader 每 2 秒
+只留最后 4 KB）。这次把 `hakios.pcie.c` 的所有输出改成走 `tell()`——逐字符写进 **loader 自己的日志**，
+中断开着时再顺带 `printf`（照抄 `hakios.cpufreq.c` 的做法）。**挂死前的每一步都留下来了。**
+
+**这条应该成为规矩：任何会写硬件的探针，输出必须走 loader 日志。**
+
+#### 这次的完整轨迹
+
+```
+pcie: 4: parf … dbi_base 0, slv_addr_space 0x1000000, device_type 0, int_all_status 0
+pcie: 5: mhi_clock_reset 0x3 -> 0x13
+pcie: 6: device_type 0 -> 0x4 (root complex mode)
+pcie: 6: pm_ctrl 0x20 -> 0
+pcie: 6: phy_ctrl 0x900 -> 0x900
+pcie: 6: dbi_base = 0
+pcie: 6: sys_ctrl 0x2000361c -> 0x365e
+pcie: 6: int_all_mask 0
+pcie: 6: slv_addr_space 0x1000000
+pcie: 6: axi_mstr_halt 0x80000014 -> 0x80000014
+pcie: 7: parf ltssm 0, status 0, pm_stts 0x90040400
+pcie: 7: reading the dbi's id (0 at …) -- if nothing follows, that read hung
+[挂死]
+```
+
+#### 结论
+
+**vendor 的 PARF 配置顺序全部照做、全部生效，读 DBI 依然挂死。** 所以障碍不在 PARF 配置。
+
+对照 `msm_pcie_hw_init`（`pci-msm.c:4510-4575`），读配置空间之前还有一步**我们没做**的：
+
+```c
+	/* init PCIe PHY */
+	ret = pcie_phy_init(dev);
+```
+
+PHY 提供的是控制器 core 的 **PIPE 时钟**。没有它，DBI 访问挂住——这和之前"缺 `gcc_pcie_phy_aux_clk`
+就读不了 PARF"是同一类问题（块存在、但没时钟就不应答），只是这次缺的是 PHY 本身，不是 GCC 里的门。
+
+#### 下一步：PHY 初始化
+
+源在 `drivers/phy/qualcomm/phy-qcom-qmp.c`，sm8250 的 PCIe PHY 是几张很长的寄存器表（PCS / TX / RX /
+PIPE 时钟，各几十到上百条 `{ offset, value, delay }`），顺序和延时都是表里写好的。**没有未知，只有量**。
+
+量级：比前面任何一步都大，但它是可机械执行的工作（抄表 + 按序写 + 等 PLL 锁）。
+
+#### 现在的完整状态
+
+| 事 | 状态 |
+|---|---|
+| GDSC / 11 个时钟 + `phy_aux_clk` / 复位 | ✅ |
+| 读 PARF | ✅ |
+| `MHI_CLOCK_RESET`=0x13、`DEVICE_TYPE`=0x4、`SYS_CTRL`=0x365E、`DBI_BASE`=0 等 | ✅ 全部生效 |
+| **读 DBI（配置空间）** | ❌ 挂死，缺 PHY 时钟 |
+| PHY 初始化 / `LTSSM_EN` / 链路训练 | 未动（PHY 是下一件） |

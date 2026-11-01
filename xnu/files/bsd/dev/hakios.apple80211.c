@@ -68,12 +68,22 @@ type_name(int32_t type)
 		{ 13, "STATE" }, { 14, "PHY_MODE" }, { 15, "OP_MODE" }, { 16, "RSSI" }, { 17, "NOISE" }, { 18, "INT_MIT" }, { 19, "POWER" },
 		{ 20, "ASSOCIATE" }, { 21, "ASSOCIATE_RESULT" }, { 22, "DISASSOCIATE" }, { 23, "STATUS_DEV_NAME" }, { 24, "IBSS_MODE" },
 		{ 25, "HOST_AP_MODE" }, { 26, "AP_MODE" }, { 27, "SUPPORTED_CHANNELS" }, { 28, "LOCALE" }, { 29, "DEAUTH" },
-		{ 30, "COUNTERMEASURES" }, { 32, "RATE_SET" }, { 42, "STATION_LIST" }, { 43, "DRIVER_VERSION" },
-		{ 44, "HARDWARE_VERSION" }, { 46, "RSN_IE" }, { 47, "BACKGROUND_SCAN" }, { 48, "AP_IE_LIST" }, { 49, "STATS" },
-		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" }, { 66, "MCS_INDEX_SET" },
+		{ 30, "COUNTERMEASURES" }, { 31, "FRAG_THRESHOLD" }, { 32, "RATE_SET" }, { 33, "SHORT_SLOT" },
+		{ 34, "MULTICAST_RATE" }, { 35, "SHORT_RETRY_LIMIT" }, { 36, "LONG_RETRY_LIMIT" }, { 37, "TX_ANTENNA" },
+		{ 38, "RX_ANTENNA" }, { 39, "ANTENNA_DIVERSITY" }, { 40, "ROM" }, { 41, "DTIM_INT" },
+		{ 42, "STATION_LIST" }, { 43, "DRIVER_VERSION" },
+		{ 44, "HARDWARE_VERSION" }, { 45, "RAND" }, { 46, "RSN_IE" }, { 47, "BACKGROUND_SCAN" }, { 48, "AP_IE_LIST" },
+		{ 49, "STATS" },
+		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 52, "DEBUG_FLAGS" }, { 53, "LAST_RX_PKT_DATA" },
+		{ 54, "RADIO_INFO" }, { 55, "GUARD_INTERVAL" }, { 56, "MIMO_POWERSAVE" }, { 57, "MCS" }, { 58, "RIFS" },
+		{ 59, "LDPC" }, { 60, "MSDU" }, { 61, "MPDU" }, { 62, "BLOCK_ACK" }, { 63, "PLS" }, { 64, "PSMP" },
+		{ 65, "PHY_SUB_MODE" }, { 66, "MCS_INDEX_SET" }, { 67, "CACHE_THRESH_BCAST" }, { 68, "CACHE_THRESH_DIRECT" },
+		{ 69, "WOW_PARAMETERS" }, { 70, "WOW_ENABLED" }, { 71, "40MHZ_INTOLERANT" },
 		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
 		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
 		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
+		/* (383 is not in the published table: a plist of interface properties, as set by wifid) */
+		{ 383, "INTERFACE_PROPERTIES" },
 	};
 
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -589,8 +599,78 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
-	default:
+	case 383:
+		/*
+		 * Not a configuration and not a request: a plist of one key, IO80211InterfaceDHCPRenewalWakeScheduled
+		 * with a false in it, 4104 bytes of which all but ninety or so are zeros (printed once, 1 November).
+		 * wifid is telling the interface whether a DHCP renewal wake is scheduled; there is nothing to
+		 * arrange, so it is taken and dropped. Refusing it only made wifid say it again, forty-seven times
+		 * in one session.
+		 */
+		snprintf(said, said_size, " (a property: DHCP renewal wake not scheduled)");
+		return 0;
+	case 67:                                /* CACHE_THRESH_BCAST */
+	case 68:                               /* CACHE_THRESH_DIRECT */
+		/*
+		 * How much of a peer's traffic the firmware keeps cached. Nothing here caches anything,
+		 * so the number has nowhere to go -- but it is a tuning knob, not a state, and refusing
+		 * it made wifid set it 383 times in one session (measured 1 November, wlan_step=20).
+		 */
+		snprintf(said, said_size, " (a cache threshold: taken and ignored, this driver has no cache)");
+		return 0;
+	default: {
+		/*
+		 * An unknown set: what it is cannot be looked up (the type table this file carries is the
+		 * one published with the old Apple80211, and stops at 254; wifid sets 383 with 4104 bytes,
+		 * 47 times in one session). So say what it looks like: its type, its length, and the first
+		 * bytes of what it carries, once per type. A list of channels, a list of SSIDs and a
+		 * structure of numbers read very differently at the front.
+		 */
+		static int32_t told[8];
+		static unsigned count;
+		bool seen = false;
+
+		for (unsigned i = 0; i < count; i++) {
+			seen = seen || told[i] == request->req_type;
+		}
+		if (!seen && count < sizeof(told) / sizeof(told[0]) && request->req_len >= 8) {
+			uint8_t head[32];
+			size_t n = request->req_len < sizeof(head) ? (size_t) request->req_len : sizeof(head);
+
+			if (copyin(request->req_data, head, n) == 0) {
+				told[count++] = request->req_type;
+				printf("apple80211: an unknown set of type %d, %u bytes, and it begins with:",
+				    request->req_type, request->req_len);
+				for (size_t i = 0; i < n; i++) {
+					printf(" %02x", head[i]);
+				}
+				printf("\n");
+				if (head[0] == 1 && head[8] == '<' && head[9] == '?') {
+					/*
+					 * A plist: the phone's Wi-Fi configuration, handed to whatever radio answers.
+					 * Print it as text, once -- what iOS asks a radio to be configured with is
+					 * worth more than any guess about it.
+					 */
+					uint8_t * body = kalloc_data(4096, Z_WAITOK);
+					size_t length = request->req_len < 4096 ? (size_t) request->req_len : 4096;
+
+					if (body != NULL && copyin(request->req_data, body, length) == 0) {
+						printf("apple80211: --- the plist, %u bytes ---\n", request->req_len);
+						for (size_t i = 0; i < length; i++) {
+							uint8_t c = body[i];
+
+							printf("%c", c == '\n' || c == '\t' || (c >= 0x20 && c < 0x7f) ? (char) c : '.');
+						}
+						printf("\napple80211: --- end of the plist ---\n");
+					}
+					if (body != NULL) {
+						kfree_data(body, 4096);
+					}
+				}
+			}
+		}
 		return EOPNOTSUPP;
+	}
 	}
 }
 
