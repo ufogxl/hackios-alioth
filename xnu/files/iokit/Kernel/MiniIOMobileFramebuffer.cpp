@@ -159,10 +159,16 @@ static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
 static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
 /*
  * Boot-arg fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see
- * drawRows()). Three by default: a frame is in the panel's memory 3 ms after its turn instead of 9
- * to 10 (the phone, 15 October; fb_threads=1 is how it was).
+ * drawRows()). Eight by default: a frame is in the panel's memory 2.0 ms after its turn instead of
+ * 3.5 ms with three (measured on the phone, 1 November, 1125 x 2436 into a 1080 x 2400 panel with
+ * the scaling that size needs). One was 9 to 10 ms.
+ *
+ * The default picture size is NOT the panel's, and that is deliberate: iOS decides how to lay out
+ * its interface from the screen size MobileGestalt reports, and 1125 x 2436 is the iPhone's. A
+ * 1080 x 2400 buffer needs no scaling at all and the copy drops to 1.3 ms, but 360 x 800 points is
+ * not an iPhone's -- pass fbwidth=1080 fbheight=2400 to try it, knowing that.
  */
-static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
+static TUNABLE(uint32_t, gThreads, "fb_threads", 8);
 #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
 static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
 static inline unsigned

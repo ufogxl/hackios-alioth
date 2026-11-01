@@ -18,11 +18,23 @@ ARGS=$1; SECS=${2:-300}
 SOC_ARGS=${SOC_ARGS-$( [ -f "devices/$DEVICE/soc.args" ] && echo "devices/$DEVICE/soc.args" ||
 	ls devices/*/soc.args 2>/dev/null | head -1 )}
 SOC=""; [ -n "$SOC_ARGS" ] && [ -f "$SOC_ARGS" ] && SOC=$(tr '\n' ' ' < "$SOC_ARGS")
+# The phone's own boot-arguments, when it keeps them in a file (devices/<name>/boot-args). The line
+# below is the POCO X5 Pro's: ufs=2 and hv_wdt_pet=1 are its, and it asks for no GPU at all. A
+# device with a file says what its kernel needs, and that file is the one place to change.
+DEVARGS=""
+if [ -n "$DEVICE" ] && [ -f "devices/$DEVICE/boot-args" ]; then
+	DEVARGS=$(grep -v '^[[:space:]]*#' "devices/$DEVICE/boot-args" | tr '\n' ' ')
+fi
+if [ -n "$DEVARGS" ]; then
+	CMDLINE="$DEVARGS $ARGS $SOC"
+else
+	CMDLINE="debug=0x8 rd=md0 hv_wdt_pet=1 bootcpu=7 cpus=8 cpufreq=1 ufs=2 $ARGS $SOC"
+fi
 for i in $(seq 1 2160); do s=$(./xl state); [ "$s" != absent ] && break; sleep 10; done
 echo "$(date +%T) phone: $s"; [ "$s" = absent ] && { echo "NO PHONE"; exit 1; }
 ./xl enter 2>&1 | tail -1
 ./xl ramdisk userland/system.apfs 2>&1 | tail -1
-XL_SB_DELAY=${XL_SB_DELAY:-600} XL_CMDLINE="debug=0x8 rd=md0 hv_wdt_pet=1 bootcpu=7 cpus=8 cpufreq=1 ufs=2 $ARGS $SOC" XL_SECS=$SECS XL_FOLLOW=1 XL_FOLLOW_KEEP=1 ./xl run 2>&1 | tail -2
+XL_SB_DELAY=${XL_SB_DELAY:-600} XL_CMDLINE="$CMDLINE" XL_SECS=$SECS XL_FOLLOW=1 XL_FOLLOW_KEEP=1 ./xl run 2>&1 | tail -2
 # xl run returns before it uploads anything when the kernel is missing or the payload cannot be made;
 # carrying on would read logs/*-run.log from an earlier round and call them this one's.
 [ "${PIPESTATUS[0]}" = 0 ] || { echo "modem-cycle.sh: the run never started (message above)"; exit 1; }

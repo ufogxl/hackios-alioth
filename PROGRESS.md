@@ -3937,3 +3937,986 @@ DEVICE=alioth ./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img
 ### 状态
 
 亮度和电池都默认可用，不再需要任何启动参数。参数保留下来只做关闭和调试用。
+
+## 2026-11-01 07:45 卡在苹果 logo 的不是代码，是旧的编译产物；120 Hz 的墙也换了位置
+
+### 起因
+
+昨晚（01:50 之后）为了调 120 Hz 改过 vsync 的发送参数，改完默认配置也黑了，于是
+`git checkout` 回退。回退之后**手机仍然停在苹果 logo**，源码和 `xnu-src/` 逐文件 diff 全一致，
+`mach.development.bcm2837` 大小也没变。当时按"代码坏了"查了一晚上。
+
+### 定案
+
+`git status` 干净、停在 `50b9f47`，把 `BUILD/obj` 整个删掉全量重编，之后第一次上机
+**直接进桌面**：
+
+```
+./xl screenshot   → 3,050,772 字节（壁纸、图标、Dock、状态栏 7:07 电量 99%）
+```
+
+冻结时同一命令是 **12,588 字节**（黑底一个苹果 logo）。源码一个字没改。
+
+所以那一段是 **make 用旧对象链接出来的内核**：这个树不是完整的 `make` 依赖图，
+`hakios.*.c` / `MiniIOMobileFramebuffer.cpp` 的改动有时候不会让目标重编。
+`xnu-build.sh` 里原有的 STAMP 只删 `mach.*.unstripped`，靠的就是 make 自己判断，挡不住这种情况。
+
+**现在的做法**：`xnu-build.sh` 加了 `--clean`（第一个参数），先 `rm -rf BUILD/obj` 再编。
+判断标准仍然是内核文件的时间戳，不是 make 的退出码（symbolset / export check 那几条
+无害错误不影响产物）。**"改了没反应"或"回退了也没恢复"时，先 `--clean` 再怀疑代码。**
+
+### 连带作废的结论
+
+10-31 凌晨那五组 120 Hz 测试（面板 60 / `fb_hz=120` / `display_hz=120` / 两个都 120 /
+`fb_beat=0`）"全部卡在苹果 logo"——**那不是 120 Hz 的锅，是坏构建的锅**，五组作废。
+
+### 重测：120 Hz 面板这一半是通的，而且桌面能起来
+
+`display_hz=120` + `fb_hz=120`，桌面正常。运行末尾数 TE（`display_te=6 display_te_delay=190`）：
+
+```
+display: TE: 728 pulses in 6 s = 121.333 a second
+```
+
+面板确实是 121.333 Hz，桌面在、有人在画。和 `devices/alioth/hardware.md` 早先那次读数一致。
+
+### 顺带量到的两个数（都是真机）
+
+| 参数 | 驱动里每帧花的 | 等 GPU | 面板收到的帧 |
+|---|---|---|---|
+| `fb_hz=60 fb_threads=3` | 3,500–3,800 us | 0.6–0.7 ms | 59/s（真机峰值） |
+| `fb_hz=120 fb_threads=3` | 3,400–3,800 us | 4–6 ms | 34–45/s |
+| `fb_hz=120 fb_threads=8` | **2,000–2,100 us** | 1.6 ms | 48/s |
+
+两个读数：
+1. **`fb_threads=8` 把拷贝成本砍掉约 43%**（3.6 ms → 2.0 ms）。默认还是 3，120 Hz 要用就得调。
+2. 把 `fb_hz` 提到 120，帧率**反而掉了**（59 → 34–45）。原因是我们的节拍逻辑在追不上的时候
+   会把下一拍推走（`next -= (next - began - aim) / 8`），越追越散。
+
+### 所以 60 的墙在哪：不在 MDP，在"渲染服务器不知道屏幕是 120"
+
+`fb_threads=8` 之后驱动 2.0 ms + 等 GPU 1.6 ms ≈ 3.6 ms，而 120 Hz 的预算是 8.3 ms——
+**驱动已经追得上了，帧还是只有 48/s**。而且 `231 of 244 swaps came a refresh late`：
+客户端就是一个 20 ms 才交一帧，跟我们快不快没关系。
+
+`sheng` 的实现（`FFT-infra/GopFramebuffer` @ `b06fd743`，`NativeLegacyDisplay.cpp`）在注释里
+把这件事说透了：
+
+> Nothing in the family publishes IOMFBDisplayRefresh … and without it the render server keeps
+> its own 1/60 s heartbeat (int-210: refresh=0).
+>
+> The render server paces its display timer by the minimum refresh interval in IOMFBDisplayRefresh
+> (int-209: no vsync client ever registered, frames came every 16.7 ms), and the generic slot 301
+> fixes it at 1/60 s.
+
+也就是：**渲染服务器的显示定时器读的是 `IOMFBDisplayRefresh` 这个属性，默认 1/60 秒**。
+我们从来没发布过它（`publishModes()` 只给了 TimingElements/ColorElements，`SyncRate` 写了
+`fb_hz << 16`，但那个不是渲染服务器用的那条路）。sheng 的做法是在 `registerService()` 之前
+`setProperty("IOMFBDisplayRefresh", …)`，并在 `getRefreshAttributes()` 里回四个 32.32 定点数
+（最小间隔秒数 32.32、它的 mach 时间、最大间隔、mach 时间；定频时后两个等于前两个）。
+
+已确认这个属性名真实存在：`sysimage/20F66__iPhone10,3_6/dyld_shared_cache_arm64.0{3,7}`
+里有这个字符串，是 iOS 自己在读它。
+
+**下一步（不用手机的第一步）**：从 shared cache 里把读 `IOMFBDisplayRefresh` 的那段反出来，
+确认属性容器类型和键名（`getRefreshAttributes` 覆盖的是 C++ 虚函数，不是我们 user client 的
+外部方法——实测我们这边 128 以下的 selector 全实现，日志里没有任何 `not implemented`，
+所以 301 不是走 user client 的）。拿到布局之后在 `setProperty` 里发出去，再看
+`fb_hz=120` 时 `came a refresh late` 的计数会不会掉。
+
+### 没变的
+
+- `fb_hz` 默认仍是 60：在上面那一步做完之前，120 Hz 只会让画面更不匀（59 → 48）。
+- 默认配置仍然只是 `gl=1 adreno=22 adreno_keep=1 touchscreen=1 bootcpu=7 cpus=8 rd=md0`。
+
+### 追加（08:00）：`fbwidth`/`fbheight` 默认报的不是面板尺寸，白白做了一次逐像素缩放
+
+查撕裂和延迟时发现的：`fWidth/fHeight` 默认取 `fbwidth`，而 `kFBDefaultWidth` 是 **1125×2436**
+（375×812 @3x），面板是 **1080×2400**。于是驱动对每一帧都做一遍 1125→1080、2436→2400 的
+**逐像素双线性缩放**（`sample_at()` + `drawRows()` 的 filter 分支），再把结果写进 `fBase`。
+
+同一台机器、同一次开机的实测：
+
+| 命令行 | 驱动每帧 | 等 GPU | 面板截图 |
+|---|---|---|---|
+| 默认（1125×2436，`fb_threads=3`） | 3,500–3,800 us | 0.6 ms | 12,588 / 3.05 MB |
+| `fb_threads=8`（仍在缩放） | 2,000–2,100 us | 1.6 ms | — |
+| **`fbwidth=1080 fbheight=2400 fb_threads=8`** | **1,293–1,300 us** | 0.65 ms | 3,075,879 字节（桌面正常） |
+
+**1.3 ms，是不改尺寸时的三分之一。** 走的是 `drawRows()` 的 `unscaled` 分支，纯 `memcpy` 每行。
+
+代价：iOS 的布局从 375×812@3x 变成 360×800@3x，也就是界面按"更小的一台设备"排版。
+桌面截图看是正常的，但要点过界面才敢说没有副作用。
+
+撕裂另说：驱动只有一块 `fBase`，就是把像素往 bootloader 留下的那块正在被 MDP 扫的内存里写，
+**结构上就没有垂直同步**（`fb_beat` 是软件节拍，不是 TE）。真要不撕裂，要么按 TE 边沿起笔，
+要么双缓冲 + 让 MDP 换基址，要么就是参考项目那种 GPU 直通（`copied 0`）。
+
+## 2026-11-01 07:50 帧从哪来：MDP 的 SSPP0 就指在 0x9c000000，撕纸检查是开着的
+
+### 做了什么
+
+`hakios.display.c` 加了 step 8 / step 9（**纯读**）：八个源管道（SSPP）和 DSI0 的接口块。
+偏移不是猜的——`k40-ref/arch/arm64/boot/dts/vendor/qcom/kona-sde.dtsi:110` 是同一颗 sm8250 的
+`qcom,sde-sspp-off`，`techpack/display/msm/sde/sde_hw_sspp.c:19-42` 是寄存器布局，
+`kona-sde.dtsi:78` 是 `qcom,sde-intf-off`。`display_step=9` 一跑就出来了。
+
+### 读数
+
+```
+display: sspp0 +0x5000: 1080x2400 at 0,0 -> 1080x2400, src0 0x9c000000, stride 4320, format 0x237ff, unpack 0x3020001
+display: sspp1..7:     全 0（没在用）
+```
+
+**只有 SSPP0 是活的**，一个全屏层，基址就是 `0x9c000000`，stride 4320（= 1080×4），
+和面板一一对上。也就是说：**"GPU 直通"要改的就是 MDP + 0x5014 这一个字。**
+
+接口块（DSI0 = `0x6b800`）：
+
+```
++6b800: 00000000 00800000    TIMING_ENGINE_EN = 0（命令模式），INTF_CONFIG = 0x00800000
++6ba80: 00000000 00000001 00180085 0000ffff 00000000 00000960 00000c32 00050004
+        ↑+0x280   ↑+0x284            ↑+0x290   ↑+0x294   ↑+0x298
+```
+
+`+0x284` 是 **INTF_TEAR_TEAR_CHECK_EN，值 1——bootloader 已经把它开着**。`+0x294`
+（VSYNC_INIT_VAL）= `0x960` = 2400，就是面板高度。这串是 vendor 用来"换层的地址但不撕裂"的
+硬件机制，已经在跑。我们不需要自己对着 TE 掐时间，写下去由硬件挑安全点。
+
+### 还差一步：怎么"提交"
+
+SDE 的寄存器是双缓冲的，写进去要踢一脚才 latch。控制块 `qcom,sde-ctl-off = <0x2000 ...>`
+（`kona-sde.dtsi:46`），`CTL_FLUSH` 在 CTL + `0x018`（`sde_hw_ctl.c:22`），置上 SSPP0 对应的位。
+所以完整动作是**两个字**：`MDP+0x5014 = 新地址`，然后 `CTL+0x018 |= SSPP0 位`。
+
+### 那个真正的未知数：地址是物理的还是过 SMMU 的
+
+`sspp0.src0` 读出来**正好等于**设备树里 reserved-memory 的物理基址 `0x9c000000`，不是一个小 VA。
+vendor 驱动一般塞的是 IOMMU 映射后的地址，不会是 0x9c000000 这种数——所以 **mdss 侧大概率是
+bypass / 恒等映射**，`kmem_alloc_contig` 出来的物理地址可以直接写。但这是推断，不是实测。
+
+要实测只需要一次开机：把 `0x5014` 写成一个我们自己分配、刷成纯色的缓冲的物理地址，
+踢一脚 CTL_FLUSH，看面板变不变色。变了就是通的；不变或者花屏，就是 SMMU 要另外处理。
+
+### 代价与风险（说在前面）
+
+- 这一下写下去是**改硬件**，不再只是读。写错地址 = 面板花屏或者 MDP 出错，但 MDP 是被
+  bootloader 配好的，最坏情况是画面坏掉、要重启回 loader——不会变砖。
+- 单层单缓冲直接换址，在 tear-check 开着的情况下应该不裂，但**没有双缓冲**：换址那一刻
+  面板上会跳。真平滑要两个缓冲轮流指（SRC0/1 或两次换址），那是第二步。
+
+## 2026-11-01 08:40 审稿更正：帧率那张表是混的，GPU 直通卡在 SMMU 不是卡在寄存器
+
+用户让先核对再调试，于是派了两个只读的审查任务：一个从 vendor 驱动原文核寄存器语义
+（`k40-ref`，同型号 sm8250），一个核我们自己的结论。两边都挑出了实质问题。**下面这一节
+推翻上面三节里的若干说法**，以这一节为准。
+
+### 更正一：帧率那张表不可用
+
+我写的
+
+| 参数 | ... | 面板收到的帧 |
+|---|---|---|
+| `fb_hz=60 fb_threads=3` | ... | 59/s |
+| `fb_hz=120 fb_threads=3` | ... | 34–45/s |
+| `fb_hz=120 fb_threads=8` | ... | 48/s |
+
+**第一行是错的**：回查 `logs/`，`59 a second` 那一行出自 `logs/070844-run.log`，而那次的
+命令行是 `display_hz=120 fb_hz=120`。**我们从来没有在 `fb_hz=60` 时截到一个正在动的窗口**——
+60 那几次抓到全是 `10 a second`（桌面静止）或 `18–19 a second`（一闪而过）。
+
+按命令行重新归类：
+
+| 日志 | 命令行 | 抓到的帧率窗口 |
+|---|---|---|
+| `070142` | 默认（`fb_hz=60 fb_threads=3`，缩放） | 16×`10/s`，1×`19/s` |
+| `070844` | `display_hz=120 fb_hz=120` | 18×`10/s`，`12` `18` `41` **`59`** `/s` |
+| `071828` | 同上 | 7×`10/s`，`13` `16` `18` `34` `36` `39` `41` `45` `48` `/s` |
+| `072243` | 同上 + `fb_threads=8` | 18×`10/s`，`18` `35` `48` `/s` |
+| `072803` | `fbwidth=1080 fbheight=2400 fb_threads=8` | 19×`10/s`，`18` `/s` |
+
+所以"把 `fb_hz` 提到 120 帧率反而掉了（59 → 34–45）"这句话**没有证据**，撤掉。
+能站得住的只有：**在所有抓到的窗口里，面板从没超过 59 帧/秒**。
+
+审查还指出一件我该早点想到的事：`MiniIOMobileFramebuffer.cpp` 那段节拍逻辑**只能压帧率
+不能抬**，而且 120 Hz 下 `began - next > period * 3 / 2` 这个逃逸条件只有 **12.5 ms**——
+只要一帧实耗超过 12.5 ms，120 Hz 下每帧都会直接走 `fBeat = began`，一次节拍都不等。
+换句话说 **120 Hz 下节拍代码根本不构成限制**，34–48 这种不落在 120 整数分频上的数字也
+不可能是它产生的（120/3=40、120/4=30 才是它的分频）。这条结论目前是"数字与代码不自洽"，
+要去掉它只能重跑：固定 `fb_threads`/`fbwidth`，只切 `fb_hz`，各两次。
+
+### 更正二：不是"面板正在扫 0x9c000000"
+
+面板是 **command mode**，DSI 把一帧推进面板自己的 GRAM，然后**面板按自己的节拍扫 GRAM**。
+所以 `SSPP0_SRC0_ADDR` 的准确含义是「**DSI 上一次从哪块内存取的帧**」，不是「面板此刻正在
+逐行扫的缓冲」。工程结论没变（MDP 确实在供帧，否则往 `fBase` 写东西屏幕不会变），但措辞要改。
+
+### 更正三（关键）：SRC0_ADDR 里是 IOVA，不是物理地址——GPU 直通卡在这里
+
+vendor 驱动的赋值链（`k40-ref`，全部有行号）：
+
+- `sde_plane.c:761` `sde_format_populate_layout(aspace, fb, &pipe_cfg->layout)`
+- `sde_formats.c:1044-1048`：有 aspace 就 `msm_framebuffer_iova()`，**没有**才 `msm_framebuffer_phys()`
+- `msm_gem_vma.c:49-52`：`vma->iova = sg_dma_address(sgt->sgl)`，来自 `qcom,iommu-dma-addr-pool`
+- `sde_hw_sspp.c:769`：把上面那个值写进 `SSPP_SRC0_ADDR`
+
+那为什么现在 `0x9c000000` 能用？**因为 splash 那块被显式做了恒等映射**：
+
+```c
+/* sde_kms.c:790-793 */
+ret = mmu->funcs->one_to_one_map(mmu, splash->splash_buf_base,
+        splash->splash_buf_base, splash->splash_buf_size, IOMMU_READ | IOMMU_NOEXEC);
+```
+（`msm_smmu.c:164` 是 `iommu_map(domain, 同址, 同址, ...)`；DT 上配着 `qcom,iommu-earlymap`。）
+
+**这一句反过来证明 SMMU 是开着的、在翻译**——如果 CB 是 bypass，根本不需要这句。
+
+而且 **DSI 的 command DMA 和 MDP 的 SSPP 用的是同一个 aspace、同一个 context bank**
+（`apps_smmu 0x820`，非安全 CB）：`dsi_ctrl.c:282-288` 和 `sde_plane.c:692` 拿的都是
+`kms->aspace[MSM_SMMU_DOMAIN_UNSECURE]`。
+
+所以 `hardware.md` 里那条一直没解释的实测——
+
+> DSI 命令 DMA 是总线主设备……内核 `kmem_alloc_contig` 出来的普通页它读不到
+> （`CMD_DMA_DONE`、`status0 0`、`ack err 0`，但面板毫无反应）
+
+**现在有解释了**：没经过 `msm_gem_get_iova` 的页，在那套页表里没有任何条目，写进去的地址
+没有意义；而 `qcom,iommu-faults = "non-fatal"`、fault handler 只打日志就返回
+（`msm_smmu.c:398-422`），所以**非法地址不 hang、不报错，只是读到全 0**。现象逐字吻合。
+
+**结论：GPU 直通不是"改一个寄存器"，而是"先让 surface 在 sde 的 aspace 里有 IOVA"。**
+把 `kmem_alloc_contig` 的物理地址直接写进 `0x5014` 一定读到 0 / 花屏。
+
+### 还剩什么、哪条路更近
+
+寄存器层面已经清楚了，而且都不难：
+
+| 事 | 值 | 依据 |
+|---|---|---|
+| 格式 | `SRC_FORMAT = 0x237ff` = **linear**、32bpp、alpha 使能 | `[31:30]=00` 即 `SDE_FETCH_LINEAR`；不是 tiled/UBWC |
+| 通道序 | `SRC_UNPACK_PATTERN = 0x3020001` = 内存字节序 **B,G,R,A** | `sde_formats.c:197-199` 的 linear `ARGB8888` 条目 |
+| 提交 | 写 `SRC0_ADDR` → `CTL_FLUSH`(`0x2018`) **bit 0** → `CTL_START`(`0x201c`) | `sde_hw_ctl.c:22,618,229`；`SSPP_VIG0` 对应 flush bit 0（`sde_hw_ctl.c:67`） |
+| 换址前 | 命令模式下还要先写 `CTL_PREPARE`(`0x0d0`) | `sde_crtc.c:3215`、`sde_encoder.c:4520` |
+| tear-check | **不保护换址**，只保护"踢帧时机" | 换址安全靠等上一帧 PP idle（`sde_encoder_phys_cmd.c:1383`）+ flush 锁存 |
+| `TIMING_ENGINE_EN = 0` | 命令模式的正常值，driver 只在 video mode 才置它 | `sde_hw_intf.c:323`，调用者全在 `sde_encoder_phys_vid.c` |
+| 踢帧 | **软件写 `CTL_START`**，不是 MDP 定时器 | `sde_encoder_phys_cmd.c:1873-1890` |
+
+所以真正的工作量在两件事上，按性价比：
+
+1. **把 surface 放进已经恒等映射的那块。** 显示 carveout 是 `0x9c000000 + 0x2300000`（36 MB），
+   splash 只用了一部分。如果 36 MB 全在 `one_to_one_map` 的范围内，那么在 carveout 里开两个
+   缓冲（每块 10.4 MB）就**既有 IOVA 又是双缓冲**，一个字都不用碰 SMMU。这条要先确认
+   `splash_buf_size` 到底多大——**一次只读的 dump 就能知道**（读 `INTF` 的地址窗口不够，
+   得看 bootloader 传给 kernel 的 splash 结构，或者干脆试：在 carveout 后半段写花色，
+   看 MDP 指过去是不是能显示）。
+2. 如果不在范围内，就得自己往 `apps_smmu` CB `0x820` 里加映射——那是另一件事，
+   而且没有任何参考实现在这台机器上做过。
+
+### 还有两个必须先读的寄存器（都没在我们现在的 dump 里）
+
+- **`SSPP_SRC_ADDR_SW_STATUS`（`0xae05070`）低 4 位**：如果被置位，SSPP 会拿地址去**安全 CB**
+  （`apps_smmu 0x821`）翻译，一切非安全映射全失效。**一个只读就能定性。**
+- **`INTF_TEAR_AUTOREFRESH_CONFIG`（`0x6bb600 + ...`，INTF `0x2b4`）与 `INTF_TEAR_START_POS`
+  （`0x2a0`）**：命令模式下没有 MDP 定时器，那"往 0x9c000000 写像素能看到变化"说明**外部有
+  东西在反复 kick**，最可能就是 autorefresh。它决定了换址之后新帧什么时候会被取。
+
+### 更正四：`--clean` 的理由要收窄
+
+审查指出 `xnu-build.sh` 原来的 STAMP **只跟踪 `ath11k.o` 一个文件**，既不可能造成、也不可能
+防止"旧对象被链进去"。也就是说"卡在 logo 是旧编译产物"这个**因果解释没有证据**，我只观察到
+"删掉 `BUILD/obj` 重编之后好了"，中间那一步是推断。收窄成：**清干净重编是当前唯一可靠的做法**，
+至于为什么会坏，未定。真要定，得留两次二进制做 `cmp`，并且先用同一个旧二进制再启动两次确认
+冻结可复现。
+
+## 2026-11-01 09:00 step 10 读数：两条"判死级"未知项都清了
+
+`display_step=10`（纯读）加了三处：`SSPP0` 的搬迁相关寄存器、INTF 的 autorefresh、
+六个 CTL 的 top/flush/start 状态。偏移全部来自 `k40-ref` 同型号源码，不是猜的。
+
+```
+display: sspp0 +0x070 src_addr_sw_status 0: planes on the secure bank: 0000
+display: sspp0 +0x038 op_mode 0x80000000, +0x044 ubwc_static 0xc0000101, +0x048 fetch_config 0x87
+display: intf-dsi0 +0x2a0 tear_start_pos 0x960, +0x2b0 tear_line_count 0x915, +0x2b4 autorefresh 0x80000001
+display: ctl0 +0x2000: top 0x20000 (cmd mode 1), flush 0, start 0, status 0x1, prepare 0
+display: ctl1..5:      top 0x1f00 (cmd mode 0), ...
+```
+
+### 结论一：没有走安全 CB
+
+`SSPP_SRC_ADDR_SW_STATUS = 0`，低四位全 0——四个 plane 的地址**都不走安全上下文**
+（`sde_hw_sspp.c:436-467` 的 `secure_bit_mask`）。这条如果置位就直接判死，现在清了。
+
+### 结论二：autorefresh 是开着的，1 帧
+
+`INTF_TEAR_AUTOREFRESH_CONFIG = 0x80000001`。按 `sde_hw_intf.c:517-521`，
+`BIT(31) | frame_count` = 使能 + **1 帧**。这就是"往 0x9c000000 写像素，面板会跟着变"的
+机制：命令模式下没有 MDP 定时器，是 autorefresh 在不停重新取同一块缓冲。
+`tear_start_pos = 0x960 = 2400`（= 面板高度）和 driver 写的 `start_pos = mode->vdisplay` 一致；
+`tear_line_count = 0x915 = 2325` 是读数那一刻的行计数，正在跑。
+
+### 结论三：CTL_0 就是那个要 flush 的控制块
+
+六个 CTL 里**只有 ctl0 的 `CTL_TOP` bit17 = 1（命令模式）**，其余五个是 0x1f00、bit17 = 0。
+`CTL_TOP` 的 bit17 按 `sde_hw_ctl.c:1148-1151` 就是"这个控制块在命令模式"。
+所以 `CTL_FLUSH`/`CTL_START` 要写的是 **`0xae02018` / `0xae0201c`**，不是推断，是读出来的。
+
+`flush`/`start`/`prepare` 读回都是 0——它们是自清零的触发寄存器，只写不读，读回值无意义。
+
+### 结论四：格式这边完全没障碍
+
+`SRC_FORMAT = 0x237ff` 是 **linear**（`[31:30] = 00`），不是 tiled/UBWC；
+`fetch_config = 0x87` 正是 `SDE_FETCH_CONFIG_RESET_VALUE`，说明线性路径根本没程序化它；
+`ubwc_static = 0xc0000101` 是残留值，线性下不参与。`op_mode = 0x80000000` 是
+`MDSS_MDP_OP_PE_OVERRIDE`（画质增强旁路，`sde_hw_sspp.c:63`），无害。
+
+### 现在只剩一件事：地址必须在 sde 的 aspace 里有 IOVA
+
+上一节已经说清：`SRC0_ADDR` 是 IOVA，`0x9c000000` 能工作**只是因为**它落在恒等映射里。
+而且这台机器上**没有跑过 Linux 的 `sde_kms`**（`sde_kms.c:790-793` 那句 `one_to_one_map`
+是 Android 内核干的），所以对 splash carveout 做恒等映射的是 **bootloader**——它的范围有多大，
+我们不知道。
+
+下一步（仍然纯读）：`soc.args` 里已经有 `soc_apps_smmu=0x15000000`，`hakios.adreno.c` 里也有
+读 SMMU 流的现成写法。读 `apps_smmu` 的 S2CR（SID `0x820`）看那个流是不是在翻译模式、
+指向哪个 context bank，再顺着 `TTBR0` 走一遍页表，就能知道**恒等映射覆盖到哪**。
+这决定了直通是"在 carveout 里开两块缓冲就行"还是"得自己往页表里加条目"。
+
+## 2026-11-01 09:20 apps_smmu 读数：stream 0x820 走的是**翻译**，context 4
+
+`display_step=11` / `=12`（纯读）读 `0x15000000`。
+
+```
+display: apps_smmu idr0 0x4c017e57, idr1 0x6000004a, idr2 0x5111, idr7 0x24, sgfsr 0, scr0 0x210406
+display: apps_smmu: 87 stream match registers, 74 contexts, 128 pages of 0x1000
+
+display: stream 0x4a0 (mask 0): translated, context 0
+display: stream 0xc0  (mask 0): translated, context 1
+display: stream 0x4e0 (mask 0): translated, context 2
+display: stream 0xe0  (mask 0): translated, context 3
+display: stream 0x820 (mask 0x402): translated, context 4
+display: stream 0     (mask 0): translated, context 5
+display: stream 0x20  (mask 0): translated, context 5
+```
+
+`smr 4 = 0x84020820`：bit31 有效，stream `0x820`，mask `0x402`——和 `kona-sde.dtsi:276`
+的 `iommus = <&apps_smmu 0x820 0x402>` 逐位对上。`S2CR = 0x4`：`[17:16] = 0` = **翻译**，
+context 4。
+
+### 这条把方案的形状定死了
+
+**显示子系统的访问确实过 SMMU，而且是翻译模式。** 所以 `SRC0_ADDR` 里的地址必须在这套页表里
+有对应条目，物理地址本身没有意义——上一节从 vendor 驱动推出来的结论，这里是硬件侧的确认。
+
+顺带两个副产品：
+- 只有 7 条 SMR 在用，而且**全部是 translated**（没有一条 bypass）。所以"某条流是直通模式"这个
+  可能性不存在。
+- `stream 0 (mask 0)` → context 5 是一条**通配**（`0 & ~0 == 0`，匹配任何 stream id），
+  没被显式匹配的流都落到 CB5。
+
+### 还没拿到的东西：context 4 的页表在哪
+
+`IDR1 = 0x6000004a`：bit31 = 0（4 KB 页），`[30:28] = 6` → `128` 页，所以 context 区从
+`+0x80000` 开始。但读 `0x80000..0x8f000` 的第一页字给的是
+
+```
+page 0x80000: sctlr 0xe0, ttbr0 0, tcr 0
+page 0x84000: sctlr 0xe0, ttbr0 0, tcr 0      ← 这是 context 4
+page 0x86000: sctlr 0x82a31a, ...             ← 看起来像页表项，不像 SMMU 寄存器
+page 0x87000: sctlr 0x1e33e31c, ...
+```
+
+`SCTLR` bit0（翻译使能）= 0、`TTBR0` = 0，而 S2CR 明明写着 translated——两者矛盾。`0x86000`
+以后的值像内存内容而不像寄存器。结论：**这个块的 context 寄存器不在 `+0x80000`**，
+`qcom,qsmmu-v500` 不是普通的 arm-smmu-v2 布局（DT 里还有 `qcom,skip-init`、
+`qcom,use-3-lvl-tables`，且这块由 TrustZone 管）。**这条没查通，不装懂。**
+
+### 但有一条更硬的旁证：恒等映射的范围比想象的大
+
+我们手上已经有**两个**能被显示侧读到、而且物理位置差得很远**的地址**：
+
+| 地址 | 什么 | 证据 |
+|---|---|---|
+| `0x9aead000` | bootloader 留下的命令 DMA 缓冲页 | `display_bl` 从这里发能真的改亮度；`kmem_alloc_contig` 的页不行 |
+| `0x9c000000` | 帧缓冲（`SSPP0_SRC0_ADDR`） | 面板确实跟着变 |
+
+两者相差 ~1.2 MB，而且 `0x9aead000` **在显示 carveout（`0x9c000000`+36 MB）之外**。
+如果恒等映射只为 splash 那一块做，命令缓冲那一页不可能读得到。
+所以 **ABL 建的是一个大范围的恒等映射**，大概率盖住整个 `0x9xxxxxxx` 一带。
+
+这意味着直通的第一步可能真的只是"在 carveout 里开两块缓冲"——但**这是推断，不是实测**。
+
+### 下一步：一次写，问一句"这块映射了没有"
+
+读到这里再往上就只剩猜了。能一锤定音的实验只有一个：
+
+1. 往 carveout 的后半段（`0x9d000000`，在 `0x9c000000`+36 MB 之内、当前没人用）写一整屏纯色；
+2. `MDP+0x5014 = 0x9d000000`，然后 `CTL_FLUSH(0xae02018) |= bit0`、`CTL_START(0xae0201c) = 1`；
+3. 截图看是不是那块纯色；
+4. 不管结果如何，`0x5014` 写回 `0x9c000000` 再 flush 一次。
+
+三种结果分别说明：
+- **变纯色** → 整块 carveout 都在恒等映射里，去掉 CPU 拷贝只要在这个范围内开缓冲；
+- **变黑/全 0** → 那块没映射（非致命 fault 读回 0），恒等映射只覆盖 splash 那一块，
+  得自己往页表里加条目；
+- **画面坏了但重启能回来** → 寄存器动作有问题，回去查 CTL 的归属。
+
+风险：这一步开始**写**了。最坏情况是画面坏掉、要重启回 loader；MDP 是 bootloader 配好的，
+重启即恢复。`SCTLR`/页表一个字节都不动。
+
+## 2026-11-01 09:50 flip 实验：动作是通的，地址不是
+
+`display_flip` 把 SSPP0 的 `SRC0_ADDR` 换掉、走 `CTL_PREPARE` → `CTL_FLUSH`(bit0) → `CTL_START`，
+按住 N 秒再换回来。三次实测：
+
+| 命令行 | 看到的现象 |
+|---|---|
+| `display_flip_src=0x9d000000`（carveout 内 +16 MB，先写 242 行横条） | 顶部**闪烁的花屏**，不是横条 |
+| `display_flip_src=0x9c13c680`（帧缓冲内第 300 行，**不写内存**） | 整屏**黑** |
+
+### 能确定的
+
+1. **提交动作是通的。** 两次换址面板都当场变了。所以 `CTL_PREPARE`(0x020d0) →`SRC0_ADDR`→
+   `CTL_FLUSH`(0x02018) bit0 →`CTL_START`(0x0201c) 这一串在这个硬件上是生效的，CTL_0 也确实是
+   主显示那个控制块。这条不再需要怀疑。
+2. **`0x9d000000` 这个 IOVA 通到的地方会变。** 闪烁 = 那块物理内存正在被别人写。所以
+   "IOVA 不等于物理地址"这件事是真的，恒等映射没有盖到 +16 MB。
+3. **`0x9c13c680` 读到的是 0。** 整屏黑而不是花屏，说明这次读全 0。可能是这个地址没映射
+   （非致命 fault 读回 0），也可能是 **SSPP 对源地址有对齐要求**，0x680 这个页内偏移不满足。
+   这两种还没分开。
+
+### 一个把观察搅了的因素
+
+`MiniIOMobileFramebuffer: the display goes off (blanked: the panel's memory black)` —— 换址之后
+约 37 秒，iOS 自己把显示关掉了（**设备闲置自动锁屏**，不是我们搞坏的）。而我们的 `blank()`
+会 `bzero(fBase)`，于是**截图从 3,049,702 字节掉到 7,629 字节**。
+
+所以：**看点必须放在桌面刚起来、还没自动息屏的那一段**，否则看到的是 iOS 的息屏，不是实验结果。
+上一轮就是这个原因，观察废了。
+
+### 下一步（一次开机问完）
+
+- 对齐的帧缓冲内偏移：`0x9c100000`（+1 MB，正好 242.7 行的位置不齐，取 0x9c000000+0x100000
+  = 第 242 行之后整页对齐），短按 12 秒，紧接桌面出现之后 —— 看桌面是不是整体上移；
+  这同时判掉"对齐要求"和"映射范围"两个变量。
+- 如果对齐的上移成功：说明映射盖住至少 1 MB，接着试 2 MB、4 MB、8 MB，二分出恒等映射的边界。
+- 如果连 +1 MB 都黑：要么 SSPP 的地址必须回到 `0x9c000000` 这种"整帧基址"，要么映射就只盖了
+  起始那一页 —— 那就得去读 context 4 的页表（`apps_smmu` 的 context 寄存器位置还没找对，
+  `qcom,qsmmu-v500` 不是普通 v2 的布局）。
+
+`display_flip_at` / `display_flip_hold` / `display_flip_src` / `display_flip_fill` 已经是启动参数，
+不用再重编内核就能跑上面这一串。
+
+## 2026-11-01 10:20 "恒等映射覆盖多远"查资料查得到吗——查不到，但已经够下结论
+
+### 谁配的显示：ABL，不是我们手上的任何源码
+
+`Mu-Silicium`（UEFI，我们的引导链里的那一环）源码就在 `~/hackios/hackios-xnu-kernel/Mu-Silicium`，
+查过了：
+
+- `Silicon/Qualcomm/QcomPkg/Drivers/DisplayReEnablerDxe/DisplayReEnablerDxe.c` 只有 40 行，
+  内容是“关显示 → 等 1 ms → 开显示”，**不碰 MDSS/MDP/SMMU 一个寄存器**。
+- `Common/Mu/MsGraphicsPkg/MsEarlyGraphics/` 只是向固件要 `FrameBufferInfo`（基址、大小、格式），
+  然后往那块内存里画像素。**也没有 MDSS/MDP 初始化。**
+
+所以 `SSPP0` 的配置和那条恒等映射都是 **ABL（高通闭源 bootloader）** 做的。
+**没有可查的资料能给出"映射到哪"这个数**——它不是硬件属性，是引导程序里的一个软件决定。
+
+参考内核 `k40-ref` 里那句 `one_to_one_map(splash_buf_base, splash_buf_base, splash_buf_size, …)`
+（`sde_kms.c:790`）是 **Linux** 的写法，而我们的机器上从来没跑过 Linux，所以它的尺寸不约束我们。
+
+### 但我们手上已经有三个数，足够判断这条路走不走得通
+
+| 地址 | 结果 | 说明 |
+|---|---|---|
+| `0x9aead000` | **能读**（`display_bl` 从这页发 DCS 真的改亮度） | 显示 carveout **之外**，也被映射了 |
+| `0x9c000000` | **能读**（帧缓冲） | 帧跨 `0x9c000000`–`0x9C9E4600`（10.4 MB） |
+| `0x9d000000`（+16 MB） | **读到会变的垃圾** | 不在映射里（非致命 fault 读回的不是 0） |
+
+帧缓冲是 10,368,000 字节，两块 surface 需要 **20.7 MB**，也就是要映射到 `0x9D3C8C00`。
+而 `0x9D000000` 落在这个范围**里面**，实测却不在映射里。
+
+**结论：即使按最乐观的估计（映射从 0x9aea0000 一路盖到帧缓冲末尾，约 12 MB），也只够放一块
+10.4 MB 的 surface。放不下第二块——也就是说零拷贝拿不到双缓冲。**
+
+而双缓冲正是"换地址"这条路唯一能顺带解决撕裂的东西。没有第二块，换址那一刻画面就会跳。
+
+所以：**零拷贝能给的是"少一次 CPU 拷贝 + 单缓冲换址"，给不了"不撕裂"；而代价是每失败一次
+显示就卡死一次（现在已经卡死了一次，只能靠重启恢复）。**
+
+### 要突破这个限制只有一条路，而且现在走不通
+
+自己往 `apps_smmu` 的 context 4 里加映射，让它能覆盖我们自己的 surface 内存。
+但这要求先找到 context 4 的页表——`qcom,qsmmu-v500` 的 context 寄存器不在 `+0x80000`
+（读到的 `SCTLR` bit0 = 0、`TTBR0` = 0，和 `S2CR` 说的 translated 矛盾），布局还没找对；
+而且这块在 DT 里带 `qcom,skip-init`，是 TrustZone 管的，我们未必有写权限。
+
+### 定论
+
+**"GPU 直通"这条线到此为止，性价比不成立。** 已经拿到的确定收益（格式、提交动作、CTL 归属、
+autorefresh 机制）都记在上面几节里，将来要做别的事还用得上；但为了省一次 CPU 拷贝去写页表、
+并且每次失败要重启手机，不值。
+
+要继续改显示的话，剩下的都是不需要碰 MDP 的：
+1. `fbwidth=1080 fbheight=2400 fb_threads=8` 变成默认（拷贝 3.6 ms → 1.3 ms，已实测）；
+2. 按 TE 边沿起笔解决撕裂（gpio66 的读法 `te_thread` 里已经有）；
+3. `IOMFBDisplayRefresh` 那条（延迟和 120 Hz 的前提）。
+
+## 2026-11-01 10:55 决定：先做"GPU blit 上屏"，而不是先调默认值
+
+### 用户的选择
+
+> 那我怎么感觉先做3呢……先做3
+
+原先我的排序是 ①`fbwidth`/`fb_threads` 默认值 → ②对齐安全窗口 → ③GPU blit，理由是"①②便宜、
+③会取代①的一部分"。用户要求先做③。查完代码之后，**用户的顺序更有道理**，理由在下面。
+
+### 为什么③现在比原先评估的容易得多
+
+原先我把③归到"要改整个上屏路径"的大工程。查 `hakios.adreno.c` 后发现关键事实：
+
+**GPU（kgsl）的页表是我们自己建的**，不经过 `apps_smmu`、不经过 TrustZone：
+
+```c
+/* block_new_at() */
+for (uint32_t offset = 0; offset < block->size; offset += 4096) {
+        space_map(space, address + offset, kvtophys(block->memory + offset), attributes);
+}
+```
+（`space_map()` 直接写 level1/level2/level3 描述符，`PTE_CORE`/`PTE_GMU` 是自定义属性位。）
+
+而 `adreno=22` 已经证明这条回路是通的：
+
+```c
+/* bsd/dev/hakios.adreno.c 里 step 22 */
+MiniIOMobileFramebufferShow((const uint8_t *)core_target.memory, TARGET_WIDTH, TARGET_HEIGHT, TARGET_ROW);
+printf("adreno: %u: A PICTURE DRAWN BY THE GPU IS ON THE PANEL: ...");
+```
+
+也就是"GPU 画进一块内存 → **CPU 拷贝**上屏"。**要替换的正是这一段拷贝。**
+
+所以要把面板缓冲当 GPU 的渲染目标，只需要**一次 `space_map(space, GPU地址, 0x9c000000, PTE_CORE)`**。
+这跟"显示直通"（要让 MDP 读新地址、要过 `apps_smmu`）是两个难度级别的事：
+**MDP 那边一个寄存器都不动，`SRC0_ADDR` 永远是 `0x9c000000`。**
+
+### ④ 具体的做法
+
+- 目标缓冲：`0x9c000000`，1080×2400，stride 4320，BGRA（`SRC_FORMAT=0x237ff`、`unpack=0x3020001` 已实测）。
+- 源：compositor 交上来的 `MiniIOSurface`。它是内核对象，**物理页内核知道**，所以内核可以直接把它
+  map 进 `core_space` 当纹理。
+- 每帧在 `IOMobileFramebuffer::show()` 里，不再跑 `drawRows()` 的 CPU 缩放拷贝，而是：
+  提交一次全屏 blit（GPURING 已经在用：`core_ring`/`core_sqe`），等 fence，返回。
+- 顺带的好处：blit 的发起时刻可以精确对齐"这一帧取完了"（`INTF_TEAR_LINE_COUNT` 走到 2400），
+  也就是 ② 那件事在③里天然就有了位置。
+- 仍然不用双缓冲，所以撕裂只能压不能消——这一点不变。
+
+### ⑤ 风险与未知（写下来，别到时候当成"又坏了"）
+
+| 风险 | 说明 |
+|---|---|
+| GPU 写、MDP 读的**缓存一致性** | GPU 写完到 MDP 读之间要不要 cache clean（`dc civac`），Adreno 侧属性怎么给。`adreno=22` 现在有 CPU 读回，说明有一条现成的可见性路径，但那不等于 MDP 也能看见 |
+| **面板缓冲不能当渲染目标用 BGRA 直接画** | 需要确认 GPU 侧的 render target 格式和 4320 的 stride 能不能对上，不能的话要换 swizzle 或在 shader 里做 |
+| 每帧提交 GPU 命令的**开销** | 1080×2400 全屏 blit 在 Adreno 650 上应该 0.3–0.5 ms，但内核里提交一次的固定开销未知 |
+| 失败的样子 | 最好情况是画面不动/回到 CPU 拷贝；最坏是 GPU 卡死，那就得重启。**比改 MDP 安全**，因为地址没变 |
+
+### ⑥ 第一步（最小验证，先不动 `show()`）
+
+把 `adreno=22` 改成：**GPU 直接画进 `0x9c000000`**，删掉那句 `MiniIOMobileFramebufferShow()`。
+如果面板上出现那张"橙/白/蓝三道"的图，就说明：
+1. `0x9c000000` 能 map 进 GPU 空间；
+2. GPU 写进去的东西 MDP 能读到（一致性没问题）；
+3. stride 和格式对得上。
+
+**一改一测，二十行以内**。这三条任何一条不成立，③就得重新设计；三条都成立，剩下就是把
+`drawRows()` 换成 blit 提交的工程活。
+
+### 追加（11:10）：③ 有一个硬约束——GPU 的目标 pitch 必须是 64 的倍数
+
+`hakios.adreno.c` 里 2D 引擎填色那一段：
+
+```c
+#define TARGET_ROW              4352            /* 1088 pixels: the next multiple of 64 bytes */
+ring_register(RB_2D_DST_PITCH, TARGET_ROW >> 6);
+```
+
+**`RB_2D_DST_PITCH` 的单位是 64 字节**，所以 GPU 的渲染目标 stride 必须是 64 的倍数。
+而面板的 stride 是 **4320 = 64 × 67.5**，不是整数。也就是说：
+
+**GPU 没法直接按 4320 的 stride 往 `0x9c000000` 里画。** 现在的 `TARGET_ROW = 4352` 正是因为这件事，
+`MiniIOMobileFramebufferShow(..., TARGET_ROW)` 拿 4352 的源去填 4320 的屏，那一次换算就是漏不掉的
+CPU 工作。
+
+要绕开只有一条路：**把面板的 stride 也改成 4352**（最接近 4320 的 64 的倍数）。
+- 面板宽 1080 不变，pipe 每行读 1080 个像素、步进 4352 字节，多出来的 32 像素不读；
+- 缓冲变成 4352×2400 = 10.44 MB，仍在 carveout（36 MB）内；
+- 需要改三处：`SSPP0 SRC_YSTRIDE0`（一个 MDP 寄存器）、我们自己的写入 stride、GPU 的目标 stride。
+
+**这仍然是一次 MDP 写**，但写的是 stride 而不是地址，风险小得多：写错了画面会歪/花，
+写回 4320 就恢复，不像换地址那样会把 pipe 卡死。
+
+所以 ③ 的第一步实际是：**先把 stride 改成 4352 并确认画面正常**（CPU 拷贝路径同步改），
+再谈让 GPU 直接画进去。
+
+### 这一轮踩到的坑（记下来省下次）
+
+1. `xl enter` 重建镜像之后 **resident 镜像不会被自动上传**，直接跑会
+   `panic: Process 1 exec of /sbin/launchd failed, errno 2`。要先 `./xl ramdisk`。
+2. 上传完接着跑，手机掉到**原厂 fastboot**（`xl state` = `fastboot`，不是 `loader`），
+   然后 USB 写超时 `AdbWriteEndpointSync failed: 信号灯超时时间已到 (121)`，
+   `fastboot devices` 能看到设备但所有命令都超时。
+   排查过程：Windows 侧 `USB\VID_18D1&PID_D00D\XNULOADER` 状态 OK → 说明设备在；
+   有两个残留进程占着接口（一个 09:21 的 `fastboot.exe`、一个 `adb` server），
+   杀掉之后枚举恢复，但端点仍然不应答。**这种时候只能拔插线或长按电源重启。**
+3. 结论：`xl` 注释里写的"121 不一定是手机的问题"是真的，但同时占着 USB 的进程不止
+   `fastboot.exe` 一个，**`adb` server 也要一起杀**。
+
+## 2026-11-01 09:45 ③ 也撞墙了：stride 4352 直接把内核挂死
+
+### 先有一个好消息：提交序列本身是安全的
+
+上一轮把地址写成**它原来的值**再走一遍完整提交：
+
+```
+display: flip: the pipe reads 0x9c000000; 0 rows written at 0x9c000000; pointing it there for 20 s
+MiniIOMobileFramebuffer: 113 frames in 5015 ms (22 a second)     ← 继续正常上屏
+display: flip: putting the pipe back on 0x9c000000
+```
+
+对比坏掉那次换址后的 `45 frames in 25153 ms (1 a second)`。所以：
+
+**把显示搞死的是"pipe 取不到相干数据的地址"，不是我们那套 `CTL_PREPARE` → `SRC_YADDR` →
+`CTL_FLUSH` → `CTL_START`。这个动作可以放心用。**（这条以后很有价值。）
+
+### 然后 stride 换来一个 hang
+
+GPU 的 2D 目标 pitch 必须是 64 的倍数（`RB_2D_DST_PITCH = stride >> 6`），面板的 4320 不是。
+所以加了两个启动参数：`display_stride=N`（写 `SSPP0 SRC_YSTRIDE0`）和 `fb_stride=N`（改驱动
+写入的 stride），先用 4352 试。
+
+```
+display: the source pipe's stride reads 4320; setting 4352 (a whole number of 64-byte units: 68)
+...
+[日志停在 09:36:54，正常启动消息中间]
+result: hung 413387 0
+```
+
+**内核在启动早期就挂死了**，不是 panic，是 hang——加载器再也读不到日志。
+缓冲从 4320×2400 = 10,368,000 变成 4352×2400 = 10,444,800，多 76,800 字节。
+
+一个可能的解释：多出来的部分在 ABL 建的那条恒等映射**之外**，pipe 一路取到未映射的页，
+`qcom,iommu-faults = "non-fatal"` 的 fault 中断没有人清（我们的内核里根本没有 SMMU 中断处理），
+于是中断风暴把系统打停。**但这只是解释，没有证据**——也可能是 stride 写法的时序问题，
+也可能是别的。
+
+### 结论：③ 也被同一堵墙挡住
+
+- 要让 GPU 直接画进面板缓冲，stride 必须是 64 的倍数；
+- 唯一可行的 4352 比 4320 多用 76,800 字节；
+- 这 76,800 字节要么在映射外（→ hang），要么 stride 的写法本身有问题；
+- 无论哪种，都回到同一个根：**显示侧那块可访问的地址空间没有余量。**
+
+而 4352 已经是比 4320 大的最接近的 64 的倍数了，4288 比 4320 小，装不下 1080 像素。
+**没有第三个选项。**
+
+### 到此为止的判断
+
+两条路殊途同归：
+
+| 路 | 卡在哪 |
+|---|---|
+| MDP 指向新缓冲（零拷贝） | 地址是 IOVA，新地址不在恒等映射里 |
+| GPU 直接画进面板缓冲 | stride 必须 64 的倍数，可行的 4352 超出映射 |
+
+**共同的根因只有一个：显示侧能碰的地址空间大约是"正好一块 4320-stride 的帧"，没有余量。**
+要突破就得自己给 SMMU 建映射（写一个 stage-1 域），那是另一件工程。
+
+所以显示这块，**在"不动 SMMU"的前提下，零拷贝是做不到的**。剩下的空间就是：
+`fbwidth=1080 fbheight=2400 fb_threads=8`（拷贝 3.6 ms → 1.3 ms，已实测）、
+以及按 `INTF_TEAR_LINE_COUNT` 对齐起笔压撕裂（提交序列已证明安全）。
+
+## 2026-11-01 09:55 撕裂这件事测出来了：没有安全窗口，`fb_threads` 固化
+
+### 一、`display_lines` 采样：pipe 一直在取帧，没有空档
+
+加了只读的采样器（`display_lines=1`），半秒内读 `INTF_TEAR_LINE_COUNT`（`0x6b800+0x2b0`）
+433,098 次，按 100 行一档统计：
+
+```
+display: the pipe's line counter over half a second: 433098 reads, 0..2400
+display:   lines    0-  99: 9412
+display:   lines  100- 199: 9354
+display:   lines  200- 299: 9351
+...
+display:   lines 1900-1999: ...          （每一档都是 93xx，完全均匀）
+```
+
+**从 0 到 2400 每一档一样多。** 也就是说行计数在整个帧区间里匀速扫过——**pipe 几乎一直在取帧，
+没有"取完了、可以安全写"的空档。**
+
+结论：**记时间点（等 TE、等行计数回到 0、等取完）全都没用**，因为根本不存在那样的时刻。
+撕裂是结构性的，只能靠双缓冲消除，而双缓冲需要第二块 pipe 能读的缓冲——
+而那块映射只有一块帧那么大（见上一节 stride 4352 多 76,800 字节就挂死）。
+
+所以 ②这条（对齐起笔）**实测否决**，不是没做，是做了也没用。
+
+### 二、`fb_threads` 默认 3 → 8（实测）
+
+固化成默认之后，真机上的驱动耗时：
+
+| | 每帧在驱动里 |
+|---|---|
+| 原来（`fb_threads=3`） | 3,500–3,800 us |
+| **现在（默认 8）** | **1,954–2,072 us** |
+
+**降了约 45%**，而且画面尺寸没动（仍是 1125×2436，iOS 的界面布局不受影响）。
+
+`fbwidth=1080 fbheight=2400` 还能再降到 1.3 ms（走纯 `memcpy` 分支），但那是 **360×800 点**，
+不是任何一台 iPhone 的尺寸——代码里原来就写着"别的尺寸 MobileGestalt 会报未知屏幕类别、
+界面没有布局"。所以只作为 opt-in 留着，不做默认。
+
+### 三、顺手清掉的
+
+`display_stride` / `fb_stride`（上一节把内核挂死的那两个启动参数）**已经整段删掉**，
+免得以后误用。`display_flip_*`（换址探针）留着——它证明了提交动作安全，是可以复用的工具。
+
+### 四、显示这条线现在的实际状态
+
+| 事项 | 状态 |
+|---|---|
+| 桌面、GPU、触摸、亮度、电池 | 正常 |
+| 每帧 CPU 拷贝 | 3.6 ms → **2.0 ms**（`fb_threads=8`） |
+| 撕裂 | **无解**（没有安全窗口，也放不下第二块缓冲） |
+| 零拷贝 | **无解**（显示侧只有一块帧的映射） |
+| 120 Hz / 延迟 | 未动；前提是渲染服务器的 `IOMFBDisplayRefresh`，那条推断还没验证 |
+
+要突破撕裂和零拷贝，只剩一条路：**在 XNU 里实现一个 `apps_smmu` 的 stage-1 域**。
+那件事现在被三个问题挡着——context 4 的寄存器位置没对（`qcom,qsmmu-v500` 不是普通 v2 布局）、
+`qcom,skip-init` 说明它归 TrustZone 管、以及没有任何参考实现在这台机器上做过。
+
+## 2026-11-01 10:30 转 WiFi：把路摸清了，卡点是两个，一个熟的一个生的
+
+用户决定先研究 Wi-Fi，"其他看社区进展"。以下是这次研究的结果，全部来自设备树和仓库源码，
+没有上机。
+
+### 硬件：QCA6390 是 PCIe 设备，不是 WCN6750 那种集成式
+
+`kona.dtsi:4880`：
+
+```
+wlan: qcom,cnss-qca6390@b0000000 {
+        reg = <0xb0000000 0x10000>,      /* smmu_iova_ipa */
+              <0xb2e5510 0x5c0>;         /* tcs_cmd */
+        wlan-en-gpio = <&tlmm 20 0>;  qcom,bt-en-gpio = <21>;  qcom,sw-ctrl-gpio = <124>;
+```
+
+根复合体 `kona-pcie.dtsi:4` `pcie0: qcom,pcie@1c00000`，六个窗口齐了：
+
+| reg-name | 物理地址 | 大小 | 是什么 |
+|---|---|---|---|
+| `parf` | `0x01c00000` | `0x3000` | 控制器与 PHY 的控制寄存器（参考项目已经在这里摸到 step 9） |
+| `phy` | `0x01c06000` | `0x1000` | DSI… 不，PCIe PHY |
+| `dm_core` | `0x60000000` | `0xf1d` | DBI，配置空间核心 |
+| `elbi` | `0x60000f20` | `0xa8` | ELBI |
+| `iatu` | `0x60001000` | `0x1000` | 地址转换单元 |
+| `conf` | `0x60100000` | `0x100000` | ECAM：枚举用的配置空间 |
+
+外加：`perst-gpio = tlmm 79`、`wake-gpio = tlmm 81`；供电 `pcie_0_gdsc` + `pm8150_l9`(1.8 V)
++ `pm8150_l5`(0.9 V) + `VDD_CX`；中断 GIC SPI 140–152（`int_global_int` 与 a/b/c/d）。
+
+### 卡点一（熟的）：设备 DMA 要过 `apps_smmu`
+
+```
+kona-pcie.dtsi:92   iommu-map = <0x0 &apps_smmu 0x1c00 0x1>;
+```
+
+**pcie0 下面的设备用 stream ID `0x1c00`**，走的正是显示那块用的同一个 `apps_smmu`
+（`0x15000000`）。Wi-Fi 固件的 IPA 窗口 `0xb0000000`（`smmu_iova_ipa`）是它自己的 IOVA 区间。
+
+所以：**Wi-Fi 也卡在我们今天撞上的那堵墙上**——要给 `apps_smmu` 建 stage-1 域。
+现在知道了另一个要映射的 SID：**`0x1c00`**。
+
+### 卡点二（生的）：PCIe 链路训练，这条链路上没人做成过
+
+参考项目（UniXNU）在 `docs/evidence/2026-10-28-gpu-wifi-bringup.md` 里记的 PCIe 进度：
+
+```
+PCIE 2: THE CONTROLLER HAS POWER (gdscr 0xf822f000, 1 ms)
+PCIE 3: aux_halt = 0, slv_q2a_halt = 0
+PCIE 4: phy_status = 0x68，bit 6 置位，未写 PHY 即就绪
+PCIE 9: parf_mhi_clock_reset_ctrl = 0x3 -> 0x13; parf_axi_mstr_wr_addr_halt_v2 = 0x80000014
+结论：step 10（DBI/配置空间/链路训练）在参考实现里也从未运行
+```
+
+`parf_ltssm` 读 **0**——链路状态机根本没动。也就是说 **sm8250 上还没有人把 PCIe 链路拉起来过**，
+包括这台机器的所有前辈项目。这是比 SMMU 更不确定的一段：LTSSM 不动可能是 refclk 没来、
+可能是 PERST 时序、可能是 PHY PLL 没锁、也可能 PARF 里少了某一步。
+
+### 我们树里现有的东西，哪些能用
+
+| 东西 | 是什么 | 对我们有用吗 |
+|---|---|---|
+| `hakios.wifi.c`（4394 行） | **WCN6750**：固件跑在 WPSS（Hexagon DSP）上，靠 PAS/TrustZone 加载，走 SMEM/SMP2P/IPCC/GLINK/QRTR | **不能用**，架构完全不同 |
+| `wifi/lx`（约 5000 行） | FreeBSD LinuxKPI + 我们自己的垫层（锁、睡眠、work、内存、固件、总线） | **垫层和构建机制可复用**；`lx_bus.c` 是 ahb/window 模型，PCI 版要重写 |
+| `tools/mk-ath11k.sh` | 拉 Linux 7.0.14 的 ath11k + FreeBSD 15.1 的 LinuxKPI，编成一个 `ath11k.o` | **可复用**，但现在是 `-DCONFIG_ATH11K_AHB`，要改成 `CONFIG_ATH11K_PCI` 并把 `pcic.c` 编进来 |
+| `fw-wifi/` | 空 | `devices/alioth/pull-firmware.sh` 已经写好从 `/mnt/fw/image/qca6390` 整目录拉：`bdwlan.*` + `amss20.bin` + `m3.bin` + `regdb*` |
+
+### 结论与建议的下一步
+
+Wi-Fi 比显示大一个量级，而且**卡在同一个 SMMU 层上，外加一段没人做成过的链路训练**。
+但它有一件显示没有的好处：**前几步不需要 SMMU 就能做**，而且都是只读/只写供电的：
+
+1. **拉固件**（要 Android 的 adb，几分钟）：`adb pull /mnt/fw/image/qca6390 fw-wifi/`，
+   顺便确认里面到底有哪些文件、版本号。
+2. **PCIe0 只读探针**：读 `parf`（版本寄存器、`parf_ltssm`、`parf_aux_halt`、
+   `parf_slv_q2a_halt`）、`phy_status`、`pcie_0_gdsc` 的状态，**在我们这台机器上**确认
+   上电后 LTSSM 是什么。参考项目的 0 是他们的机器，不是我们的。
+3. 如果 LTSSM 是 0：查三件事——refclk（L9/L5 + `pcie_0_gdsc` 都上了吗）、PERST(gpio79)
+   有没有拉高、PHY PLL 有没有锁。这三条任何一条不对，链路都不会动。
+4. **不要先碰 SMMU**：链路起来了才有枚举，枚举了才有 MHI，SMMU 在那之后才轮到。
+   反过来先做 SMMU 是白做。
+
+也就是说：**Wi-Fi 的前半段（上电 → PARF → PHY → 链路训练）是自包含的，不依赖那个缺的 SMMU 层。**
+这是它比显示更值得投入的地方——至少在链路训练成功之前，不会被 SMMU 挡住。
+
+## 2026-11-01 11:20 方法论整改（一）：状态表和生成器
+
+看了 HakiOS 官方站（`hackios-web.vercel.app`）的「适配你的设备」和「架构」两页之后，改的第一件事。
+
+### 为什么先改这个
+
+它那条规矩是：
+
+> Only what you have seen on the phone is `works`. Written and not yet seen is `partial`, with a
+> note. What is not there is `missing`.
+>
+> `python3 tools/docs-gen.py` … **never edit them by hand**
+
+而我们今天正好抓到一个反例：`README.md` 那张表还写着「Brightness (the slider moves, then
+nothing)」，而亮度在 10-31 深夜就好了。**同一份状态写在两个地方，就一定会漂。**
+
+**结论：状态写在会过时的手写文档里，是结构问题，不是手滑。**
+
+### 做了什么
+
+**1. `devices/alioth/status`（新）** —— 一行一个部件：
+
+```
+<area>  <works|partial|missing>  <note>
+```
+
+18 个部件：display touch buttons cpu gpu storage audio battery thermal haptic camera torch wifi
+bluetooth cellular network usb sensors。当前是 **6 works / 3 partial / 9 missing**。
+
+note 里写清「怎么开的」或「缺什么」，例如：
+
+```
+display  works  …它的 60 Hz 档位，或 display_hz=120 的 120 Hz 档位；画面本身仍是 60 帧/秒，所以面板不是瓶颈
+haptic   missing  aw8697 在 I2C 上认得出、波形 RAM 回读一致，但 f0 校准和播放都没 PASS，也没有真实震感
+wifi     missing  QCA6390 是 pcie0 后面的 PCIe 设备（stream ID 0x1c00），这条链路在 sm8250 上从没训练过
+```
+
+**2. `tools/device-status.py`（新）** —— 三个子命令：
+
+```
+tools/device-status.py table  alioth            打印表格
+tools/device-status.py update alioth README.md  替换标记之间的内容
+tools/device-status.py check  alioth            校验（未知部件名、未知状态、重复、works/partial 没写 note 都会报错）
+```
+
+`update` 只重写 `<!-- status:alioth begin -->` 和 `<!-- status:alioth end -->` 之间的部分，
+外面一个字不动。跑两次第二次会说 "already up to date"（幂等）。
+
+**3. `README.md`** 那张手写的两列表格换成了生成的三列（Area / State / Note），前面加了一句
+「这张表是生成的，不要手改」。
+
+**4. `devices/alioth/hardware.md` 修掉一处事实错误**：振动原来写 `✅`，但 `PROGRESS.md`
+「AW8697 振动：已到硬件驱动阻塞点」写得很清楚——**f0 校准和 RAM 播放都没 PASS，iOS 的 haptic
+服务没接上，也没有真实震感验收**。改成 `❌` 并注明依据。这正是状态漂移的另一种形态。
+
+**5. `devices/alioth/README.md`** 开头加了指向 `status` 的一句，并说明表是生成的。
+
+### 还没做的（按价值排）
+
+1. **启动参数从配置来**：我们的 `XL_CMDLINE` 还是手打的，`tools/modem-cycle.sh:25` 里那条
+   还是 redwood 的（`ufs=2 hv_wdt_pet=1`）。今天修掉的三处 `battery=1`/`backlight=1` 过时
+   就是手打的后果。
+2. **别的机型的驱动默认不编**：`hakios.wifi.c`（WCN6750）、`wifi/lx`、`tools/mk-ath11k.sh`
+   （`-DCONFIG_ATH11K_AHB`）现在都在树里、都编。它那条规矩是"另一个手机的驱动碰你的手机是
+   最不能接受的事"。这一项要动构建图，得单独做。
+3. **每个驱动的 "Done when" 和引入顺序**：它给了一张 1–7 的表（CPUFREQ/THERMAL/SOCINFO →
+   BUTTONS/TOUCH → UFS → ADRENO → ADSP/BATTERY/SPEAKER/SOUND/MIC → WIFI/QMI →
+   HAPTIC/CAMERA/TORCH/MODEM/BT），我们要按自己的实际进度写一张。
+
+## 2026-11-01 10:35 方法论整改（二）：命令行从配置来；别的手机的 Wi-Fi 不再编进来
+
+### ① 启动参数不再手打
+
+| 改了什么 | 为什么 |
+|---|---|
+| 新 `devices/alioth/boot-args` | 这台手机自己的命令行，一处维护：`gl=1 adreno=22 adreno_keep=1 touchscreen=1 bootcpu=7 cpus=8` |
+| `tools/modem-cycle.sh` | 有 `devices/$DEVICE/boot-args` 就用它；没有才退回原来那一行（POCO 的 `ufs=2 hv_wdt_pet=1`） |
+| `Makefile`：`DEVICE ?= alioth` | 原来是 `poco-x5-pro`。**不带 `DEVICE=alioth` 打出来的镜像在这台机器上根本不能启动**，10-31 晚上整晚都栽在这上面 |
+| `Makefile`：`ARGS ?=`（清空） | 原来是 **POCO 的驱动清单**：`touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1 haptic=5 modem=1 ...`，每次 `make phone` 都照样套到我们手机上 |
+
+那条 `ARGS` 是这轮最有价值的发现。第一次跑 `make phone` 抓到的命令行是：
+
+```
+gl=1 adreno=22 adreno_keep=1 touchscreen=1 bootcpu=7 cpus=8  touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1 haptic=5 modem=1 ...
+```
+
+也就是说：`wifi=1` 在请求一个**已经不存在的**驱动；`haptic=5` 允许驱动一台 **f0 校准从没通过**的马达；
+`modem=1` 是另一台手机的基带驱动。**清除之后：**
+
+```
+cmdline: debug=0x8 rd=md0 battery_shared_pa=0x1012000 loader_return_after=150 sb_delay=8
+         gl=1 adreno=22 adreno_keep=1 touchscreen=1 bootcpu=7 cpus=8  soc_ipa_base=... soc_apps_smmu=...
+```
+
+干净的。只剩这台手机自己的参数和它自己的 `soc.args`。
+
+### ② POCO 的 Wi-Fi 整组不再编进内核
+
+`xnu/files/bsd/conf/files` 里去掉五个：`hakios.wifi.c`、`hakios.wlfw.c`、`hakios.lx.c`、
+`hakios.sta.c`、`hakios.apple80211.c`。**`hakios.net.c`（en0）留下**——它是通用接口，
+基带和 QEMU 的 virtio-net 都在用。
+
+`hakios.net.c` 里唯一伸进那组的一行（`hakios_apple80211_ioctl`）改成 `EOPNOTSUPP` 并注明原因。
+
+### 链接错误揭示的事：那个文件是半个内核的公共库
+
+第一次去掉之后链接失败，报的正好是八个符号：
+
+```
+"_hakios_aop_mailbox_lock"    ← hakios.adsp.o, hakios.mpss.o
+"_hakios_rsc_lock"            ← hakios.adsp.o, hakios.mpss.o
+"_hakios_smem_alloc_lock"     ← hakios.adsp.o, hakios.mpss.o
+"_hakios_smmu_lock"           ← hakios.camera.o, hakios.mpss.o, hakios.sound.o
+"_hakios_wifi_file"           ← hakios.haptic.o, hakios.camera.o
+"_hakios_wifi_init"           ← hakios.input.o
+"_hakios_wifi_quiesce"        ← loader_return.o
+"_hakios_wifi_stop"           ← loader_return.o
+```
+
+`hakios.wifi.c` 是先写的，后来别的驱动都从它那儿借东西：**四个锁**、**小镜像里 `fw/` 的文件加载器**
+（振动的波形、相机的标定表都走它）、以及**三个生命周期钩子**。所以它不是"POCO 的驱动"，
+是"POCO 的驱动 + 长在它里面的公共设施"。
+
+新建 `bsd/dev/hakios.shared.c`，把这八个搬进去，锁和加载器照原样、三个钩子是空的（这个内核没有
+电台可启停）。文件头写清了这段来历和那八行链接错误。
+
+### 验证（两次 `make phone`，都是真机）
+
+| | 结果 |
+|---|---|
+| 内核 | 15,239,760 → **15,145,296 字节**（少约 94 KB），`strings` 里 **`WCN6750` 出现 0 次** |
+| 第一次（ARGS 未清） | 到 SpringBoard，GL 980 帧，上屏 10/s、每帧 2.0 ms，无 panic |
+| 第二次（ARGS 清空） | 到 SpringBoard，GL 760 帧，上屏 10/s、每帧 2.1 ms，无 panic，手机自己回到 loader |
+
+两轮的启动顺序、桌面、GPU 都正常。**每帧 2.0 ms 是上一轮 `fb_threads=8` 的默认值生效的结果。**
+
+### 还剩的（记账）
+
+- `soc.args` 里的 `soc_ipa_*` / `soc_pas_ipa` / `soc_ipa_fw` 只被 POCO 的基带驱动读，
+  现在命令行上仍然带着，是死参数——等基带那条线重开时再决定归属。
+- `hakios.mpss.c` / `ipa.c` / `cell.c` / `nas.c` / `qmi.c` 仍然是树里编着的 POCO 版本，
+  它们靠 `modem=1` 之类参数才动，现在命令行上已经没有这些参数了。要像 Wi-Fi 那样整组摘掉，
+  得先弄清 `hakios.net.c` 和它们之间的依赖（`cell.c` 会调 `hakios_net_input_unit`）。

@@ -139,6 +139,188 @@ dump(const char *who, vm_offset_t base, uint32_t from, uint32_t to)
 	}
 }
 
+/* ---- step 13: point the source pipe somewhere else, and put it back ---------------------- */
+
+/*
+ * Steps 11 and 12 established that stream 0x820 is translated (S2CR type 0, context 4), so the word
+ * in SSPP0's SRC0_ADDR is an IOVA: what the display reads is not that physical address but whatever
+ * this SMMU's table has for it. The frame buffer at 0x9c000000 works because the bootloader mapped
+ * it one to one; the question this asks is how far that map reaches.
+ *
+ * The first attempt wrote bands at 0x9d000000 and pointed the pipe there: the top of the panel
+ * flickered with rubbish instead of showing them. That is one of two stories --
+ *   (a) IOVA 0x9d000000 resolves to some other physical page (rubbish that changes under us), or
+ *   (b) the commit itself is wrong, so the pipe never took the new address and the rubbish is
+ *       something else entirely.
+ * display_flip_src settles which, because it needs no new memory: point the pipe a few hundred rows
+ * into the frame buffer it is already reading. If the desktop slides up by that many rows, the
+ * commit is right and the address space is the problem. If nothing moves, the commit is wrong.
+ *
+ * Boot-args:
+ *   display_flip=1              do it at all
+ *   display_flip_src=ADDR       where to point the pipe (default 0x9d000000)
+ *   display_flip_fill=0|1       write bands there first (default 1)
+ *   display_flip_at=SECONDS     wait this long before flipping (default 0)
+ *   display_flip_hold=SECONDS   leave it there this long (default 25)
+ */
+#define FLIP_SOURCE     0x9d000000UL    /* inside the display carveout, past the frame buffer */
+/*
+ * Only 1 MB of it. A whole screen is 10,368,000 bytes, and asking ml_io_map for that much was the
+ * first thing this test did: kmem_alloc(11534336) failed with 3 at vm_kern.c:178 and panicked the
+ * kernel before a single pixel was written. 1 MB is what display_map() already maps for the MDP,
+ * so it is known to fit.
+ */
+#define FLIP_SIZE       0x00100000UL    /* 1 MB: 242 rows of 1080 pixels */
+#define FLIP_CTL        0x02000         /* CTL_0: the only control whose CTL_TOP bit 17 reads 1 (step 10) */
+#define FLIP_SSPP       0x05000         /* SSPP0: the only source pipe that is configured (step 8) */
+
+static struct {
+	uint32_t        src;            /* where to point the pipe */
+	uint32_t        restore_at;     /* the address it had before */
+	uint32_t        fill;           /* write bands there first */
+	uint32_t        at;             /* seconds to wait before flipping */
+	uint32_t        hold;           /* seconds to leave it pointing away */
+} flip_job;
+
+/*
+ * The words that make a new address take effect, in the order the vendor's driver uses them
+ * (sde_crtc.c:3215 CTL_PREPARE, sde_encoder.c:4264 CTL_FLUSH, sde_encoder.c:4309 CTL_START).
+ * SSPP_VIG0 is bit 0 of the flush mask (sde_hw_ctl.c:67, sspp_tbl[SSPP_VIG0] = 0).
+ */
+static void
+flip_commit(uint32_t address)
+{
+	wr(mdp + FLIP_CTL + 0x0d0, 1);                  /* CTL_PREPARE: only in command mode, which this is */
+	wr(mdp + FLIP_SSPP + 0x14, address);            /* SSPP0 SRC0_ADDR */
+	wr(mdp + FLIP_CTL + 0x018, 1u << 0);            /* CTL_FLUSH: SSPP_VIG0 */
+	wr(mdp + FLIP_CTL + 0x01c, 1);                  /* CTL_START */
+}
+
+/*
+ * Boot-arg display_lines=1: where in its frame the pipe spends its time.
+ *
+ * Whether a copy into the frame buffer can be kept out of the way of the fetch depends on how much
+ * of the period the fetch occupies. INTF_TEAR_LINE_COUNT (0x6b800 + 0x2b0) counts the line being
+ * fetched, 0 to 2400; sampling it for a while says whether the counter sits still in one band (a
+ * short fetch, and a wide gap to write in) or sweeps the whole range (a fetch that lasts the
+ * frame, and no safe moment at all).
+ *
+ * Nothing is written. The sampling loop is as fast as the register read allows, so the time spent
+ * in each band is what the counts are proportional to.
+ */
+static void
+lines_thread(void *parameter, __unused wait_result_t result)
+{
+	uint32_t buckets[26];
+	uint64_t deadline, now, samples = 0;
+	uint32_t low = 2400, high = 0;
+
+	bzero(buckets, sizeof(buckets));
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / 2, &deadline);
+	deadline += mach_absolute_time();
+	do {
+		uint32_t line = rd(mdp + 0x6b800 + 0x2b0);
+
+		if (line > 2400) {
+			line = 2400;
+		}
+		buckets[line / 100]++;
+		low = line < low ? line : low;
+		high = line > high ? line : high;
+		samples++;
+		now = mach_absolute_time();
+	} while (now < deadline);
+	printf("display: the pipe's line counter over half a second: %llu reads, %u..%u\n",
+	    samples, low, high);
+	for (unsigned i = 0; i < 25; i++) {
+		if (buckets[i] != 0) {
+			printf("display:   lines %4u-%4u: %llu\n", i * 100, i * 100 + 99, buckets[i]);
+		}
+	}
+	thread_terminate(current_thread());
+}
+
+static void
+display_lines(void)
+{
+	uint32_t on = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("display_lines", &on, sizeof(on)) || on == 0 || !display_map()) {
+		return;
+	}
+	if (kernel_thread_start(lines_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
+static void
+flip_thread(void *parameter, __unused wait_result_t result)
+{
+	uint32_t base, rows, wrote = 0;
+
+	if (flip_job.at != 0) {
+		delay_for_interval(flip_job.at, NSEC_PER_SEC);
+	}
+	if (flip_job.fill != 0) {
+		/* aligned down, so that an unaligned source is still writable through one mapping */
+		vm_offset_t buffer = ml_io_map(flip_job.src & ~0xfffu, FLIP_SIZE);
+
+		if (buffer == 0) {
+			printf("display: flip: %#x could not be mapped\n", flip_job.src & ~0xfffu);
+			thread_terminate(current_thread());
+			return;
+		}
+		base = flip_job.src - (flip_job.src & ~0xfffu);
+		rows = (FLIP_SIZE - base) / 4320;
+		for (uint32_t y = 0; y < rows; y++) {
+			uint32_t word = (y / 8) & 1 ? 0xffff00ff : 0xff00ff00;   /* magenta / green, BGRA */
+			volatile uint32_t *row = (volatile uint32_t *) (buffer + base + (size_t) y * 4320);
+
+			for (uint32_t x = 0; x < 1080; x++) {
+				row[x] = word;
+			}
+			wrote++;
+		}
+	}
+	flip_job.restore_at = rd(mdp + FLIP_SSPP + 0x14);
+	printf("display: flip: the pipe reads %#x; %u rows written at %#x; pointing it there for %u s\n",
+	    flip_job.restore_at, wrote, flip_job.src, flip_job.hold);
+	flip_commit(flip_job.src);
+	delay_for_interval(flip_job.hold, NSEC_PER_SEC);
+	printf("display: flip: putting the pipe back on %#x\n", flip_job.restore_at);
+	flip_commit(flip_job.restore_at);
+	thread_terminate(current_thread());
+}
+
+static void
+display_flip(void)
+{
+	thread_t thread;
+
+	if (!display_map()) {
+		return;
+	}
+	flip_job.src = (uint32_t) FLIP_SOURCE;
+	flip_job.fill = 1;
+	if (!PE_parse_boot_argn("display_flip_src", &flip_job.src, sizeof(flip_job.src))) {
+		flip_job.src = (uint32_t) FLIP_SOURCE;
+	}
+	if (!PE_parse_boot_argn("display_flip_fill", &flip_job.fill, sizeof(flip_job.fill))) {
+		flip_job.fill = 1;
+	}
+	if (!PE_parse_boot_argn("display_flip_at", &flip_job.at, sizeof(flip_job.at))) {
+		flip_job.at = 0;
+	}
+	if (!PE_parse_boot_argn("display_flip_hold", &flip_job.hold, sizeof(flip_job.hold)) || flip_job.hold < 3) {
+		flip_job.hold = 25;
+	}
+	flip_job.restore_at = 0;
+	if (kernel_thread_start(flip_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
 static void
 display_thread(void *parameter, __unused wait_result_t result)
 {
@@ -271,6 +453,245 @@ display_thread(void *parameter, __unused wait_result_t result)
 		}
 		printf("\n");
 	}
+	/*
+	 * Step 8: which source pipe the panel is being scanned out of, and what memory it reads.
+	 *
+	 * The display controller was set up by the bootloader and this kernel has only ever written the
+	 * frame buffer's contents, never told it which buffer that is. A layer's start address is a
+	 * plain word in one of the eight source pipes, so the pipe that says 0x9c000000 is the one the
+	 * panel is being fed from -- and the word beside it is what a hand-off would have to rewrite.
+	 *
+	 * The offsets are this SoC's own: qcom,sde-sspp-off = <0x5000 0x7000 0x9000 0xb000 0x25000
+	 * 0x27000 0x29000 0x2b000> (the vendor tree's kona-sde.dtsi:110, the same sm8250), and the
+	 * register layout from sde_hw_sspp.c:19-42 -- SRC_SIZE 0x00, SRC_XY 0x08, OUT_SIZE 0x0c,
+	 * SRC0_ADDR 0x14, SRC_YSTRIDE0 0x24, SRC_FORMAT 0x30, SRC_UNPACK_PATTERN 0x34. A size word is
+	 * (height << 16) | width, so a 1080x2400 frame reads 0x09600438 and its stride 4320 = 0x10e0.
+	 *
+	 * Reading these changes nothing: none of the eight is written here.
+	 */
+	if (steps < 8) {
+		goto out;
+	}
+	printf("display: step 8: the eight source pipes, and the memory each would read a frame from\n");
+	{
+		static const uint32_t sspp[8] = { 0x05000, 0x07000, 0x09000, 0x0b000,
+		                                  0x25000, 0x27000, 0x29000, 0x2b000 };
+
+		for (unsigned i = 0; i < 8; i++) {
+			uint32_t b = sspp[i];
+			uint32_t size = rd(mdp + b + 0x00), xy = rd(mdp + b + 0x08), out = rd(mdp + b + 0x0c);
+			uint32_t addr = rd(mdp + b + 0x14), stride = rd(mdp + b + 0x24);
+			uint32_t format = rd(mdp + b + 0x30), unpack = rd(mdp + b + 0x34);
+
+			printf("display: sspp%u +%#05x: %ux%u at %u,%u -> %ux%u, src0 %#010x, stride %u, "
+			    "format %#x, unpack %#x\n", i, b, size & 0xffff, size >> 16, xy & 0xffff, xy >> 16,
+			    out & 0xffff, out >> 16, addr, stride & 0xffff, format, unpack);
+		}
+	}
+
+	/*
+	 * Step 9: the interface block the panel hangs off, and the tear-check registers beside it.
+	 *
+	 * DSI0 is the second of the SoC's four interfaces: qcom,sde-intf-off = <0x6b000 0x6b800
+	 * 0x6c000 0x6c800> with qcom,sde-intf-type = "dp", "dsi", "dsi", "dp". +0x000 is
+	 * INTF_TIMING_ENGINE_EN and +0x004 INTF_CONFIG (sde_hw_intf.c:12-13); the block from +0x280 is
+	 * the tear-check machinery (INTF_TEAR_MDP_VSYNC_SEL .. INTF_TEAR_INT_COUNT_VAL, :70-76), which
+	 * is what a vendor driver uses to change a layer's address without tearing. Whether it is
+	 * switched on decides whether a hand-off can be timed by hardware or has to be guessed.
+	 */
+	if (steps < 9) {
+		goto out;
+	}
+	printf("display: step 9: DSI0's interface block, and the tear-check registers from +0x280\n");
+	dump("intf-dsi0", mdp, 0x6b800, 0x6b880);
+	dump("intf-dsi0", mdp, 0x6ba80, 0x6baa0);
+
+	/*
+	 * Step 10: the three registers that decide whether a layer's address can be pointed anywhere.
+	 *
+	 * SSPP_SRC_ADDR_SW_STATUS (0x70) is the first: its low four bits say, per plane, that this
+	 * plane's address is to be translated through the SECURE context bank instead of the one the
+	 * frames have been read through so far (sde_hw_sspp.c:436-467, `secure_bit_mask`). If any of
+	 * them is set, a non-secure mapping is irrelevant and a hand-off is finished before it starts.
+	 *
+	 * INTF_TEAR_AUTOREFRESH_CONFIG (0x2b4) is the second: in command mode nothing inside the MDP
+	 * keeps time (INTF_TIMING_ENGINE_EN reads 0), yet writing pixels into 0x9c000000 shows on the
+	 * panel, so something re-fetches frames. Autorefresh is the only candidate in this block
+	 * (sde_hw_intf.c:506-526), and it also says how wide the window between frames is.
+	 *
+	 * The six control blocks at qcom,sde-ctl-off = <0x2000 0x2200 0x2400 0x2600 0x2800 0x2a00>
+	 * are the third: a new address only takes effect when it is flushed through one of them
+	 * (CTL_FLUSH 0x018) and started (CTL_START 0x01c). CTL_TOP's bit 17 reads back as "this
+	 * control is in command mode" (sde_hw_ctl.c:1148-1151). Reading CTL_START tells which of the
+	 * six is the one in use without writing anything.
+	 */
+	if (steps < 10) {
+		goto out;
+	}
+	printf("display: step 10: can a layer's address be pointed elsewhere\n");
+	{
+		static const uint32_t ctl[6] = { 0x02000, 0x02200, 0x02400, 0x02600, 0x02800, 0x02a00 };
+		uint32_t b = 0x05000;           /* SSPP0, the one pipe that is configured */
+		uint32_t sw = rd(mdp + b + 0x70);
+
+		printf("display: sspp0 +0x070 src_addr_sw_status %#x: planes on the secure bank: %u%u%u%u\n",
+		    sw, (sw >> 3) & 1, (sw >> 2) & 1, (sw >> 1) & 1, sw & 1);
+		printf("display: sspp0 +0x038 op_mode %#x, +0x044 ubwc_static %#x, +0x048 fetch_config %#x\n",
+		    rd(mdp + b + 0x38), rd(mdp + b + 0x44), rd(mdp + b + 0x48));
+		printf("display: sspp0 +0x060 danger_lut %#x, +0x064 safe_lut %#x, +0x06c qos %#x, "
+		    "+0x170 multirect %#x\n", rd(mdp + b + 0x60), rd(mdp + b + 0x64), rd(mdp + b + 0x6c),
+		    rd(mdp + b + 0x170));
+
+		printf("display: intf-dsi0 +0x2a0 tear_start_pos %#x, +0x2b0 tear_line_count %#x, "
+		    "+0x2b4 autorefresh %#x\n", rd(mdp + 0x6b800 + 0x2a0), rd(mdp + 0x6b800 + 0x2b0),
+		    rd(mdp + 0x6b800 + 0x2b4));
+
+		for (unsigned i = 0; i < 6; i++) {
+			uint32_t c = ctl[i], top = rd(mdp + c + 0x014);
+
+			printf("display: ctl%u +%#05x: top %#x (cmd mode %u), flush %#x, start %#x, "
+			    "status %#x, prepare %#x\n", i, c, top, (top >> 17) & 1, rd(mdp + c + 0x018),
+			    rd(mdp + c + 0x01c), rd(mdp + c + 0x064), rd(mdp + c + 0x0d0));
+		}
+	}
+
+	/*
+	 * Step 11: the apps_smmu at 0x15000000, and what it does with stream 0x820.
+	 *
+	 * This is the one thing left that decides whether a layer's address can be pointed at memory
+	 * of our own. The display subsystem's two bus masters -- the MDP reading pixels and the DSI
+	 * host reading a command -- are both on stream 0x820 (kona-sde.dtsi:276,
+	 * iommus = <&apps_smmu 0x820 0x402>), and both of them read through this SMMU. A physical
+	 * address is only meaningful to them if this table translates it. That is why the bootloader's
+	 * splash page works and kmem_alloc_contig pages do not.
+	 *
+	 * The block is `qcom,qsmmu-v500` (msm-arm-smmu-kona.dtsi:71), reg = <0x15000000 0x100000>,
+	 * and that compatible is handled by drivers/iommu/arm-smmu.c (arm-smmu-v2 layout), so the
+	 * offsets are the same ones hakios.adreno.c uses for the GPU's SMMU: SMR(n) 0x800+4n with
+	 * bit 31 valid, [30:16] mask, [14:0] stream; S2CR(n) 0xc00+4n with [17:16] 0 translate /
+	 * 1 bypass / 2 fault and [7:0] the context; a context's own registers start at
+	 * pages * page and CBAR(n) lives in the second page.
+	 *
+	 * Read-only. Nothing here writes, and only the stream match registers the ID register says
+	 * exist are touched.
+	 */
+	if (steps < 11) {
+		goto out;
+	}
+	printf("display: step 11: the apps_smmu, and stream 0x820 of the display subsystem\n");
+	{
+		vm_offset_t smmu = ml_io_map(0x15000000UL, 0x00100000UL);
+		uint32_t idr0, idr1, page, pages, matches, contexts, valid = 0, found = 0;
+
+		if (smmu == 0) {
+			printf("display: the apps_smmu at %#x could not be mapped\n", 0x15000000);
+			goto out;
+		}
+		idr0 = rd(smmu + 0x020);
+		idr1 = rd(smmu + 0x024);
+		printf("display: apps_smmu idr0 %#x, idr1 %#x, idr2 %#x, idr7 %#x, sgfsr %#x, scr0 %#x\n",
+		    idr0, idr1, rd(smmu + 0x028), rd(smmu + 0x03c), rd(smmu + 0x048), rd(smmu + 0x000));
+		page = idr1 >> 31 ? 0x10000 : 0x1000;
+		pages = 2u << (idr1 >> 28 & 7);
+		contexts = idr1 & 0xff;
+		matches = idr0 & 0xff;
+		printf("display: apps_smmu: %u stream match registers, %u contexts, %u pages of %#x\n",
+		    matches, contexts, pages, page);
+		if (matches == 0 || matches > 256) {
+			printf("display: apps_smmu: that many match registers is not one to walk\n");
+			goto out;
+		}
+		for (uint32_t i = 0; i < matches; i++) {
+			uint32_t smr = rd(smmu + 0x800 + 4 * i), s2cr, stream, mask, type, cb;
+
+			if ((smr >> 31) == 0) {
+				continue;
+			}
+			valid++;
+			stream = smr & 0x7fff;
+			mask = (smr >> 16) & 0x7fff;
+			if ((stream & ~mask) != (0x820 & ~mask)) {
+				continue;
+			}
+			s2cr = rd(smmu + 0xc00 + 4 * i);
+			type = (s2cr >> 16) & 3;
+			cb = s2cr & 0xff;
+			printf("display: apps_smmu: smr %u = %#x (stream %#x, mask %#x), s2cr = %#x: %s, context %u\n",
+			    i, smr, stream, mask, s2cr, type == 0 ? "translated" : type == 1 ? "BYPASS" :
+			    type == 2 ? "fault" : "?", cb);
+			if (++found >= 8) {
+				break;
+			}
+		}
+		printf("display: apps_smmu: %u of %u match registers are in use, %u named stream 0x820\n",
+		    valid, matches, found);
+		if (found != 0) {
+			uint32_t cb_first = pages * page;
+
+			/* the context that stream landed in, by the same arithmetic hakios.adreno.c uses */
+			for (uint32_t i = 0; i < matches && i < 8; i++) {
+				uint32_t s2cr = rd(smmu + 0xc00 + 4 * i), cb;
+
+				if ((rd(smmu + 0x800 + 4 * i) >> 31) == 0 || ((s2cr >> 16) & 3) != 0) {
+					continue;
+				}
+				cb = s2cr & 0xff;
+				printf("display: apps_smmu: context %u: cbar %#x (kind %u), sctlr %#x, "
+				    "ttbr0 %#x%08x, tcr %#x\n", cb, rd(smmu + page + 4 * cb),
+				    (rd(smmu + page + 4 * cb) >> 16) & 3, rd(smmu + cb_first + cb * page + 0x00),
+				    rd(smmu + cb_first + cb * page + 0x24), rd(smmu + cb_first + cb * page + 0x20),
+				    rd(smmu + cb_first + cb * page + 0x30));
+			}
+		}
+	}
+
+	/*
+	 * Step 12: fix the address of the context banks, since step 11's did not answer.
+	 *
+	 * Step 11 found stream 0x820 at stream match register 4 with S2CR = 0x4 -- type 0, translated,
+	 * context 4. But the context registers read there (sctlr 0xe0 with bit 0 clear, ttbr0 0) cannot
+	 * be a bank that is translating anything, and CBAR read back the same 0x1f000 for every index.
+	 * So the arithmetic for where a context's page sits is wrong for this block, which is
+	 * `qcom,qsmmu-v500` and not a plain arm-smmu-v2.
+	 *
+	 * Rather than guess again: walk the part of the register space the SMMU is supposed to use for
+	 * contexts -- from the page count in IDR1 to the end of the 1 MB window -- and print the first
+	 * words of every page. The one that is translating has SCTLR bit 0 set and a TTBR0 that is not
+	 * zero; the others cannot.
+	 *
+	 * Read-only. Every valid stream match register is printed too, so that the streams the
+	 * bootloader left in bypass are told apart from the one the display reads through.
+	 */
+	if (steps < 12) {
+		goto out;
+	}
+	printf("display: step 12: every stream the SMMU knows, and where the context pages really are\n");
+	{
+		vm_offset_t smmu = ml_io_map(0x15000000UL, 0x00100000UL);
+
+		if (smmu == 0) {
+			printf("display: the apps_smmu at %#x could not be mapped\n", 0x15000000);
+			goto out;
+		}
+		for (uint32_t i = 0; i < 87; i++) {
+			uint32_t smr = rd(smmu + 0x800 + 4 * i), s2cr, type;
+
+			if ((smr >> 31) == 0) {
+				continue;
+			}
+			s2cr = rd(smmu + 0xc00 + 4 * i);
+			type = (s2cr >> 16) & 3;
+			printf("display: stream %#x (mask %#x): %s, context %u\n", smr & 0x7fff,
+			    (smr >> 16) & 0x7fff, type == 0 ? "translated" : type == 1 ? "BYPASS" :
+			    type == 2 ? "fault" : "?", s2cr & 0xff);
+		}
+		for (uint32_t at = 0x80000; at < 0x90000; at += 0x1000) {
+			printf("display: page %#07x: sctlr %#x, ttbr0 %#x%08x, tcr %#x\n", at,
+			    rd(smmu + at + 0x00), rd(smmu + at + 0x24), rd(smmu + at + 0x20),
+			    rd(smmu + at + 0x30));
+		}
+	}
+
 out:
 	if (steps < 7) {
 		printf("display: stopping here (display_step=%u)\n", steps);
@@ -1053,6 +1474,16 @@ hakios_display_init(void)
 		if (kernel_thread_start(hz_thread, (void *)(uintptr_t)((hz == 60 || hz == 90 || hz == 120) ? hz : 0), &thread) ==
 		    KERN_SUCCESS) {
 			thread_deallocate(thread);
+		}
+	}
+
+	display_lines();
+
+	{
+		uint32_t flip = 0;
+
+		if (PE_parse_boot_argn("display_flip", &flip, sizeof(flip)) && flip != 0) {
+			display_flip();
 		}
 	}
 

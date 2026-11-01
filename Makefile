@@ -19,11 +19,20 @@
 #   SECS=600             the session's length for make phone / make qemu
 #   JOBS=8               parallel jobs for the kernel build
 
-DEVICE ?= poco-x5-pro
+# The default is this repository's phone. It used to be poco-x5-pro, and an image built
+# without DEVICE=alioth does not boot here -- a whole evening went into that (PROGRESS.md,
+# 2026-10-31 21:40). The POCO is still one `DEVICE=poco-x5-pro` away.
+DEVICE ?= alioth
 JOBS ?= 8
 SECS ?= 600
 ARGS_OPEN ?= cpus=1
-ARGS ?= touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1 haptic=5 modem=1 modem_again=1 modem_buffer=0xa8000000
+# Empty by default, and it used to be the POCO X5 Pro's driver set:
+#   touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1 haptic=5 modem=1 modem_again=1 modem_buffer=0xa8000000
+# which every `make phone` applied to this phone as well -- wifi=1 asking for a radio this kernel no
+# longer builds, haptic=5 allowing a motor to be driven whose f0 calibration never passed, modem=1
+# another phone's modem driver. This phone's own arguments are in devices/$(DEVICE)/boot-args;
+# `make phone ARGS=...` still adds to them.
+ARGS ?=
 IMAGE_OPTS ?= REST=1
 
 # 这些脚本自己也读它：xl 与 mkxnuimg.py 从 $DEVICE 取设备，modem-cycle.sh 从它取 soc.args。

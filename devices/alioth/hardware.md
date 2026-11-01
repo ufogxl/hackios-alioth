@@ -117,6 +117,17 @@ curl -O $BASE/techpack/display/msm/dsi/dsi_ctrl_hw_cmn.c
 **已通**：`display_hz=120` 把上表 timing@2 那 7 个包按顺序发下去，TE 从 60.666 变成 121.333。
 关键在于**命令 DMA 从哪一页读**：DSI 命令 DMA 是总线主设备，走显示侧的地址窗口，内核
 `kmem_alloc_contig` 出来的普通页它读不到（`CMD_DMA_DONE`、`status0 0`、`ack err 0`，但面板毫无反应）；
+**为什么会这样**：DSI 和 MDP 用的是**同一个地址空间**——`apps_smmu` 的非安全 CB（`0x820`），
+`dsi_ctrl.c:282-288` 和 `sde_plane.c:692` 拿的都是 `kms->aspace[MSM_SMMU_DOMAIN_UNSECURE]`；
+驱动的语义是「有 aspace 就用 IOMMU 映射后的地址，没有才用物理地址」(`sde_formats.c:1044-1048`)。
+bootloader 那一页之所以能读，是因为 splash 被显式做了**恒等映射**
+（`sde_kms.c:790-793` → `msm_smmu.c:164` `iommu_map(domain, 同址, 同址, ...)`，DT 上有
+`qcom,iommu-earlymap`）——不是因为它是一页特殊的页。`kmem_alloc_contig` 的页从来没进过这套
+页表，写进去的地址没有条目；而 `qcom,iommu-faults = "non-fatal"`、fault handler 只打日志就返回
+（`msm_smmu.c:398-422`），所以**非法地址不 hang、不报错，只读到全 0**。
+**这条对 MDP 直通同样成立**：`SSPP_SRC0_ADDR` 里现在那个 `0x9c000000` 能工作，同样只是因为它
+落在恒等映射里；把普通内核页的物理地址写进去，下场和命令 DMA 完全一样。
+
 从 bootloader 留在 `DSI +0x048` 的那页（`0x9aead000`）发就立刻生效。默认值已改为那一页：
 `display_dma_at=ADDR` 可换，`display_dma_own=1` 是失败的那个反例。
 
@@ -265,7 +276,7 @@ SOUTH  85..91     NORTH  92..124    SOUTH 125..132   WEST  133..179
 | GPU | ✅ 真机跑起来 | 见上 |
 | Wi-Fi | ❌ | **QCA6390**（`qcom,cnss-qca6390`，wlan-en = gpio20），走 PCIe；XNU 侧没有 PCIe 代码，`hakios.wifi.c` 还是 WCN6750 版本 |
 | 音频 | ⚠️ 部分 | 两颗 CS35L41 在 `i2c@98c000`（SE3，gpio119/120，reset gpio114），DEVID `0x035a40`，能读能写；出声还差 ADSP + 三级 TDM（0x9020 / 0x9120）。麦克风走 SoundWire（WCD938x） |
-| 振动 | ✅ | aw8697，与 HackiOS 同款；`fw-haptic` |
+| 振动 | ❌ | aw8697 在 I2C 上认得出（地址 `0x5a`、ID `0x97`）、原厂波形 RAM 回读一致、内部 ADC 约 4.3 V，但 **f0 校准和 RAM 播放都没 PASS**，iOS 的 haptic 服务没接上，也没有真实震感验收——见 `PROGRESS.md`「AW8697 振动：已到硬件驱动阻塞点」 |
 | 相机 | ❌ | IMX582 等，最复杂，最后做 |
 | 指纹 | — | 侧边 Goodix（gpio23/24），iOS 无对应能力，忽略 |
 

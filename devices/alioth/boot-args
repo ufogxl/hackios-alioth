@@ -1,0 +1,13 @@
+# devices/alioth/boot-args — what this phone's kernel command line carries.
+#
+# tools/modem-cycle.sh (and so `make phone`) reads this file and puts it on the command line; the
+# line it used to carry was the POCO X5 Pro's (ufs=2, hv_wdt_pet=1, no GPU). Nothing here is the
+# POCO's, and nothing the POCO needs is here.
+#
+# Put one argument per line or all of them on one; `#` starts a comment. The loader adds its own
+# (debug=0x8, loader_return_after, rd=md0, battery_shared_pa, sb_delay), so they are not here.
+#
+# gl/adreno/adreno_keep are the GPU: without adreno_keep=1 the core is stopped after step 22 and the
+# display falls back to the software path. touchscreen=1 is the FT3658U. bootcpu=7 keeps the kernel
+# on a big core so the loader can still answer on its own during a run.
+gl=1 adreno=22 adreno_keep=1 touchscreen=1 bootcpu=7 cpus=8

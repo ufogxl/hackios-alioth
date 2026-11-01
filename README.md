@@ -60,16 +60,32 @@ The second phone is the **Redmi K40** (`alioth`, Snapdragon 870, 12 GB). The ker
 space are the same; what differs is collected in `devices/alioth/`. It boots the same iOS 16.5 user
 space to a home screen with a wallpaper, widgets and working touch, on a 120 Hz panel.
 
-| Works on the K40 | Not yet on the K40 |
-|---|---|
-| The kernel boots to SpringBoard; lock screen, home screen, stock apps | Wi-Fi: the QCA6390 is a PCIe part and `hakios.wifi.c` is still the WCN6750 version; the PCIe link has never trained |
-| All 8 cores; `bootcpu=7` on the big core; EPSS frequency scaling | Microphone: the WCD938x hangs off SoundWire behind the ADSP and has not been done |
-| Touch (FT3658U), multitouch, coordinates verified against the panel | Brightness (the slider moves, then nothing) and volume-up (not a TLMM pin; the firmware leaves it unpulled) -- two separate causes |
-| GPU: a real A650 through freedreno, CoreAnimation rendered by it (`gl=1 adreno=22 adreno_keep=1`) | Metal: this port has none |
-| Display: 120 Hz (`display_hz=120`); DCS brightness (`display_bl=N`) | Battery colour under the status-bar number |
-| Wallpaper and widgets (`SYSTEM=1` in the image build: 407 launchd jobs instead of 25) | Camera |
-| `/private/var` kept across reboots (`var_store=1 ufs_write=1`) | |
-| ADSP firmware loaded (steps 1-2, read-only); audio and amp are wired but not initialised | |
+Every area below is a line of `devices/alioth/status`. The table is generated from that file --
+`python3 tools/device-status.py update alioth README.md` -- and must not be edited here: a status
+kept in prose drifts from the phone, and this one did.
+
+<!-- status:alioth begin -->
+| Area | State | Note |
+|---|---|---|
+| display | works | the panel's 60 Hz timing, or its 120 Hz one with display_hz=120; the picture itself stays at 60 frames a second, so the panel is not the limit |
+| touch | works | FT3658U, multitouch, coordinates checked against the panel |
+| buttons | partial | power and volume-down come through the PMIC; volume-up is not a TLMM pin and the firmware leaves it unpulled, and the PON status word reads 0x4 |
+| cpu | works | all eight cores; bootcpu=7 on the big core; EPSS frequency scaling |
+| gpu | works | a real A650 through Mesa's freedreno, CoreAnimation rendered by it (gl=1 adreno=22 adreno_keep=1); no Metal |
+| storage | works | /private/var survives a reboot with var_store=1 ufs_write=1 |
+| audio | partial | the ADSP's firmware loads (steps 1-2, read-only); speaker, sound and microphone are wired but not initialised |
+| battery | works | percentage, charging state and the charger flag from the PMIC, with no boot-arg |
+| thermal | missing | no thermal driver; cpufreq=1 pins the top frequency instead |
+| haptic | missing | the aw8697 answers on I2C and its waveform RAM reads back correctly, but f0 calibration and playback do not pass and no vibration has been felt |
+| camera | missing | IMX582 and the rest |
+| torch | missing | the flash module is on the PMIC's SPMI and has been read, not driven |
+| wifi | missing | the QCA6390 is a PCIe endpoint behind pcie0 (stream ID 0x1c00) and the link has never trained on this SoC; hakios.wifi.c and wifi/lx in this tree are the POCO X5 Pro's (WCN6750, no PCIe) |
+| bluetooth | missing | behind the same QCA6390, so behind the same link |
+| cellular | missing | the modem is not started; hakios.mpss.c in this tree is the POCO X5 Pro's |
+| network | missing | follows wifi and cellular; nothing of iOS's networking has been reached |
+| usb | partial | the loader's USB answers xl during a run; nothing of the kernel's own |
+| sensors | missing | no accelerometer, gyroscope or ambient light |
+<!-- status:alioth end -->
 
 Two things are worth knowing before reading the port notes, because each of them has cost a night:
 
@@ -138,7 +154,7 @@ mistake: **`gpu=1` is refused there by design** -- that shorthand is the steps o
 Adreno 642L, and the SM8250's Adreno 650 has only the standalone steps 1 to 22. What works is
 
 ```sh
-DEVICE=alioth XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 rd=md0 battery=1"
+DEVICE=alioth XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 rd=md0"
 ```
 
 (`adreno_keep=1` is what keeps the GPU for the system to draw with; without it step 22 is the end

@@ -1,7 +1,18 @@
 #!/bin/bash
 # Build XNU for redwood on Linux. Extra make args are passed through.
+# "--clean" as the first argument throws BUILD/obj away first. The makefiles here decide what to
+# rebuild from a file name and a date; that much is fine for an ordinary edit, but on 2026-11-01 a
+# kernel whose source was the version that worked sat on the Apple logo, and deleting BUILD/obj and
+# rebuilding brought the desktop back with no source change at all. Why the old objects were used is
+# not established (the STAMP below only tracks ath11k.o, so it is neither the cause nor the cure).
+# The practice stands anyway: when a change does not show on the panel, or reverting a change does
+# not restore it, build with --clean before looking at the code again.
 source "$(dirname "${BASH_SOURCE[0]}")/xnu-env.sh"
 cd "$XNU_SRC" || exit 1
+if [ "$1" = "--clean" ] || [ "$1" = "clean" ]; then
+	rm -rf BUILD/obj
+	shift
+fi
 # The Wi-Fi driver's object (tools/mk-ath11k.sh) is linked into the kernel when it is there; make
 # does not see it change, so the linked kernel is thrown away when it has.
 LX=$XNUDEPS/build/ath11k/out/ath11k.o

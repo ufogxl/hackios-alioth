@@ -7,7 +7,10 @@
 **动手改任何驱动之前，先去 [`hardware.md`](hardware.md) 查那个值从哪来。** 那张表每条都注了
 来源，可信度不同（真机 dump > 入库 DTS > 公开规格）；寄存器位定义和初始化序列这类设备树里没有
 的东西来自高通的 vendor 内核源码——**公开可下载**，路径和取法在 `hardware.md` 的「厂商源码从哪来」。
-功能现状和踩坑过程在 `PROGRESS.md`。
+**现在什么能用、什么不能用，看 [`status`](status)** ——一行一个部件，只有亲眼在手机上
+看到过的才写 `works`。`README.md` 里那张表是从它生成的
+（`python3 tools/device-status.py update alioth README.md`），不要手改那张表。
+踩坑过程（为什么走到今天，以及哪些结论已经被推翻）在 `PROGRESS.md`。
 
 ## 资源在哪
 
@@ -143,14 +146,16 @@ fastboot --set-active=b             # 一行修好，不刷任何分区
 ## 常用 boot 参数
 
 ```sh
-XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 bootcpu=7 cpus=8 rd=md0 battery=1"
+XL_CMDLINE="gl=1 adreno=22 adreno_keep=1 touchscreen=1 bootcpu=7 cpus=8 rd=md0"
 ```
 
 - `gl=1 adreno=22 adreno_keep=1`：GPU 要这三个。`gpu=1` 在这台按设计被拒（那是 POCO 的
   Adreno 642L 的步骤表）；少了 `adreno_keep=1`，第 22 步做完就收摊、显示退回软件路径
 - `bootcpu=7`：内核跑在大核，loader 留在自己核上继续应答。**要在一轮中间读日志就必须带**
 - `cpufreq=1`：钉最高频，默认不带（发烫）
-- `backlight=1 backlight_arm=1`：发布 `AppleBacklight` / `AppleARMBacklight` 服务
+- `backlight=0` / `backlight_arm=0` / `backlight_dcs=0` / `battery=0`：**关掉**对应的服务。
+  这几样现在默认就发布/初始化，参数只用来关（以前是 opt-in，忘了带一个，现象和驱动坏了
+  一模一样——见 `PROGRESS.md` 2026-11-01 03:55）
 - `display_hz=60|90|120`：面板刷新率；`display_bl=1..0x7ff`：直接发一次 DCS 0x51 背光
 
 完整清单在 `docs/ru/notes.md`。

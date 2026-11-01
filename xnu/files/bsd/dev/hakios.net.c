@@ -262,8 +262,12 @@ net_ioctl(ifnet_t ifp, u_long command, void *data)
 	case SIOCDELMULTI:
 		break;                          /* the link hands us everything anyway */
 	default:
-		/* what iOS's Wi-Fi side asks of a radio's interface: bsd/dev/hakios.apple80211.c */
-		error = n->link->wireless ? hakios_apple80211_ioctl(command, data) : EOPNOTSUPP;
+		/*
+		 * What iOS's Wi-Fi side asks of a radio's interface. There is no radio here to ask:
+		 * the Wi-Fi cluster of the POCO X5 Pro is not built into this kernel (see
+		 * bsd/conf/files). The link still exists for the interfaces that do have one.
+		 */
+		error = EOPNOTSUPP;
 		break;
 	}
 	return error;

@@ -1,0 +1,33 @@
+# devices/alioth/status — what works on this phone, and how you know.
+#
+# One line per area:   <area>  <works|partial|missing>  <note>
+#
+# Only what has been seen on the phone is `works`. Written and not yet seen is `partial`, with a
+# note saying what is missing. An area with no line here is `missing`.
+#
+# The table in README.md is generated from this file:
+#
+#     python3 tools/device-status.py update alioth README.md
+#
+# Do not edit that table by hand. It drifted once already: the day after the control centre's
+# brightness slider started working, README.md still listed brightness as "the slider moves, then
+# nothing". A status written in two places drifts; one written in one place cannot.
+
+display     works    the panel's 60 Hz timing, or its 120 Hz one with display_hz=120; the picture itself stays at 60 frames a second, so the panel is not the limit
+touch       works    FT3658U, multitouch, coordinates checked against the panel
+buttons     partial  power and volume-down come through the PMIC; volume-up is not a TLMM pin and the firmware leaves it unpulled, and the PON status word reads 0x4
+cpu         works    all eight cores; bootcpu=7 on the big core; EPSS frequency scaling
+gpu         works    a real A650 through Mesa's freedreno, CoreAnimation rendered by it (gl=1 adreno=22 adreno_keep=1); no Metal
+storage     works    /private/var survives a reboot with var_store=1 ufs_write=1
+audio       partial  the ADSP's firmware loads (steps 1-2, read-only); speaker, sound and microphone are wired but not initialised
+battery     works    percentage, charging state and the charger flag from the PMIC, with no boot-arg
+thermal     missing  no thermal driver; cpufreq=1 pins the top frequency instead
+haptic      missing  the aw8697 answers on I2C and its waveform RAM reads back correctly, but f0 calibration and playback do not pass and no vibration has been felt
+camera      missing  IMX582 and the rest
+torch       missing  the flash module is on the PMIC's SPMI and has been read, not driven
+wifi        missing  the QCA6390 is a PCIe endpoint behind pcie0 (stream ID 0x1c00) and the link has never trained on this SoC; hakios.wifi.c and wifi/lx in this tree are the POCO X5 Pro's (WCN6750, no PCIe)
+bluetooth   missing  behind the same QCA6390, so behind the same link
+cellular    missing  the modem is not started; hakios.mpss.c in this tree is the POCO X5 Pro's
+network     missing  follows wifi and cellular; nothing of iOS's networking has been reached
+usb         partial  the loader's USB answers xl during a run; nothing of the kernel's own
+sensors     missing  no accelerometer, gyroscope or ambient light

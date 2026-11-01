@@ -117,10 +117,15 @@ bsd/dev/hakios.battery.c	standard
 bsd/dev/hakios.ufs.c	standard
 bsd/dev/hakios.ufshc.c	standard
 bsd/dev/hakios.net.c		standard
+bsd/dev/hakios.shared.c		standard
+# The Wi-Fi of the POCO X5 Pro (WCN6750: hakios.wifi.c, hakios.wlfw.c, hakios.lx.c,
+# hakios.sta.c, hakios.apple80211.c) is NOT built here. The K40's radio is a QCA6390 on
+# PCIe and shares no code with it, and a driver written for another phone's addresses,
+# pins and rails is the last thing this kernel should carry. The files stay in the tree
+# for the POCO's own build; hakios.net.c (en0) is the generic interface and stays here.
 bsd/dev/hakios.ipa.c		standard
 bsd/dev/hakios.cell.c		standard
 bsd/dev/hakios.virtio_net.c	standard
-bsd/dev/hakios.apple80211.c	standard
 bsd/dev/hakios.cpufreq.c	standard
 bsd/dev/hakios.adreno.c	standard
 bsd/dev/hakios.audio.c		standard
@@ -133,7 +138,6 @@ bsd/dev/hakios.camera.c	standard
 bsd/dev/hakios.mic.c		standard
 bsd/dev/hakios.display.c	standard
 bsd/dev/hakios.amp.c	standard
-bsd/dev/hakios.wifi.c		standard
 bsd/dev/hakios.adsp.c		standard
 bsd/dev/hakios.mpss.c		standard
 bsd/dev/hakios.image.c		standard
@@ -143,9 +147,6 @@ bsd/dev/hakios.apfs_check.c	optional apfs
 bsd/dev/hakios.sound.c		standard
 bsd/dev/hakios.qmi.c		standard
 bsd/dev/hakios.nas.c		standard
-bsd/dev/hakios.wlfw.c		standard
-bsd/dev/hakios.lx.c		standard
-bsd/dev/hakios.sta.c		standard
 bsd/dev/dev_perfmon.c optional config_perfmon
 
 bsd/libkern/crc32.c			standard
