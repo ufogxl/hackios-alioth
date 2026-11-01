@@ -1481,6 +1481,53 @@ control_center_fades(const char *arguments)
  */
 #define HAKIOS_TWEAK_LOADER    "/redwood/lib/libhakios.tweaks.dylib"
 
+/*
+ * Boot-args ax_rt=0|1 and ax_rm=0|1: Settings' Reduce Transparency and Reduce Motion, set as
+ * SpringBoard starts through libAccessibility's own setters, which keep them as Settings does.
+ * Without them nothing is set.
+ *
+ * Reduce Transparency puts plain colours where CoreAnimation would blur what is behind: the dock,
+ * folders, a navigation bar over a scroll view, an application opening over the home screen. The
+ * blurs are what the GPU spends most of an application's opening on (the POCO X5 Pro's port added
+ * these two for that), and on this port they are also the one explanation left for the narrow band
+ * of rubbish under the status bar that appears when a large title scrolls under it: the band is
+ * where the navigation bar's blur meets the content. ax_rt=1 is therefore the experiment: if the
+ * band goes with the blur, the blur is what draws it.
+ */
+static void
+accessibility_settings(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	static const struct {
+		const char *arg, *setter, *what;
+	} settings[] = {
+		{ "ax_rt=", "_AXSSetEnhanceBackgroundContrastEnabled", "Reduce Transparency" },
+		{ "ax_rm=", "_AXSSetReduceMotionEnabled", "Reduce Motion" },
+	};
+	void *library;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return;
+	}
+	for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); i++) {
+		const char *at = strstr(arguments, settings[i].arg);
+		void (*set)(Boolean);
+
+		if (at == NULL || (at != arguments && at[-1] != ' ')) {
+			continue;
+		}
+		if ((library = dlopen("/usr/lib/libAccessibility.dylib", RTLD_NOW)) == NULL ||
+		    (set = (void (*)(Boolean))dlsym(library, settings[i].setter)) == NULL) {
+			say("hakios: %s: no %s in libAccessibility\n", settings[i].what, settings[i].setter);
+			continue;
+		}
+		set(atoi(at + strlen(settings[i].arg)) != 0);
+		say("hakios: %s %s (%s%d)\n", settings[i].what, atoi(at + strlen(settings[i].arg)) ? "on" : "off",
+		    settings[i].arg, atoi(at + strlen(settings[i].arg)));
+	}
+}
+
 static void
 load_tweaks(void)
 {
@@ -1529,6 +1576,7 @@ hakios_springboard_init(void)
 	 * only one inserted library per program is reliable here, and SpringBoard's is this one; so
 	 * this one opens it, the way a jailbreak's own hook does.
 	 */
+	accessibility_settings();
 	load_tweaks();
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	activation = replace_method("SBLockdownManager", "_setupActivationState", 0x1c4bc8dfcUL, (IMP)setup_activation_state);

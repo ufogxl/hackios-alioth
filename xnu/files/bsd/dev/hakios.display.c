@@ -254,6 +254,46 @@ display_lines(void)
 	}
 }
 
+/*
+ * Boot-arg fb_kick=1: the framebuffer starts each frame itself instead of letting the controller
+ * re-fetch by itself.
+ *
+ * INTF_TEAR_AUTOREFRESH_CONFIG (0x6b800 + 0x2b4) reads 0x80000001 on this phone: autorefresh is on
+ * with one frame, which means the display controller reads the frame buffer whenever it likes. That
+ * is why nothing timed against it worked -- waiting for its line counter to wrap, waiting for the
+ * frame to end, starting earlier or later: the stripe under the status bar moved for none of them,
+ * because the fetch is not on a schedule we can see.
+ *
+ * With autorefresh off, nothing is read until this kernel says so: hakios_display_kick() flushes
+ * the pipe and starts it, and the framebuffer calls it once the whole frame has been written. The
+ * controller then cannot read half a frame, which is the one thing no amount of timing could
+ * promise.
+ *
+ * The same three writes that were measured harmless on 1 November: CTL_PREPARE (0x020d0), then
+ * CTL_FLUSH (0x02018) with SSPP_VIG0's bit, then CTL_START (0x0201c). The address is not touched.
+ */
+static bool kick_ready;
+
+void
+hakios_display_kick(void)
+{
+	uint32_t autorefresh;
+
+	if (!display_map()) {
+		return;
+	}
+	if (kick_ready == false) {
+		kick_ready = true;
+		autorefresh = rd(mdp + 0x6b800 + 0x2b4);
+		wr(mdp + 0x6b800 + 0x2b4, autorefresh & ~(1u << 31));
+		printf("display: autorefresh %#x -> %#x: the controller no longer fetches by itself\n",
+		    autorefresh, rd(mdp + 0x6b800 + 0x2b4));
+	}
+	wr(mdp + FLIP_CTL + 0x0d0, 1);                  /* CTL_PREPARE */
+	wr(mdp + FLIP_CTL + 0x018, 1u << 0);            /* CTL_FLUSH: SSPP_VIG0 */
+	wr(mdp + FLIP_CTL + 0x01c, 1);                  /* CTL_START */
+}
+
 static void
 flip_thread(void *parameter, __unused wait_result_t result)
 {
@@ -332,6 +372,23 @@ display_thread(void *parameter, __unused wait_result_t result)
 		return;
 	}
 	printf("display: mdss mdp %#lx, dsi0 %#lx, dsi0 phy %#lx, disp_cc %#lx\n", mdp, dsi, phy, dcc);
+	/*
+	 * INTF_TEAR_AUTOREFRESH_CONFIG's bit 31 back on, every boot: it is what makes the controller
+	 * fetch frames at all, and nothing else here turns it on. fb_kick=1 turns it off to try driving
+	 * frames ourselves, and that setting outlives the kernel -- a run only replaces the kernel, the
+	 * display controller keeps its registers until the phone is power-cycled -- so a run that tried
+	 * fb_kick and died left the panel showing nothing for every run after it. Restoring it here
+	 * makes that mistake cost one reboot of the kernel rather than one of the phone.
+	 */
+	{
+		uint32_t cfg = rd(mdp + 0x6b800 + 0x2b4);
+
+		if ((cfg & (1u << 31)) == 0) {
+			wr(mdp + 0x6b800 + 0x2b4, cfg | (1u << 31));
+			printf("display: autorefresh %#x -> %#x: the controller fetches frames again\n",
+			    cfg, rd(mdp + 0x6b800 + 0x2b4));
+		}
+	}
 	printf("display: mdp HW_VERSION %#x, HW_INTR_STATUS %#x\n", rd(mdp + 0x0000), rd(mdp + 0x0010));
 	/*
 	 * The DSI host's first words. Hardware versions of this block put the version and the status

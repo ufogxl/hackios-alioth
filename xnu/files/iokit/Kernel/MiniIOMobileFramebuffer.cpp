@@ -191,6 +191,15 @@ static TUNABLE(uint32_t, gFetchAlign, "fb_fetch_align", 2);
  * this is what says whether they do.
  */
 static TUNABLE(uint32_t, gLogLayers, "fb_log_layers", 0);
+/*
+ * Boot-arg fb_kick=1: tell the display controller to fetch the frame once it has all been written,
+ * instead of letting it fetch whenever it likes (fb_kick, see hakios.display.c). What it buys: the
+ * controller cannot read a half-written frame. What it risks: if the start is not taken, the panel
+ * keeps showing what it has -- a frozen screen, and a reboot.
+ */
+static TUNABLE(uint32_t, gKick, "fb_kick", 0);
+
+extern "C" void hakios_display_kick(void);          /* (bsd/dev/hakios.display.c) */
 
 extern "C" uint32_t hakios_display_line(void);      /* (bsd/dev/hakios.display.c) */
 /*
@@ -1278,6 +1287,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				}
 			}
 		}
+	}
+	if (gKick) {
+		hakios_display_kick();
 	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
