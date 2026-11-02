@@ -1920,6 +1920,83 @@ step_endpoint_polarity(void)
 #undef PIN_IO
 }
 
+/*
+ * Step 28: the endpoint's configuration space, reached the way this controller reaches it.
+ *
+ * The link is at L0 (step 27), and 0x60200000 still read 0xffffffff -- because on this IP the
+ * configuration window is not an ECAM: a read has to go through the address translation unit's
+ * region 0, which is what msm_pcie_cfg_bdf() programs before every access
+ * (pci-msm.c:3060-3085):
+ *
+ *	msm_pcie_iatu_config(dev, 0, bus == 1 ? CFG0 : CFG1,
+ *	                     conf->start, conf->start + 4K - 1, BDF_OFFSET(bus, devfn));
+ *	... and then the register is read at conf->start + (offset & 0xfff)
+ *
+ * with BDF_OFFSET(bus, devfn) = (bus << 24) | (devfn << 16), the region's ctrl1 = 4 for a bus-1
+ * target (5 for anything further), and ctrl2's bit 31 enabling the region after it is written.
+ *
+ * So: region 0 is aimed at bus 1, device 0, function 0; the window at 0x60100000 (4 KB of it) is
+ * then the endpoint's configuration space, and the vendor and device ids at its offset 0 are the
+ * answer to whether the QCA6390 (17cb:1101) is on the other end of this link.
+ */
+#define IATU_PHYS       0x60001000UL
+#define IATU_SIZE       0x00001000UL
+#define CONF_PHYS       0x60100000UL
+#define CONF_SIZE       0x00001000UL
+#define BDF(bus, devfn) (((uint32_t)(bus) << 24) | ((uint32_t)(devfn) << 16))
+
+static void
+iatu_region0(vm_offset_t iatu, uint32_t type, uint32_t host, uint32_t host_end, uint32_t target)
+{
+	wr(iatu + 0x04, 0);                     /* (the region is switched off before it changes) */
+	wr(iatu + 0x00, type);
+	wr(iatu + 0x08, host);
+	wr(iatu + 0x0c, 0);
+	wr(iatu + 0x10, host_end);
+	wr(iatu + 0x14, target);
+	wr(iatu + 0x18, 0);
+	wr(iatu + 0x04, 1u << 31);              /* (and on again) */
+}
+
+static void
+step_endpoint_config(void)
+{
+	vm_offset_t iatu, conf;
+	uint32_t id;
+
+	if (parf == 0) {
+		tell("pcie: 28: no parf window\n");
+		return;
+	}
+	if ((rd(parf + PARF_LTSSM) & 0x3f) != 0x11) {
+		tell("pcie: 28: the link is not in L0 (state %#x); the configuration space will not answer\n",
+		    rd(parf + PARF_LTSSM) & 0x3f);
+	}
+	iatu = ml_io_map(IATU_PHYS, IATU_SIZE);
+	conf = ml_io_map(CONF_PHYS, CONF_SIZE);
+	if (iatu == 0 || conf == 0) {
+		tell("pcie: 28: the iatu (%#lx) or the conf window (%#lx) could not be mapped\n",
+		    (unsigned long) IATU_PHYS, (unsigned long) CONF_PHYS);
+		return;
+	}
+	iatu_region0(iatu, 0x04, CONF_PHYS, CONF_PHYS + 0xfff, BDF(1, 0));    /* (type 4: a bus-1 target) */
+	tell("pcie: 28: iatu region 0 for bus 1 dev 0: ctrl1 %#x, lbar %#x, lar %#x, ltar %#x, ctrl2 %#x\n",
+	    rd(iatu + 0x00), rd(iatu + 0x08), rd(iatu + 0x10), rd(iatu + 0x14), rd(iatu + 0x04));
+
+	id = rd(conf + 0x00);
+	tell("pcie: 28: endpoint 01:00.0: id %#x (vendor %#x, device %#x)%s\n", id, id & 0xffff, id >> 16,
+	    (id == 0xffffffffu) ? " -- nothing answered" : "");
+	if (id == 0xffffffffu) {
+		return;
+	}
+	tell("pcie: 28:   command/status %#x, revision/class %#x, header %#x, cache/latency/type/bist %#x\n",
+	    rd(conf + 0x04), rd(conf + 0x08), rd(conf + 0x0c), rd(conf + 0x0c));
+	for (unsigned b = 0; b < 6; b++) {
+		tell("pcie: 28:   bar%u = %#x\n", b, rd(conf + 0x10 + 4 * b));
+	}
+	tell("pcie: 28:   subsystem id %#x, cap pointer %#x\n", rd(conf + 0x2c), rd(conf + 0x34));
+}
+
 static void
 step_setup(uint32_t steps)
 {
@@ -2061,6 +2138,9 @@ step_setup(uint32_t steps)
 	}
 	if (steps >= 27) {
 		step_endpoint_polarity();
+	}
+	if (steps >= 28) {
+		step_endpoint_config();
 	}
 }
 

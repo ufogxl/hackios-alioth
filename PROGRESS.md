@@ -5927,3 +5927,59 @@ bus 号）加 `msm_pcie_iatu_config`，我们两件都没做。下一步：
   免得瞬间驱动错电平。第 27 步已经这么写了。
 - 他们的进度停在第 5 步（PARF 访问挂死），根因是 `gcc_pcie_0_aux_clk_src`（0x6b038）从未配置；
   我们这边 aux 分支一直是好的（第 2 步），所以他们卡住的地方我们不受影响。
+
+---
+
+## 23:30–23:40 配置空间通了：QCA6390 在总线上应答
+
+### 第 28 步：iATU region 0
+
+链路 L0 之后 `0x60200000` 仍是 `0xffffffff`，原因是这块 IP 的配置空间**不是 ECAM**：
+每次访问前都要把地址翻译单元（iATU）的 region 0 对准目标 BDF，然后在 conf 窗口的**低 4 KB**
+里读。vendor 的 `msm_pcie_cfg_bdf()`（`pci-msm.c:3060-3085`）就是干这个：
+
+```c
+msm_pcie_iatu_config(dev, 0, bus == 1 ? CFG0 : CFG1,
+                     conf->start, conf->start + SZ_4K - 1, BDF_OFFSET(bus, devfn));
+/* 之后读 conf->start + (offset & 0xfff) */
+```
+
+其中 `BDF_OFFSET(bus, devfn) = (bus << 24) | (devfn << 16)`，region 的 `ctrl1` = 4（目标是 bus 1）
+或 5（更远的 bus），`ctrl2` 的 bit31 在写完其余字段后置起以启用该 region。
+
+照做：
+
+```
+pcie: 28: iatu region 0 for bus 1 dev 0: ctrl1 0x4, lbar 0x60100000, lar 0x60100fff, ltar 0x1000000, ctrl2 0x80000000
+pcie: 28: endpoint 01:00.0: id 0x110117cb (vendor 0x17cb, device 0x1101)
+pcie: 28:   command/status 0x100000, revision/class 0x2800001, subsystem id 0x10817cb, cap pointer 0x40
+pcie: 28:   bar0 = 0x4, bar1..bar5 = 0
+```
+
+**`17cb:1101` 就是 QCA6390**，它已经在总线上应答了。这一条打通了"控制器→链路→端点"的整条链：
+
+| 环节 | 状态 |
+|---|---|
+| GDSC / 时钟 / 复位 / PARF | ✅ |
+| PHY 序列 + ready | ✅ |
+| 四路电源（RPMh 投票） | ✅ 12 条请求全部有应答 |
+| WLAN_EN / PERST#（低有效！）/ ELBI LT_ENABLE | ✅ |
+| 链路 **L0** | ✅ `ltssm 0x111`、`debug1` bit4、`dbi link` bit29 |
+| 端点配置空间 | ✅ `17cb:1101`（iATU region 0 + conf 窗口低 4 KB） |
+
+### 下一步（驱动方向，不是寄存器方向了）
+
+1. **BAR**：`bar0 = 0x4` 是 64 位 memory BAR（type = 2）。要写全 1 探测尺寸，再分配一段物理地址
+   （vendor 用 `mem` 窗口 `0x60300000` + 0x3d00000），并在 iATU 里配一条 memory outbound。
+2. **MEM_EN / BUS_MASTER**：`command` 现在只有 `0x100000`（第 20 位 = cap list 相关），要置 bit1/bit2。
+3. **MSI**：QCA6390 用 MSI（`mhi,m2-no-db-access`），要配 RC 的 MSI 控制器并把中断接到 SPI。
+4. **MHI / QMI / 固件**：`fw-wifi/` 目前是空的，需要从手机 `/vendor/firmware_mnt/image/`
+   取 `qca6390` 那一套（`amss.bin`、`bdwlan.bin`、`m3.bin` 等）。
+5. **驱动层**：QCA6390 是 **ath11k**，UniXNU 只有 `Ath12kWifi`（WCN7850/QCN9274），要自己写或改。
+
+### 这一轮的方法学收获
+
+- **另一个移植的一句话，抵得上我们十轮试验。** `MrMoxing/ios-alioth` 的 PERST# 极性说明直接
+  终结了"链路时灵时不灵"这个假问题；mainline 的 `qcom_pcie_2_1_0_ltssm_enable` 给了
+  `ELBI_SYS_CTRL` bit0；mainline 的 `msm_pcie_cfg_bdf` 给了 iATU 配置方式。
+- 搜索方式：GitHub 代码搜索（带 token）搜 `alioth_pcie`、`PARF_LTSSM`，比按仓库名找有效得多。
