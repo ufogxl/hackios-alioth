@@ -1811,6 +1811,115 @@ out:
 	;
 }
 
+/*
+ * Step 27: the endpoint brought out of reset, which is what every step before this one got wrong.
+ *
+ * Two corrections, both from other alioth ports rather than from this file's own reasoning:
+ *
+ * 1. PERST# is active low. The vendor's GPIO table (pci-msm.c:939) has "on" = 1 for perst, and its
+ *    assert is `gpio_set_value(num, on)`, so *asserted is a low level and released is a high one* --
+ *    MrMoxing/ios-alioth's alioth_pcie.c:126-132 says it in as many words, and the PCIe reset line is
+ *    named PERST# for that reason. Every step here before now drove the line high to "assert" and low
+ *    to "release", which held the QCA6390 in reset while the controller was told to train. The one
+ *    boot that reached L0 is the one where step 19's second polarity attempt left the line high.
+ *
+ * 2. ELBI_SYS_CTRL bit 0 is ELBI_SYS_CTRL_LT_ENABLE -- "enable link training" -- and nothing in this
+ *    file ever wrote it (pcie-qcom.c:287-293, qcom_pcie_2_1_0_ltssm_enable).
+ *
+ * The order is the vendor's: hold the endpoint in reset while everything comes up, then power (done),
+ * then WLAN_EN, then release the reset, then enable the link, then look at the core's port debug
+ * registers -- 0x72c bit 4 is LINK_UP and bit 5 is LINK_IN_TRAINING, which is what mainline's
+ * dw_pcie_link_up() actually reads.
+ */
+#define DBI_PORT_DEBUG0         0x0728
+#define DBI_PORT_DEBUG1         0x072c
+#define DBI_PORT_DEBUG1_LINK_UP (1u << 4)
+#define DBI_PORT_DEBUG1_IN_TRAIN (1u << 5)
+
+static bool
+link_up_now(void)
+{
+	uint32_t debug1 = rd(dbi + DBI_PORT_DEBUG1);
+	uint32_t link = rd(dbi + DBI_LINK_CTRL_STATUS);
+
+	return (rd(parf + PARF_LTSSM) & 0x3f) == 0x11 ||
+	    (debug1 & DBI_PORT_DEBUG1_LINK_UP) != 0 ||
+	    (link != 0xffffffffu && ((link >> 29) & 1) != 0);
+}
+
+static void
+step_endpoint_polarity(void)
+{
+	vm_offset_t tlmm;
+	uint32_t now;
+	unsigned i;
+
+	if (parf == 0 || dbi == 0 || elbi == 0) {
+		tell("pcie: 27: a window is missing\n");
+		return;
+	}
+	tlmm = ml_io_map(0x0f900000UL, 0x0007d000UL);
+	if (tlmm == 0) {
+		tell("pcie: 27: the north tile could not be mapped\n");
+		return;
+	}
+#define PIN_CFG(n)      (tlmm + 0x1000 * (n))
+#define PIN_IO(n)       (tlmm + 0x1000 * (n) + 4)
+	/* perst: the level first, then the pin made an output -- it must never drive the wrong one. */
+	wr(PIN_IO(79), 0);                               /* (asserted: low) */
+	wr(PIN_CFG(79), 0x200);                          /* (output, 2 mA, no pull) */
+	wr(PIN_CFG(20), 0x3c3);                          /* (wlan-en: gpio, 16 mA, pull-up, output) */
+	tell("pcie: 27: perst asserted (low, level %u) -- the endpoint is held in reset\n", rd(PIN_IO(79)) & 1);
+	delay_for_interval(10000, NSEC_PER_USEC);
+
+	wr(PIN_IO(20), rd(PIN_IO(20)) & ~2u);
+	delay_for_interval(20000, NSEC_PER_USEC);
+	wr(PIN_IO(20), rd(PIN_IO(20)) | 2u);
+	tell("pcie: 27: wlan-en low 20 ms then high (level %u); 50 ms for the chip's own PMU\n",
+	    rd(PIN_IO(20)) & 1);
+	delay_for_interval(50000, NSEC_PER_USEC);
+
+	wr(PIN_IO(79), 2);
+	tell("pcie: 27: perst RELEASED (high, level %u); 1 ms, then the link\n", rd(PIN_IO(79)) & 1);
+	delay_for_interval(1000, NSEC_PER_USEC);
+
+	now = rd(elbi + ELBI_SYS_CTRL);
+	wr(elbi + ELBI_SYS_CTRL, now | 1u);
+	tell("pcie: 27: elbi sys_ctrl %#x -> %#x (LT_ENABLE), port debug1 %#x\n", now, rd(elbi + ELBI_SYS_CTRL),
+	    rd(dbi + DBI_PORT_DEBUG1));
+	now = rd(parf + PARF_LTSSM);
+	wr(parf + PARF_LTSSM, (now & ~(1u << 11) & ~(1u << 10)) | (1u << 8));
+	tell("pcie: 27: parf ltssm %#x -> %#x\n", now, rd(parf + PARF_LTSSM));
+
+	for (i = 1; i <= 40; i++) {
+		delay_for_interval(20000, NSEC_PER_USEC);
+		now = rd(parf + PARF_LTSSM);
+		if (link_up_now()) {
+			break;
+		}
+		if ((i % 5) == 0) {
+			tell("pcie: 27:   try %u: ltssm %#x (state %#x, flush %u), debug0 %#x, debug1 %#x, dbi link %#x\n",
+			    i, now, now & 0x3f, (now >> 11) & 1, rd(dbi + DBI_PORT_DEBUG0), rd(dbi + DBI_PORT_DEBUG1),
+			    rd(dbi + DBI_LINK_CTRL_STATUS));
+		}
+	}
+	now = rd(parf + PARF_LTSSM);
+	tell("pcie: 27: after %u tries: ltssm %#x (state %#x, flush %u), debug0 %#x, debug1 %#x, dbi link %#x\n", i, now,
+	    now & 0x3f, (now >> 11) & 1, rd(dbi + DBI_PORT_DEBUG0), rd(dbi + DBI_PORT_DEBUG1),
+	    rd(dbi + DBI_LINK_CTRL_STATUS));
+	if (link_up_now()) {
+		vm_offset_t ep = ml_io_map(ECAM_EP_PHYS, 0x00010000UL);
+
+		tell("pcie: 27: LINK IS UP (state %#x)\n", now & 0x3f);
+		if (ep != 0) {
+			tell("pcie: 27: endpoint 0x60200000: id %#x (vendor %#x, device %#x), class %#x, bar0 %#x\n",
+			    rd(ep), rd(ep) & 0xffff, rd(ep) >> 16, rd(ep + 0x08), rd(ep + 0x10));
+		}
+	}
+#undef PIN_CFG
+#undef PIN_IO
+}
+
 static void
 step_setup(uint32_t steps)
 {
@@ -1930,14 +2039,28 @@ step_setup(uint32_t steps)
 	if (steps >= 23) {
 		step_config();
 	}
-	if (steps >= 24) {
-		step_link_final();
+	{
+		/*
+		 * Steps 24 to 26 keep the old PERST polarity and only make sense as evidence; they are
+		 * opt-in so that a step 27 run is not spent on them (each of them loops for seconds).
+		 */
+		uint32_t legacy = 0;
+
+		PE_parse_boot_argn("pcie_legacy", &legacy, sizeof(legacy));
+		if (legacy != 0) {
+			if (steps >= 24) {
+				step_link_final();
+			}
+			if (steps >= 25) {
+				step_flush_proper();
+			}
+			if (steps >= 26) {
+				step_endpoint_attempts();
+			}
+		}
 	}
-	if (steps >= 25) {
-		step_flush_proper();
-	}
-	if (steps >= 26) {
-		step_endpoint_attempts();
+	if (steps >= 27) {
+		step_endpoint_polarity();
 	}
 }
 

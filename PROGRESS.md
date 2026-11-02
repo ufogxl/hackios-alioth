@@ -5857,3 +5857,73 @@ active**。这是这条线第一次真正训起来。
 不稳定出在**端点侧的上电/时钟余量**，不在控制器：同一份序列有时第一次就 L0，有时从头到尾停在
 Detect。下一步应当把"复位后等多久"和"EN 之后等多久"做成可用启动参数扫的（`pci_wait=`），
 一次冷启动扫一组，而不是每轮改代码。
+
+---
+
+## 23:20–23:30 找到根因：PERST# 极性反了（另一个 alioth 项目给的答案）
+
+### 来源
+
+GitHub 代码搜索 `alioth_pcie` 找到另一个 K40 移植：**`MrMoxing/ios-alioth`**（2026-11-01 更新），
+它的 `src/hackios-xnu-kernel-main/xnu/files/bsd/dev/alioth_pcie.c:126-132` 写着：
+
+> PERST: the endpoint's reset line is TLMM gpio 79 … but the vendor driver's table has perst on = 0
+> -- **asserted is a low level, released a high one**.
+
+对照 vendor（`pci-msm.c:939`）：`{"perst-gpio", 0, 1, ...}` 里的 `on = 1`，
+而“assert”是 `gpio_set_value(num, on)` —— 也就是说 `on` 被当作**电平取反**用；PERST# 本身是
+低有效，复位时拉低、释放时拉高。
+
+**我们从第 13 步起一直拉高当"复位"、拉低当"释放"，等于整场把 QCA6390 按在复位里。**
+回头看两条证据完全吻合：唯一两次"起来"的轮次，都是 step 19 第二遍极性把线留在了**高**。
+
+第二个修正来自 mainline `pcie-qcom.c:287-293`：
+
+```c
+static void qcom_pcie_2_1_0_ltssm_enable(struct qcom_pcie *pcie)
+{
+	val = readl(pcie->elbi + ELBI_SYS_CTRL);
+	val |= ELBI_SYS_CTRL_LT_ENABLE;      /* bit 0: 开启链路训练 */
+	writel(val, pcie->elbi + ELBI_SYS_CTRL);
+}
+```
+
+我们从来没写过 `ELBI_SYS_CTRL` bit0。
+
+### 第 27 步（正确顺序）的实测
+
+```
+pcie: 27: perst asserted (low, level 0) -- the endpoint is held in reset
+pcie: 27: wlan-en low 20 ms then high (level 1); 50 ms for the chip's own PMU
+pcie: 27: perst RELEASED (high, level 1); 1 ms, then the link
+pcie: 27: elbi sys_ctrl 0 -> 0 (LT_ENABLE), port debug1 0x8200000
+pcie: 27: parf ltssm 0x100 -> 0x100
+pcie: 27: after 1 tries: ltssm 0x111 (state 0x11, flush 0), debug0 0x3983311, debug1 0x8000010, dbi link 0xb0120008
+pcie: 27: LINK IS UP (state 0x11)
+```
+
+- `state 0x11` = **L0**；
+- `debug1 = 0x8000010`，bit4 = `PCIE_PORT_DEBUG1_LINK_UP`（mainline `dw_pcie_link_up()` 用的正是这个）；
+- `dbi link = 0xb0120008`，bit29 data link active；
+- **第一次轮询就到位**，冷启动第一轮就成功，不再靠运气。
+
+（顺带：`elbi sys_ctrl` 写 1 读回仍是 0 —— 这个 IP 上 ELBI 的 bit0 可能只写不读回，但写它无害。）
+
+### 还差一步：配置空间还没通
+
+端点 ECAM（bus 1 = `0x60200000`）读回仍是 `0xffffffff`。链路是 L0 了，但**根桥的
+secondary bus 号和 iATU 还没配** —— vendor 里这是 `msm_pcie_config_controller`（写 type-1 头的
+bus 号）加 `msm_pcie_iatu_config`，我们两件都没做。下一步：
+
+1. 写 RC 自己的配置空间（DBI）偏移 `0x18`：primary 0 / secondary 1 / subordinate 1；
+2. 读回 iATU（`0x60001000`）的现状，按 vendor 的值配一条 outbound（config 与 memory）；
+3. 再读 `0x60200000`，期望 `17cb:1101`。
+
+### 记录
+
+- 我们这棵树里 `hakios.wifi.c` 的 wlan-en/tlmm 基址是错的（真值：pin 20、NORTH `0x0f900000`），
+  这次没动它，只用 `hakios.pcie.c` 自己的引脚代码。
+- `MrMoxing/ios-alioth` 的另一条经验也值得抄：写 GPIO 电平要在把 pin 配成输出**之前**做，
+  免得瞬间驱动错电平。第 27 步已经这么写了。
+- 他们的进度停在第 5 步（PARF 访问挂死），根因是 `gcc_pcie_0_aux_clk_src`（0x6b038）从未配置；
+  我们这边 aux 分支一直是好的（第 2 步），所以他们卡住的地方我们不受影响。
