@@ -5815,3 +5815,45 @@ active**。这是这条线第一次真正训起来。
 3. 记一笔坑：`hakios.wifi.c` 里 wlan-en 用的 tlmm 84 和基址 `0xf100000` 都是错的（真值：pin 20，
    NORTH tile `0x0f900000`）；`hakios.adreno.c` 里那份 cmd-db 解析和新加的 `hakios.rpmh.c` 有重复，
    以后可以合并。
+
+---
+
+## 23:00–23:20 L0 出现过两次，但不稳定；顺手纠正了 flush 的语义
+
+### flush 的正确用法
+
+`pci-msm.c:5463-5472` 的 `msm_pcie_linkdown_recovery` 给出真正的做法：
+
+1. 先等 `PARF_STATUS` bit8 `FLUSH_COMPLETED`；
+2. 再 `write_mask(PARF_LTSSM, 0, SW_CLR_FLUSH_MODE)` —— 也就是**把 bit10 置 1**（它是一个"请清
+   flush"的脉冲，不是要清的位）；
+3. 然后等 `FLUSH_MODE`（bit11）自己清掉。
+
+我们之前一直把 bit10/bit11 一起**清零**，方向是反的。改成 vendor 的写法后 bit11 确实清了，
+但状态仍停在 0x5，说明 flush 只是症状之一。
+
+### 两次"起来"
+
+| 轮次 | 读数 | 含义 |
+|---|---|---|
+| 23:04（`pcie_step=22`） | `parf ltssm 0x111`, `dbi link 0xb0120008`（active=1） | **真正进了 L0** |
+| 23:11（`pcie_step=24`，冷复位后） | `parf ltssm 0x10d`, `dbi link 0xb8120008`（active=1） | 停在 Configuration，还没到 L0，但链路已经是活的 |
+
+其余约八轮（含冷复位）都退回 `0x905`（state 5 + flush）或 `0x100`（state 0）。所以现在是
+"能训起来，但不可复现"，约 2/10。
+
+### 已经排除的
+
+- 电源：四路都投上了（`smpa6` 同时是 aon 和 dig）。
+- WLAN_EN / PERST#：两种极性、多种延时（20/50/100/150 ms）都试过。
+- PHY：掉电位方向已确认（3 = 上电），且 PHY 一直报 ready。
+- vendor 的七条 dm_core 写：全部生效（`gen3_spcie_cap` 写 0x55555555）。
+- aux 时钟频率寄存器（`0xb40`）：读回一直是 `0x14`，本来就是对的。
+- 端点配置空间（ECAM `0x60200000`）：读机制通，但链路没进 L0 时全是 `0xffffffff`；而且
+  `0xffffffff` 的 bit29 恰好是 1，所以"link active"这个判据必须同时排除 `0xffffffff`。
+
+### 现在的怀疑
+
+不稳定出在**端点侧的上电/时钟余量**，不在控制器：同一份序列有时第一次就 L0，有时从头到尾停在
+Detect。下一步应当把"复位后等多久"和"EN 之后等多久"做成可用启动参数扫的（`pci_wait=`），
+一次冷启动扫一组，而不是每轮改代码。

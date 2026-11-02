@@ -1556,6 +1556,261 @@ step_config(void)
 	}
 }
 
+/*
+ * Step 24: the endpoint brought up once, in one place, in the order the vendor keeps -- with the
+ * delays it actually needs rather than the shortest that compiled.
+ *
+ * The one boot that reached L0 did it on the first try, and the boots after it did not, which is
+ * the signature of a sequence that is right but has no margin: 5 ms between the rails and WLAN_EN,
+ * 10 ms between WLAN_EN and PERST#. The vendor's own driver waits 1 ms for PERST# propagation, 10
+ * ms for the endpoint's latency (qcom,ep-latency), and the chip's own spec sheet wants tens of
+ * milliseconds after its enable. So: rails, 100 ms, WLAN_EN low then high, 50 ms, PERST# asserted
+ * for 20 ms and released, 20 ms, and only then the LTSSM.
+ *
+ * The flush bit is the other half. The state machine sets it again every time it is asked to start
+ * and the endpoint does not answer in time, and a flushed link sends no detect pulse at all -- so
+ * the trigger here clears it, enables, and if the state has not moved by the next round, clears it
+ * again rather than waiting for a state machine that is not running.
+ */
+#define ECAM_EP_PHYS    0x60200000UL    /* (dt: ranges map bus 1 here) */
+
+static void
+step_link_final(void)
+{
+	vm_offset_t tlmm;
+	uint32_t now;
+	unsigned i;
+
+	if (parf == 0 || dbi == 0 || elbi == 0) {
+		tell("pcie: 24: a window is missing\n");
+		return;
+	}
+	tlmm = ml_io_map(0x0f900000UL, 0x0007d000UL);
+	if (tlmm == 0) {
+		tell("pcie: 24: the north tile could not be mapped\n");
+		return;
+	}
+#define PIN_CFG(n)      (tlmm + 0x1000 * (n))
+#define PIN_IO(n)       (tlmm + 0x1000 * (n) + 4)
+	tell("pcie: 24: waiting 100 ms for the rails before touching the endpoint's pads\n");
+	delay_for_interval(100000, NSEC_PER_USEC);
+	wr(PIN_CFG(20), 0x3c3);                         /* (wlan-en: gpio, 16 mA, pull-up, output) */
+	wr(PIN_IO(20), rd(PIN_IO(20)) & ~2u);
+	delay_for_interval(20000, NSEC_PER_USEC);
+	wr(PIN_IO(20), rd(PIN_IO(20)) | 2u);
+	tell("pcie: 24: wlan-en low 20 ms, then high (level %u); 50 ms for the chip\n", rd(PIN_IO(20)) & 1);
+	delay_for_interval(50000, NSEC_PER_USEC);
+	wr(PIN_CFG(79), 0x200);                         /* (perst: an output, 2 mA, no pull) */
+	wr(PIN_IO(79), 2);
+	delay_for_interval(20000, NSEC_PER_USEC);
+	wr(PIN_IO(79), 0);
+	tell("pcie: 24: perst asserted 20 ms and released (level %u); 20 ms, then the ltssm\n",
+	    rd(PIN_IO(79)) & 1);
+	delay_for_interval(20000, NSEC_PER_USEC);
+
+	for (i = 1; i <= 40; i++) {
+		now = rd(parf + PARF_LTSSM);
+		if ((now & 0x3f) == 0x11) {
+			break;
+		}
+		if ((now & (1u << 11)) != 0) {
+			wr(parf + PARF_LTSSM, (now & ~(1u << 11) & ~(1u << 10)) | (1u << 8));
+		}
+		delay_for_interval(20000, NSEC_PER_USEC);
+		now = rd(parf + PARF_LTSSM);
+		tell("pcie: 24:   try %u: parf ltssm %#x (state %#x, flush %u), dbi link %#x\n", i, now, now & 0x3f,
+		    (now >> 11) & 1, rd(dbi + DBI_LINK_CTRL_STATUS));
+	}
+	now = rd(parf + PARF_LTSSM);
+	if ((now & 0x3f) != 0x11 && ((rd(dbi + DBI_LINK_CTRL_STATUS) >> 29) & 1) == 0) {
+		tell("pcie: 24: still down after 30 rounds: state %#x, flush %u, dbi link %#x\n", now & 0x3f,
+		    (now >> 11) & 1, rd(dbi + DBI_LINK_CTRL_STATUS));
+		return;
+	}
+	tell("pcie: 24: LINK UP: parf ltssm %#x (state %#x), dbi link ctrl/status %#x (speed %#x, width %#x, active %u)\n",
+	    now, now & 0x3f, rd(dbi + DBI_LINK_CTRL_STATUS), rd(dbi + DBI_LINK_CTRL_STATUS) & 0xf,
+	    (rd(dbi + DBI_LINK_CTRL_STATUS) >> 4) & 0x3f, (rd(dbi + DBI_LINK_CTRL_STATUS) >> 29) & 1);
+	{
+		vm_offset_t ep = ml_io_map(ECAM_EP_PHYS, 0x00010000UL);
+
+		if (ep == 0) {
+			tell("pcie: 24: the endpoint's configuration window could not be mapped\n");
+			return;
+		}
+		tell("pcie: 24: endpoint 0x60200000: id %#x (vendor %#x, device %#x), class %#x\n", rd(ep), rd(ep) & 0xffff,
+		    rd(ep) >> 16, rd(ep + 0x08));
+		tell("pcie: 24:   command/status %#x, header %#x, bar0 %#x, bar1 %#x\n", rd(ep + 0x04), rd(ep + 0x0c),
+		    rd(ep + 0x10), rd(ep + 0x14));
+	}
+#undef PIN_CFG
+#undef PIN_IO
+}
+
+/*
+ * Step 25: the flush, cleared the way the vendor clears it.
+ *
+ * Every step since 21 has been writing `(ltssm & ~BIT(11)) & ~BIT(10)` and expecting the state
+ * machine to run. pci-msm.c:5463-5472 shows that this is backwards:
+ *
+ *	msm_pcie_write_mask(dev->parf + PCIE20_PARF_LTSSM, 0, SW_CLR_FLUSH_MODE);
+ *	... wait for FLUSH_MODE to clear ...
+ *
+ * write_mask(addr, mask, val) is `(read & ~mask) | val`, so that call *sets* bit 10 -- SW_CLR_FLUSH_MODE
+ * is a pulse that asks the hardware to clear bit 11, it is not a bit to clear. Writing zero into it
+ * asks for nothing, which is why the state kept reading 0x905 a millisecond later.
+ *
+ * The vendor also waits first: the flush has to have finished (PARF_STATUS bit 8, FLUSH_COMPLETED)
+ * before it is cleared. All three of those are done here, in that order, then LTSSM is enabled and
+ * the state is read until it moves.
+ */
+static void
+step_flush_proper(void)
+{
+	uint32_t status, now;
+	unsigned i, done;
+
+	status = 0;
+	for (i = 0; i < 200; i++) {
+		status = rd(parf + PARF_STATUS);
+		if (status & (1u << 8)) {                       /* (FLUSH_COMPLETED) */
+			break;
+		}
+		delay_for_interval(10, NSEC_PER_USEC);
+	}
+	tell("pcie: 25: parf status %#x, flush completed %s (after %u tries)\n", status, (status & (1u << 8)) ? "yes" : "NOT",
+	    i);
+	now = rd(parf + PARF_LTSSM);
+	tell("pcie: 25: ltssm before %#x (state %#x, flush %u)\n", now, now & 0x3f, (now >> 11) & 1);
+	wr(parf + PARF_LTSSM, (now & ~(1u << 11)) | (1u << 10) | (1u << 8));   /* SW_CLR_FLUSH_MODE, then LTSSM_EN */
+	for (done = 0, i = 0; i < 200; i++) {
+		now = rd(parf + PARF_LTSSM);
+		if ((now & (1u << 11)) == 0) {
+			done = 1;
+			break;
+		}
+		delay_for_interval(10, NSEC_PER_USEC);
+	}
+	tell("pcie: 25: ltssm after %#x (state %#x, flush %u): flush %s after %u tries\n", now, now & 0x3f,
+	    (now >> 11) & 1, done ? "cleared" : "STILL SET", i);
+	if (!done) {
+		return;
+	}
+	for (i = 1; i <= 30; i++) {
+		now = rd(parf + PARF_LTSSM);
+		if ((now & 0x3f) == 0x11 || ((rd(dbi + DBI_LINK_CTRL_STATUS) >> 29) & 1) != 0) {
+			tell("pcie: 25: LINK UP after %u tries: parf ltssm %#x (state %#x), dbi link %#x (active %u)\n", i, now,
+			    now & 0x3f, rd(dbi + DBI_LINK_CTRL_STATUS), (rd(dbi + DBI_LINK_CTRL_STATUS) >> 29) & 1);
+			{
+				vm_offset_t ep = ml_io_map(ECAM_EP_PHYS, 0x00010000UL);
+
+				if (ep != 0) {
+					tell("pcie: 25: endpoint: id %#x (vendor %#x, device %#x), class %#x, bar0 %#x\n", rd(ep),
+					    rd(ep) & 0xffff, rd(ep) >> 16, rd(ep + 0x08), rd(ep + 0x10));
+				}
+			}
+			return;
+		}
+		if ((i % 5) == 0) {
+			tell("pcie: 25:   try %u: parf ltssm %#x (state %#x, flush %u), dbi link %#x\n", i, now, now & 0x3f,
+			    (now >> 11) & 1, rd(dbi + DBI_LINK_CTRL_STATUS));
+		}
+		delay_for_interval(5000, NSEC_PER_USEC);
+	}
+	tell("pcie: 25: end: state %#x, flush %u, dbi link ctrl/status %#x\n", rd(parf + PARF_LTSSM) & 0x3f,
+	    (rd(parf + PARF_LTSSM) >> 11) & 1, rd(dbi + DBI_LINK_CTRL_STATUS));
+}
+
+/*
+ * Step 26: the endpoint tried three times in one boot, and the link state judged honestly.
+ *
+ * Step 25 cleared the flush the vendor's way -- a pulse into SW_CLR_FLUSH_MODE -- and the bit did
+ * clear, but the state stayed at 5. Step 21 cleared bit 11 directly and the state went to 0. Both
+ * are true, so this step does the direct clear that moved it, and judges the result on a register
+ * that cannot lie: 0xffffffff has bit 29 set, so "active" from the DBI's link word means nothing
+ * unless the read itself succeeded.
+ *
+ * The three attempts exist because the one boot that reached L0 did it on the first try and the
+ * next six did not: whatever the endpoint is waiting for is marginal, and a sequence that is right
+ * but has no margin shows up exactly like this. Each attempt leaves the rails alone, pulses WLAN_EN,
+ * resets the endpoint, and only then touches the LTSSM; the delay after WLAN_EN grows with each
+ * attempt, because a chip that needs longer is the obvious candidate.
+ */
+#define ECAM_EP_PHYS    0x60200000UL
+
+static bool
+link_is_up(void)
+{
+	uint32_t link = rd(dbi + DBI_LINK_CTRL_STATUS);
+
+	return (rd(parf + PARF_LTSSM) & 0x3f) == 0x11 || (link != 0xffffffffu && ((link >> 29) & 1) != 0);
+}
+
+static void
+step_endpoint_attempts(void)
+{
+	vm_offset_t tlmm;
+	unsigned attempt, i;
+
+	if (parf == 0 || dbi == 0) {
+		tell("pcie: 26: a window is missing\n");
+		return;
+	}
+	tlmm = ml_io_map(0x0f900000UL, 0x0007d000UL);
+	if (tlmm == 0) {
+		tell("pcie: 26: the north tile could not be mapped\n");
+		return;
+	}
+#define PIN_CFG(n)      (tlmm + 0x1000 * (n))
+#define PIN_IO(n)       (tlmm + 0x1000 * (n) + 4)
+	wr(PIN_CFG(20), 0x3c3);
+	wr(PIN_CFG(79), 0x200);
+	for (attempt = 1; attempt <= 3; attempt++) {
+		unsigned settle = 50 * attempt;         /* (50, 100, 150 ms after WLAN_EN) */
+
+		tell("pcie: 26: attempt %u: wlan-en low, %u ms settle, perst, then the ltssm\n", attempt, settle);
+		wr(PIN_IO(20), rd(PIN_IO(20)) & ~2u);
+		delay_for_interval(20000, NSEC_PER_USEC);
+		wr(PIN_IO(20), rd(PIN_IO(20)) | 2u);
+		delay_for_interval((uint64_t)settle * 1000, NSEC_PER_USEC);
+		wr(PIN_IO(79), 2);
+		delay_for_interval(20000, NSEC_PER_USEC);
+		wr(PIN_IO(79), 0);
+		delay_for_interval(20000, NSEC_PER_USEC);
+
+		{
+			uint32_t now = rd(parf + PARF_LTSSM);
+
+			wr(parf + PARF_LTSSM, (now & ~(1u << 11) & ~(1u << 10)) | (1u << 8));
+		}
+		for (i = 1; i <= 20; i++) {
+			delay_for_interval(20000, NSEC_PER_USEC);
+			if (link_is_up()) {
+				break;
+			}
+		}
+		tell("pcie: 26: attempt %u: parf ltssm %#x (state %#x, flush %u), dbi link %#x after %u tries\n", attempt,
+		    rd(parf + PARF_LTSSM), rd(parf + PARF_LTSSM) & 0x3f, (rd(parf + PARF_LTSSM) >> 11) & 1,
+		    rd(dbi + DBI_LINK_CTRL_STATUS), i);
+		if (link_is_up()) {
+			vm_offset_t ep = ml_io_map(ECAM_EP_PHYS, 0x00010000UL);
+
+			tell("pcie: 26: LINK UP on attempt %u: dbi link ctrl/status %#x (speed %#x, width %#x, active %u)\n",
+			    attempt, rd(dbi + DBI_LINK_CTRL_STATUS), rd(dbi + DBI_LINK_CTRL_STATUS) & 0xf,
+			    (rd(dbi + DBI_LINK_CTRL_STATUS) >> 4) & 0x3f, (rd(dbi + DBI_LINK_CTRL_STATUS) >> 29) & 1);
+			if (ep != 0) {
+				tell("pcie: 26: endpoint at 0x60200000: id %#x (vendor %#x, device %#x), class %#x, bar0 %#x\n",
+				    rd(ep), rd(ep) & 0xffff, rd(ep) >> 16, rd(ep + 0x08), rd(ep + 0x10));
+			}
+			goto out;
+		}
+	}
+	tell("pcie: 26: none of the three attempts trained the link\n");
+out:
+#undef PIN_CFG
+#undef PIN_IO
+	;
+}
+
 static void
 step_setup(uint32_t steps)
 {
@@ -1674,6 +1929,15 @@ step_setup(uint32_t steps)
 	}
 	if (steps >= 23) {
 		step_config();
+	}
+	if (steps >= 24) {
+		step_link_final();
+	}
+	if (steps >= 25) {
+		step_flush_proper();
+	}
+	if (steps >= 26) {
+		step_endpoint_attempts();
 	}
 }
 
