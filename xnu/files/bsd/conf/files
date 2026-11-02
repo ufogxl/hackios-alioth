@@ -126,6 +126,7 @@ bsd/dev/hakios.sta.c		standard
 bsd/dev/hakios.apple80211.c	standard
 bsd/dev/hakios.radio.c		standard
 bsd/dev/hakios.pcie.c		standard
+bsd/dev/hakios.rpmh.c		standard
 # What is NOT built of the Wi-Fi: the POCO X5 Pro's radio itself (hakios.wifi.c, hakios.wlfw.c).
 # The K40's radio is a QCA6390 on PCIe and shares no code with a WCN6750 on the WPSS; a driver
 # written for another phone's addresses, pins and rails is the last thing this kernel should

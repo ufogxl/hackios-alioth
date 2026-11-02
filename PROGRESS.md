@@ -5528,3 +5528,290 @@ PIPE 时钟，各几十到上百条 `{ offset, value, delay }`），顺序和延
 | `MHI_CLOCK_RESET`=0x13、`DEVICE_TYPE`=0x4、`SYS_CTRL`=0x365E、`DBI_BASE`=0 等 | ✅ 全部生效 |
 | **读 DBI（配置空间）** | ❌ 挂死，缺 PHY 时钟 |
 | PHY 初始化 / `LTSSM_EN` / 链路训练 | 未动（PHY 是下一件） |
+
+---
+
+## 23:05–23:55 PHY 起来了，DBI 读通了（PCIe 的分水岭）
+
+### 先把上一步的结论钉住
+
+上一节说"缺 PHY"，对。补的料不是 `phy-qcom-qmp.c`（那里没有 sm8250 的 PCIe 表），而是
+**这台手机自己的设备树**：`devices/alioth/prebuilt/device-tree.dtb` 里 `qcom,pcie@1c00000` 节点的
+`qcom,phy-sequence`，**99 组 `{offset, value, delay}`**，全部在 PHY 窗口 `0x1c06000` 的 0x1000 以内，
+delay 全是 0。同节点还有 `qcom,phy-status-offset = <0x814>`、`qcom,phy-status-bit = <6>`、
+`qcom,phy-power-down-offset = <0x840>`。
+
+顺序照 vendor（`pci-msm.c:3713-3766`，`pcie_phy_init`）：写表 → 等 1 ms → PIPE 时钟（GCC `+0x52008`
+bit 4，第 2 步已经开了）→ 轮询 `phy+0x814` 的 bit 6，**bit 清掉才算就绪**（名字是反的：
+`pcie_phy_is_ready()` 在位被置起时返回 false），10 次 1 ms。
+
+### 实测（`pcie_step=9`）
+
+```
+pcie: 8: writing the device trees
+
+---
+
+## 23:05–23:55 PHY 起来了，DBI 读通了（PCIe 的分水岭）
+
+### 先把上一步的结论钉住
+
+上一节说"缺 PHY"，对。要补的料不在 `phy-qcom-qmp.c`（那里没有 sm8250 的 PCIe 表），而在
+**这台手机自己的设备树**：`devices/alioth/prebuilt/device-tree.dtb` 里 `qcom,pcie@1c00000` 节点的
+`qcom,phy-sequence`，**99 组 `{offset, value, delay}`**，全部落在 PHY 窗口 `0x1c06000` 的 0x1000 之内，
+delay 全是 0。同一个节点还有 `qcom,phy-status-offset = <0x814>`、`qcom,phy-status-bit = <6>`、
+`qcom,phy-power-down-offset = <0x840>`。
+
+顺序照 vendor（`pci-msm.c:3713-3766`，`pcie_phy_init`）：写表 → 等 1 ms → PIPE 时钟（GCC `+0x52008`
+bit 4，第 2 步已经开了）→ 轮询 `phy+0x814` 的 bit 6，**bit 清掉才算就绪**（名字是反的：
+`pcie_phy_is_ready()` 在位被置起时返回 false），10 次 1 ms。
+
+### 实测（`pcie_step=9`）
+
+```
+pcie: 8: writing the device tree's 99 phy triples into 0x1c06000
+pcie: 8: table written; 0x840 = 0x3, 0x840 = 0x3, 0x844 = 0x3
+pcie: 8: pipe clk vote 0x410007f (bit 4 set in step 2), phy reset 0 (step 3)
+pcie: 8:   try 1: phy_status 0x69, bit 6 still set
+pcie: 8:   try 2: phy_status 0xa6, bit 6 clear: phy is ready
+pcie: 8: phy ready (info 0xd), step 9 reads the dbi next
+pcie: 9: dbi id 0x10b17cb (Qualcomm is 0x17cb), header type 0x10000, cap 0x1420010
+```
+
+**DBI 读通了。** `0x010b17cb`：vendor 0x17cb（Qualcomm），device 0x010b；`0x0c` 那个双字的头类型
+字节在 +2，读出 type 1（bridge）——一个真正的 root complex 的头。`DBI_CAP` 的 `0x1420010`，低字节
+0x10 是第一个 capability 的偏移。
+
+同一轮里还改掉一处偏差：`PARF_SLV_ADDR_SPACE_SIZE` 写的是 `0x01000000`，设备树说
+`qcom,slv-addr-space-size = <0x4000000>`（64 MB），已按设备树改成 `0x04000000`。
+
+于是"PARF 配好了却读不了配置空间"这件事有了完整的因果：**缺的是 PHY 的 PIPE 时钟**，不是 PARF。
+
+### 下一步（链路训练）卡在哪
+
+`msm_pcie_hw_init` 的顺序是：PHY 就绪 → 等 `qcom,ep-latency`（10 ms）→ EP 的 gpio → 释放 PERST →
+`PARF_LTSSM` bit 8 → 轮询 ELBI 的 `XMLH_LINK_UP`（bit 10），LTSSM 状态在 `[17:12]`。
+
+补这条链要动的引脚，设备树里是现成的：
+
+| 引脚 | 是什么 | 出处 |
+|---|---|---|
+| tlmm 20 | **wlan-en**（QCA6390 的使能，**不是** 84） | `qcom,cnss-qca6390@b0000000` 的 `wlan-en-gpio` |
+| tlmm 21 | bt-en | 同上 |
+| tlmm 124 | sw-ctrl | 同上 |
+| tlmm 79 | perst（active high，置高=复位） | `qcom,pcie@1c00000` 的 `perst-gpio` |
+| tlmm 81 | wake（只当中断用） | 同上 |
+
+（`hakios.wifi.c` 第 5 步把 84 当成 wlan-en，那是**错的**：84 只是那条 pinctrl 描述的名字，
+真正的使能在 20。以后要用的时候先改这里。）
+
+电源那五路也是设备树里写好的（`vdd-wlan-aon/dig/io/rfa1/rfa2` → pm8150_s6、pm8009_s2、
+pm8150_s4、pm8150_s5、pm8150a_s8）。
+
+**实测卡点**：加上"读/写引脚 + 拉 wlan-en + PERST 一个回合"这一步（`pcie_step=10`）之后，
+机器必定挂死；而 `pcie_step=9` 稳定返回。已经把它拆细成 10=引脚、11=LTSSM、
+12=ELBI，但**挂死时拿不到日志**——`xl run` 在挂死时不会抓 loader 日志，而 `tell()` 写的正是
+那一份，所以看不出挂在哪一行。今晚最后几次尝试连 USB 都开始返回垃圾（日志文件里是乱码），
+需要拔插数据线。
+
+下一轮的做法：`XL_SECS` 给大（600），让 `xl run` 被挪到后台继续挂着，再用 `xl screenshot`
+（运行中也用得上）把屏幕上最后一行 -v 输出拍下来——挂死时内核日志末尾会丢，屏幕不会。
+
+---
+
+## 22:00–22:10 找到"写引脚就复位"的真凶：TLMM 不是一个基址
+
+### 错误
+
+`hakios.pcie.c` 里我一直按 `0xf100000 + 0x1000 * n` 算引脚地址。**这是错的。**
+
+TLMM 是一个 16 MB 的窗口 `0xf000000`，里面有**三个 tile**（`k40-ref:drivers/pinctrl/qcom/pinctrl-kona.c:20-24`）：
+
+```
+NORTH = 0x00900000
+SOUTH = 0x00500000
+WEST  = 0x00100000
+```
+
+引脚 n 的寄存器 = **tile 基址 + 0x1000 * n**（这些值是相对 `0xf000000` 的偏移）。
+而引脚 20 / 79 / 81 / 84 **全部在 NORTH**（`pinctrl-kona.c:1461, 1576, 1580, 1586`；79 的
+功能列表里还有 `pci_e0`），所以它们真实地址是 `0x0f900000 + 0x1000 * n`。
+
+`0xf100000` 是 WEST tile —— 也就是说之前那几步**读写的完全是别的四个引脚**。往 WEST+20 之类的
+pad 上写配置，把某个关键使能（电源/时钟）拉掉了，于是"运行 40 秒内整机复位、日志变 64 KB 的
+0x98 垃圾"—— 全都对得上。`hakios.amp.c` / `hakios.display.c` / `hakios.goodix.c` 里的
+`TLMM_NORTH_PHYS 0x0f900000`、`TLMM_SOUTH_PHYS 0x0f500000` 一直是对的，是我这里抄错了。
+
+### 修好之后
+
+`pcie_step=13`（LTSSM → 读引脚 → 拉 wlan-en → PERST 一回合 → 读 ELBI）**完整跑完、干净返回**：
+
+```
+pcie: 10: ltssm 0x100 -> 0x100 (enabled 1, state 0)
+pcie: 11:   gpio79: config 0x1 (function 0, an input), level 0
+pcie: 11:   gpio20: config 0x9 (function 2, an input), level 0
+pcie: 12: gpio20 (wlan-en) now config 0x3c3, level 1 (high)
+pcie: 13: gpio79 (perst) released (low), level 0
+pcie: 12:   try 20: elbi sys_stts 0x1: link down, ltssm state 0
+pcie: 12: dbi link ctrl/status 0x10110008 (speed 0x8, width 0, data link active 0)
+```
+
+（wlan-en 的 `0x3c3` 是照设备树 `cnss_wlan_en_active` 抄的：function gpio、16 mA、pull-up、
+输出高。之前那版把 bit9 当成 `1<<9` 写成了 `| 9`，等于只置了 pull-down 和 drive，**输出使能根本没
+打开**——现在改成显式的 `GPIO_OE_MASK 0x200`。）
+
+### 现在的状态：链路还没起来，原因是 QCA6390 没电
+
+LTSSM 一直是 state 0（Detect），ELBI 只有 `0x1`（link down），DBI 的 link 寄存器 width 为 0。
+原因很明确：**QCA6390 的五路电一路都没开**。vendor 里这是 cnss 驱动在 PCIe 之前做的
+（`qcom,cnss-qca6390@b0000000` 的 `vdd-wlan-aon/dig/io/rfa1/rfa2`）：
+
+| 电源 | PMIC 开关 | 电压 |
+|---|---|---|
+| vdd-wlan-aon | pm8150_s6 | 0.95 V |
+| vdd-wlan-dig | pm8009_s2 | 0.95 V |
+| vdd-wlan-io | pm8150_s4 | 1.8 V |
+| vdd-wlan-rfa1 | pm8150_s5 | 1.9 V |
+| vdd-wlan-rfa2 | pm8150a_s8 | 1.35 V |
+
+这几路是 **RPMh** 管的，不是直接写 SPMI 寄存器的事；而树里目前只有 `hakios.wifi.c` 的
+`spmi_read`（没有 `spmi_write`）。所以下一步是：先开这五路电（RPMh / CMD-DB 或至少 SPMI 写），
+再走"wlan-en 高 → PERST 释放 → LTSSM"，否则 EP 不在线上，训练永远不会离开 Detect。
+
+---
+
+## 23:20–次日 22:40 RPMh 投票成功，LTSSM 从 Detect 走到 PRE_DETECT_QUIET
+
+### 先把别人的进度摸清了
+
+上游 `FFT-infra/UniXNU-alioth` 的 WiFi 线在 2026-10-31 停住，停在"用 RPMh 投 ldoa5"上，投票
+**永远不完成**（`RSC_DRV_CMD_STATUS` 读回 `0x10101`）。而 `UniXNU/UniXNU-sheng`（小米平板 6S Pro，
+WCN7850）的 Wi-Fi **是能用的**：连 WPA2、拿 DHCP、Safari 打开网页。它的经验写在
+`UniXNU/UniXNU:docs/drivers/ath12k-wifi.md`，关键一条：
+
+> Each of the six PMU rails needs RPMh **mode, voltage and enable** requests. Without the mode
+> request two rails stay off and the link never trains.
+
+也就是说每路轨要投三次（mode / 电压 / enable），mode 不能省。
+
+上游还有两处和我们实测对不上的地方，值得记：他们把 `0x52008` 只投 `0x2f`（注释写 "pipe comes
+with the PHY"），**pipe 时钟 bit4 从没开**，而我们的 `0x3f` 让 DBI 可读；他们的 ELBI 读挂死，
+我们的能读。
+
+### 做了什么
+
+**1. 移植 RPMh 支持**：新增 `xnu/files/bsd/dev/hakios.rpmh.{c,h}`（源自 sheng 的
+`package/QcomRpmh.c`，BSD-2-Clause，注释按本板重写），提供 cmd-db 解析（含"列出全部条目"）、
+按 DRV 版本选两套 TCS 版式、以及一个请求的寄存器写序列。
+
+**2. 第 14 步（只读）**：映射 `0x80860000`（设备树 `reserved-memory@80860000`，0x20000，
+`compatible = "qcom,cmd-db"`），32 位读把库拷贝出来，校验 magic `0x0c0330db`，然后按名字查轨，
+并把全部 125 个条目打印出来（顺带证明解析覆盖完整）。
+
+读数：cmd-db version 1，magic 对；**共 125 个条目**，其中 RPMh 的 SMPS 只有
+`smpa3/a4/a5/a6`、`smpc1/c3/c4/c6/c7/c8`。
+
+| 轨 | cmd-db 名 | 地址 | 结论 |
+|---|---|---|---|
+| vdd-wlan-aon (pm8150_s6) | `smpa6` | `0x40200` | ✅ |
+| vdd-wlan-io (pm8150_s4) | `smpa4` | `0x40000` | ✅ |
+| vdd-wlan-rfa1 (pm8150_s5) | `smpa5` | `0x40100` | ✅ |
+| vdd-wlan-rfa2 (pm8150a_s8) | `smpc8` | `0x40400` | ✅ |
+| vdd-wlan-dig (pm8009_s2) | `smpf2` | — | ❌ **库中不存在**（125 条全打印过，没有 smpb/d/e/f） |
+
+RSC：`0x18220000`（drv-2），`qcom,tcs-offset 0xd00`，config 读回 `0x800c8104`（4 TCS × 16 命令），
+版式是本板 vendor 内核的 v2 那一套（tcs 672、命令 20、control 0x14、cmd_enable 0x1c）。
+
+**3. 第 15 步（投票）**：写序列不是新写的 —— 直接复用本树里**已经在本机跑通**的那份
+（`hakios.adreno.c` 的 `pas_bw_write`，GPU 的 PAS 带宽投票，msgid `0x10108`、active-mode 后
+trigger、等 `TCS(0x04)` 的 bit0）。每条轨三个请求：`+8 = 7`（mode HPM）、`+0 = mV`、`+4 = 1`。
+默认 dry run，`pcie_rail=2` 才真写。
+
+实测：
+
+```
+pcie: 15: smpa6: wrote 0x40208 = 7: RPMh answered
+pcie: 15: smpa6: wrote 0x40200 = 950: RPMh answered
+pcie: 15: smpa6: wrote 0x40204 = 1: RPMh answered
+... smpa4 1800 / smpa5 1900 / smpc8 1350 ...
+pcie: 15: 4 of 4 rails handled
+```
+
+**12 条全部 "RPMh answered"** —— 上游那次投票失败（`0x10101`）在我们的序列下没有复现。
+
+**4. 第 16 步**：轨上电后重新复位端点（PERST# 高 2 ms → 低），然后轮询 ELBI：
+
+```
+pcie: 16: parf ltssm 0x905 (state 0x5), dbi link ctrl/status 0xd0110008 (width 0, data link active 0)
+```
+
+`0x5` 是 `MSM_PCIE_LTSSM_PRE_DETECT_QUIET`（`pci-msm.c:416`，L0 = `0x11`）。**LTSSM 动了**：
+之前一直是 0（DETECT_QUIET，根本没启动），现在在 detect 里循环但**找不到对端**。
+
+### 结论与下一步
+
+电投上去了、时钟对了、PERST# 和 WLAN_EN 都到位，RC 在找对端但找不到 —— 差的是**第五路
+vdd-wlan-dig（pm8009_s2）**，它没有 RPMh 资源，所以没被投上。QCA6390 的数字核心供电不在，
+端点不会应答。
+
+下一件事：确认 pm8009_s2 到底谁管。两条路：
+1. Android 里怎么开的（vendor 的 cnss 用 `qcom,cmd_db_name = "smpf2"` 去 `cmd_db_read_addr`；
+   设备树里也确实有 `rpmh-regulator-smpf2`，但运行时库里没有这个名字 —— 这个矛盾要查清，
+   可能是 AOP 的库按 PMIC 配置裁剪过）；
+2. 直接走 SPMI 写 PM8009 的 SMPS2（本树 `hakios.wifi.c` 已有 SPMI 读，缺 `spmi_write`）。
+
+顺带记一句：`hakios.wifi.c` 第 5 步把 tlmm 84 当 wlan-en 是错的（真在 20），且它读 84/85/86
+用的是 WEST tile 的基址 `0xf100000`，也是错的（NORTH 是 `0x0f900000`）。
+
+---
+
+## 次日 22:40–23:00 第一次 L0：链路训起来了（但还不稳定）
+
+### 修正两处事实错误
+
+**1. alioth 没有第五路电源。** 设备树里 cnss 的 `vdd-wlan-aon` 和 `vdd-wlan-dig` 是**同一个**
+supply（phandle `0xa9` = `pm8150_s6` = cmd-db 的 `smpa6`，都是 `0xe7ef0` = 950 mV）。之前按通用
+`kona.dtsi` 说的 `pm8009_s2` 去找，才得出"第五路缺失"的结论。四路全在，都已投票。
+
+**2. PHY 的 power-down 是低有效。** `phy-qcom-qmp.c:1132` 里 `setbits(POWER_DOWN_CONTROL,
+pwrdn_ctrl)` 的注释是"Pull out of PHY from POWER DOWN state"。所以设备树序列开头的
+`0x840 = 3`（SW_PWRDN | REFCLK_DRV_DSBL）正是**上电**，而我按"清零=上电"去写 0，等于把 PHY 关了
+——那一轮机器连 PARF 都不应答，就是证据。**0x840 保持 3。**
+
+### 关键发现：`PARF_LTSSM` 的 FLUSH_MODE（bit 11）被控制器自己置起
+
+读数一直是 `0x905`：state `0x5`（`MSM_PCIE_LTSSM_PRE_DETECT_QUIET`）+ bit8（LTSSM_EN）+ **bit11
+（FLUSH_MODE）**。本文件从没写过 bit 11，是控制器自己置的；被 flush 卡住的链路**根本不发 detect
+脉冲**，所以永远出不了 0x5。加了一步"清 bit11/bit10 再置 bit8"之后，状态能从 5 回到 0。
+
+### 第一次 L0
+
+`pcie_step=22`（清 flush → 置 LTSSM_EN → 轮询 PARF/DBI）：
+
+```
+pcie: 22: aux_clk_freq 0x14 -> 0x14 (was it 0x14 already? yes), port link ctrl 0x10120
+pcie: 22:   try 1: parf ltssm 0x111 (state 0x11, flush 0), dbi link 0xb0120008
+pcie: 22: THE LINK IS UP: dbi link ctrl/status 0xb0120008 (speed 0x8, width 0, active 1)
+```
+
+`state 0x11` = **LTSSM_L0**（`pci-msm.c:432`），`dbi link ctrl/status` 的 bit29 = 1 = **data link
+active**。这是这条线第一次真正训起来。
+
+### 但还不稳定
+
+同一份代码后来的两轮：一轮 `state 0x5, flush 1`（flush 又回来了），一轮 `state 0, flush 0`，都没
+再进 L0。冷复位（`xl reboot` → enter → ramdisk）也没能稳定复现。
+
+顺带把端点配置空间读了（第 23 步，ECAM：`conf` bus0 = `0x60100000`，ranges 把 bus1 映到
+`0x60200000`）：读机制本身是通的（有数据返回），但 **bus0/bus1 全是 `0xffffffff`**，也就是说那一轮
+链路上根本没有设备。
+
+### 下一步
+
+1. **把 L0 做成确定性的**：现在只在某一轮出现，怀疑是上电时序的余量不够 —— 现在四路轨投完
+   只等 5 ms 就拉 EN、再等 10 ms 就放 PERST。改成轨 → 100 ms → EN 低/高各 20 ms → PERST，
+   并把"清 flush → 置 enable"放在最后紧挨着。
+2. L0 稳定后，第 23 步就能读到 QCA6390 的 `17cb:1101`，之后才是 BAR / MHI / 固件 / ath11k 那一大段。
+3. 记一笔坑：`hakios.wifi.c` 里 wlan-en 用的 tlmm 84 和基址 `0xf100000` 都是错的（真值：pin 20，
+   NORTH tile `0x0f900000`）；`hakios.adreno.c` 里那份 cmd-db 解析和新加的 `hakios.rpmh.c` 有重复，
+   以后可以合并。
