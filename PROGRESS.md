@@ -6718,3 +6718,48 @@ pcie: 38: done: status 0, exec env 0, error code 0xef128100, ERRBG 0x80000000 0 
    QCA6390 BHI/MHI 实现 —— 对 XNU 移植参考价值最高（Linux 的 mhi 框架太重，OpenBSD 的是裸寄存器）；
 2. Qualcomm 的 `BOOT.XF.3.3`（UEFI/XBL）里有 `PcieSIDProg.c` 与 `pcie_props.xml`，配 DMA 时要用；
 3. 用 `GFSR`/`FSR` 判据分清 BHI 失败是"二次翻译"还是"请求没到"。
+
+---
+
+## 08:00–08:10 参照 OpenBSD `qwx(4)`：两处照做，BHI 仍未启动
+
+### 做了什么
+
+OpenBSD 的 `qwx(4)`（`sys/dev/pci/if_qwx_pci.c`，4288 行）是这颗芯片除 Linux 之外唯一一份从零写的
+bring-up，BHI 那段与本文件几乎一致（512 KB 一次、`BHI_STATUS<-0`、写 IMGADDR/IMGSIZE、随机
+30 位门铃、然后等）。差异只有两处，都试了：
+
+1. **`BHI INTVEC = 0`**（`qwx_pci.c:2987`，每次下载前写）—— 我们之前**没写过**，而且这个寄存器
+   一直读回 `0xffffffff`。写进去之后 **读回 0**，说明它是只写寄存器、写是生效的。
+2. **`bhi_off` 从 `BAR + 0x28` 读**（`qwx_pci.c:2972`）—— 这颗芯片上读到 **0x100**，而 0x100 那块
+   全部读回 `0xffffffff`；反而是 `0x1e0e200` 那套读数自洽（版本 1.2、EXECENV 0、NUMSEG 1、
+   序列号 `0xc4e10d95`）。所以**基址仍是 0x1e0e200**，0x28 处的值不是我们要的偏移。
+
+另外把轮询时间从 1 秒放长到 **5 秒**（qwx 的等待也是 5 秒）。
+
+### 结果
+
+```
+pcie: 44: using base 0x1e0e200: version 1.2, exec env 0, status 0, intvec 0, errcode 0xef128100
+pcie: 38: A: 512 KB, a new sequence number: status 0 (bits 31:30 = 0) after 1001 polls, exec env 0
+pcie: 38: done: status 0, exec env 0, error code 0xef128100, ERRBG 0x80000000 0 0x80000
+```
+
+**`BHI_STATUS` 的 bits 31:30 一直是 0**（既不是 2=成功也不是 3=失败），`EXECENV` 停在 0。
+也就是说：门铃写了、镜像是可读的、INTVEC 也清了，但**传输从来没有开始**。
+
+### 下一批假设（按顺序试，都不用改硬件）
+
+1. **端点自身 PCIe 核的 PARF**：`cnss2` 的寄存器表里有 `QCA6390_PCIE_PCIE_PARF_MHI_BASE_ADDR_LOWER
+   = 0x01E08178`、`..._MHI_CLOCK_RESET_CTRL = 0x01E08174`（同一套窗口可读）。如果芯片侧的
+   MHI base 是 0，BHI 可能找不到"读宿主内存"的通道 —— 先读这几个寄存器看值，必要时把我们的
+   IOVA 写进去；
+2. **`QCA6390_PCIE_CORE_CONFIG`**（cnss2 reg 表里也有）：芯片的 AXI/DMA 模式可能要先配；
+3. **`errcode 0xef128100` 的语义**：它从第一次失败起就没变过，也不随我们写的东西变化 ——
+   有可能是**上电残留**而不是本次错误，值得在下载前先读一次作基线（现在每次都读，但没记基线）。
+
+### 今天的提交状态
+
+- 已提交：`2c90e95`（README/README.zh.md 状态表、`devices/alioth/status`、`userland/build.sh`、
+  `hakios.pcie.c`、`PROGRESS.md`），**未 push**；
+- 工作区干净；手机在 loader、链路 L0。

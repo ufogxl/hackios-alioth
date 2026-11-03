@@ -231,6 +231,7 @@ static const struct pcie_phy_step pcie_phy_sequence[] = {
 };
 
 static vm_offset_t parf, phy, dbi, elbi;
+static uint32_t bhi_base = 0x1e0e200u;   /* (what BAR + 0x28 says; see step 44) */
 static void step_setup(uint32_t steps);  /* (defined below, used by the runner above it) */
 /* (the read-only steps the reuse path calls before their definitions) */
 static void step_endpoint_config(void);
@@ -245,6 +246,7 @@ static void step_bdf_to_sid(void);
 static void step_sid_table(void);
 static void step_stream_read(void);
 static void step_iatu_inbound(void);
+static void step_bhi_base(void);
 static uint32_t step;
 
 static inline uint32_t
@@ -590,6 +592,9 @@ pcie_run(uint32_t steps)
 			}
 			if (steps >= 43) {
 				step_iatu_inbound();
+			}
+			if (steps >= 44) {
+				step_bhi_base();
 			}
 			return;
 		}
@@ -2257,7 +2262,7 @@ step_endpoint_bar(void)
  *	write BAR + 0x310c = 0x40000000 | window;        (REMAP_BAR_CTRL)
  *	read  BAR + 0x80000 + (offset & 0x7ffff);
  *
- * So the BHI block at 0x1e0e200 is window 0x3c, in-window offset 0xe200. The registers are the ones
+ * So the BHI block at bhi_base + 0x00 is window 0x3c, in-window offset 0xe200. The registers are the ones
  * mhi_internal.h names (k40-ref, drivers/bus/mhi/core/mhi_internal.h:169-198): version minor/major
  * at 0x0/0x4, exec environment at 0x28, status at 0x2c, error code at 0x30, the three debug words
  * after it. A block that answers with a version is a block the host can talk to.
@@ -2295,19 +2300,19 @@ step_bhi(void)
 		uint32_t at;
 		const char *what;
 	} bhi[] = {
-		{ 0x1e0e200, "BHI version minor" },
-		{ 0x1e0e204, "BHI version major" },
-		{ 0x1e0e208, "BHI image address low" },
-		{ 0x1e0e210, "BHI image size" },
-		{ 0x1e0e228, "BHI exec environment" },
-		{ 0x1e0e22c, "BHI status" },
-		{ 0x1e0e230, "BHI error code" },
-		{ 0x1e0e234, "BHI error debug 1" },
-		{ 0x1e0e238, "BHI error debug 2" },
-		{ 0x1e0e23c, "BHI error debug 3" },
-		{ 0x1e0e240, "BHI serial number" },
-		{ 0x1e0e244, "BHI SBL anti-rollback version" },
-		{ 0x1e0e248, "BHI number of segments" },
+		{ 0x00, "BHI version minor" },
+		{ 0x04, "BHI version major" },
+		{ 0x08, "BHI image address low" },
+		{ 0x10, "BHI image size" },
+		{ 0x28, "BHI exec environment" },
+		{ 0x2c, "BHI status" },
+		{ 0x30, "BHI error code" },
+		{ 0x34, "BHI error debug 1" },
+		{ 0x38, "BHI error debug 2" },
+		{ 0x3c, "BHI error debug 3" },
+		{ 0x40, "BHI serial number" },
+		{ 0x44, "BHI SBL anti-rollback version" },
+		{ 0x48, "BHI number of segments" },
 	};
 
 	if (parf == 0) {
@@ -2330,13 +2335,16 @@ step_bhi(void)
 		tell("pcie: 30: remap bar ctrl reads %#x before any window is selected\n", was);
 	}
 	for (unsigned i = 0; i < sizeof(bhi) / sizeof(bhi[0]); i++) {
-		uint32_t value = windowed_read(bar, bhi[i].at);
+		uint32_t at = bhi_base + bhi[i].at;
+		uint32_t value = windowed_read(bar, at);
 
-		tell("pcie: 30:   %#x %s: %#x\n", bhi[i].at, bhi[i].what, value);
+		tell("pcie: 30:   %#x %s: %#x\n", at, bhi[i].what, value);
 	}
-	tell("pcie: 30: the whole BHI page, window %#x, in-window 0xe000 to 0xe280:\n",
-	    (0x1e0e200u >> 19) & 0x3f);
-	for (uint32_t at = 0x1e0e000; at <= 0x1e0e280; at += 16) {
+	tell("pcie: 30: the whole BHI page, base %#x (window %#x, in-window %#x):\n", bhi_base,
+	    (bhi_base >> 19) & 0x3f, bhi_base & 0x7ffff);
+	for (uint32_t off = 0; off <= 0x80; off += 16) {
+		uint32_t at = bhi_base + off;
+
 		tell("pcie: 30:   %#x: %#x %#x %#x %#x\n", at, windowed_read(bar, at), windowed_read(bar, at + 4),
 		    windowed_read(bar, at + 8), windowed_read(bar, at + 12));
 	}
@@ -2927,8 +2935,8 @@ step_bhi_download(void)
 		tell("pcie: 36: the bar could not be mapped\n");
 		return;
 	}
-	execenv = windowed_read(bar, 0x1e0e228);
-	status = windowed_read(bar, 0x1e0e22c);
+	execenv = windowed_read(bar, bhi_base + 0x28);
+	status = windowed_read(bar, bhi_base + 0x2c);
 	tell("pcie: 36: before: BHI exec env %u, status %#x (bits 31:30 = %u), image %llu bytes\n", execenv, status,
 	    status >> 30, (unsigned long long) size);
 	if (execenv != 0) {
@@ -2940,18 +2948,18 @@ step_bhi_download(void)
 	__builtin_memcpy((void *) wifi_buffer, image, chunk);
 	tell("pcie: 36: copied %#x bytes of the image into %#llx; telling the endpoint\n", chunk,
 	    (unsigned long long) wifi_iova);
-	windowed_write(bar, 0x1e0e22c, 0);                              /* (STATUS: clear the last verdict) */
-	windowed_write(bar, 0x1e0e20c, 0);                              /* (IMGADDR_HIGH) */
-	windowed_write(bar, 0x1e0e208, (uint32_t) wifi_iova);           /* (IMGADDR_LOW) */
-	windowed_write(bar, 0x1e0e210, chunk);                          /* (IMGSIZE) */
-	tell("pcie: 36: read back: addr %#x%08x, size %#x\n", windowed_read(bar, 0x1e0e20c),
-	    windowed_read(bar, 0x1e0e208), windowed_read(bar, 0x1e0e210));
-	windowed_write(bar, 0x1e0e218, seq);                            /* (the doorbell) */
+	windowed_write(bar, bhi_base + 0x2c, 0);                              /* (STATUS: clear the last verdict) */
+	windowed_write(bar, bhi_base + 0x0c, 0);                              /* (IMGADDR_HIGH) */
+	windowed_write(bar, bhi_base + 0x08, (uint32_t) wifi_iova);           /* (IMGADDR_LOW) */
+	windowed_write(bar, bhi_base + 0x10, chunk);                          /* (IMGSIZE) */
+	tell("pcie: 36: read back: addr %#x%08x, size %#x\n", windowed_read(bar, bhi_base + 0x0c),
+	    windowed_read(bar, bhi_base + 0x08), windowed_read(bar, bhi_base + 0x10));
+	windowed_write(bar, bhi_base + 0x18, seq);                            /* (the doorbell) */
 	tell("pcie: 36: rang the doorbell with %#x (reads %#x); waiting for the transfer\n", seq,
-	    windowed_read(bar, 0x1e0e218));
+	    windowed_read(bar, bhi_base + 0x18));
 
 	for (i = 1; i <= 400; i++) {
-		status = windowed_read(bar, 0x1e0e22c);
+		status = windowed_read(bar, bhi_base + 0x2c);
 		if ((status >> 30) != 0) {
 			break;
 		}
@@ -2960,8 +2968,8 @@ step_bhi_download(void)
 	tell("pcie: 36: after %u polls: BHI status %#x -> %s\n", i, status,
 	    (status >> 30) == 2 ? "SUCCESS" : (status >> 30) == 3 ? "FAILED" : "still transferring");
 	if ((status >> 30) == 3 || status == 0xffffffffu) {
-		tell("pcie: 36: error code %#x, debug %#x %#x %#x\n", windowed_read(bar, 0x1e0e230),
-		    windowed_read(bar, 0x1e0e234), windowed_read(bar, 0x1e0e238), windowed_read(bar, 0x1e0e23c));
+		tell("pcie: 36: error code %#x, debug %#x %#x %#x\n", windowed_read(bar, bhi_base + 0x30),
+		    windowed_read(bar, bhi_base + 0x34), windowed_read(bar, bhi_base + 0x38), windowed_read(bar, bhi_base + 0x3c));
 		/*
 		 * 0xffffffff is an error response, not a verdict: the window stopped answering after the
 		 * doorbell. Two readings settle whether that is the endpoint or the memory it was told to
@@ -2985,13 +2993,13 @@ step_bhi_download(void)
 		for (unsigned again = 0; again < 3; again++) {
 			delay_for_interval(5000, NSEC_PER_USEC);
 			tell("pcie: 36:   re-read %u: status %#x, exec env %#x, addr %#x%08x\n", again,
-			    windowed_read(bar, 0x1e0e22c), windowed_read(bar, 0x1e0e228),
-			    windowed_read(bar, 0x1e0e20c), windowed_read(bar, 0x1e0e208));
+			    windowed_read(bar, bhi_base + 0x2c), windowed_read(bar, bhi_base + 0x28),
+			    windowed_read(bar, bhi_base + 0x0c), windowed_read(bar, bhi_base + 0x08));
 		}
 		return;
 	}
 	for (i = 1; i <= 200; i++) {
-		execenv = windowed_read(bar, 0x1e0e228);
+		execenv = windowed_read(bar, bhi_base + 0x28);
 		if (execenv != 0) {
 			break;
 		}
@@ -3063,8 +3071,8 @@ step_after_download(void)
 		tell("pcie: 37: BHI_EOFF (bar + 0x2c) %#x -> the BHIE aperture would be bar + %#x%s\n", bhie_off, bhie_off,
 		    (bhie_off == 0 || bhie_off > 0x100000u) ? " (not a plausible offset)" : "");
 		tell("pcie: 37: window again: exec env %#x, status %#x, image size %#x, addr %#x\n",
-		    windowed_read(bar, 0x1e0e228), windowed_read(bar, 0x1e0e22c), windowed_read(bar, 0x1e0e210),
-		    windowed_read(bar, 0x1e0e208));
+		    windowed_read(bar, bhi_base + 0x28), windowed_read(bar, bhi_base + 0x2c), windowed_read(bar, bhi_base + 0x10),
+		    windowed_read(bar, bhi_base + 0x08));
 	}
 }
 
@@ -3091,7 +3099,7 @@ step_after_download(void)
 static uint32_t
 bhi_status_of(vm_offset_t bar)
 {
-	return windowed_read(bar, 0x1e0e22c);
+	return windowed_read(bar, bhi_base + 0x2c);
 }
 
 static bool
@@ -3108,7 +3116,7 @@ bhi_wait(vm_offset_t bar, unsigned polls, const char *what)
 		delay_for_interval(5000, NSEC_PER_USEC);
 	}
 	tell("pcie: 38: %s: status %#x (bits 31:30 = %u) after %u polls, exec env %#x\n", what, status, status >> 30,
-	    i, windowed_read(bar, 0x1e0e228));
+	    i, windowed_read(bar, bhi_base + 0x28));
 	return (status >> 30) != 0;
 }
 
@@ -3192,8 +3200,8 @@ step_bhi_retry(void)
 		}
 	}
 	tell("pcie: 38: BHI_INTVEC %#x, BHI_EOFF %#x, NUMSEG %#x, SERIALNU %#x, ANTIROLLVER %#x\n",
-	    windowed_read(bar, 0x1e0e220), rd(bar + 0x2c), windowed_read(bar, 0x1e0e248), windowed_read(bar, 0x1e0e240),
-	    windowed_read(bar, 0x1e0e244));
+	    windowed_read(bar, bhi_base + 0x20), rd(bar + 0x2c), windowed_read(bar, bhi_base + 0x48), windowed_read(bar, bhi_base + 0x40),
+	    windowed_read(bar, bhi_base + 0x44));
 	chunk = (size > 0x80000u) ? 0x80000u : (uint32_t) size;
 	if (size > WIFI_BUFFER_BYTES) {
 		tell("pcie: 38: the image (%llu) does not fit the buffer (%llu); only the first part is used\n",
@@ -3202,35 +3210,35 @@ step_bhi_retry(void)
 	__builtin_memcpy((void *) wifi_buffer, image, (size_t)((size > WIFI_BUFFER_BYTES) ? WIFI_BUFFER_BYTES : size));
 
 	/* A: the same request, a different sequence number */
-	windowed_write(bar, 0x1e0e22c, 0);
-	windowed_write(bar, 0x1e0e20c, 0);
-	windowed_write(bar, 0x1e0e208, (uint32_t) wifi_iova);
-	windowed_write(bar, 0x1e0e210, chunk);
-	windowed_write(bar, 0x1e0e218, seq);
-	(void) bhi_wait(bar, 200, "A: 512 KB, a new sequence number");
-	if (windowed_read(bar, 0x1e0e228) != 0) {
+	windowed_write(bar, bhi_base + 0x2c, 0);
+	windowed_write(bar, bhi_base + 0x0c, 0);
+	windowed_write(bar, bhi_base + 0x08, (uint32_t) wifi_iova);
+	windowed_write(bar, bhi_base + 0x10, chunk);
+	windowed_write(bar, bhi_base + 0x18, seq);
+	(void) bhi_wait(bar, 1000, "A: 512 KB, a new sequence number");
+	if (windowed_read(bar, bhi_base + 0x28) != 0) {
 		return;
 	}
 
 	/* B: the whole image */
-	windowed_write(bar, 0x1e0e22c, 0);
-	windowed_write(bar, 0x1e0e210, (uint32_t) size);
-	windowed_write(bar, 0x1e0e218, seq + 1);
+	windowed_write(bar, bhi_base + 0x2c, 0);
+	windowed_write(bar, bhi_base + 0x10, (uint32_t) size);
+	windowed_write(bar, bhi_base + 0x18, seq + 1);
 	(void) bhi_wait(bar, 200, "B: the whole image");
-	if (windowed_read(bar, 0x1e0e228) != 0) {
+	if (windowed_read(bar, bhi_base + 0x28) != 0) {
 		return;
 	}
 
 	/* C: the doorbell as an edge */
-	windowed_write(bar, 0x1e0e22c, 0);
-	windowed_write(bar, 0x1e0e210, chunk);
-	windowed_write(bar, 0x1e0e218, 0);
+	windowed_write(bar, bhi_base + 0x2c, 0);
+	windowed_write(bar, bhi_base + 0x10, chunk);
+	windowed_write(bar, bhi_base + 0x18, 0);
 	delay_for_interval(1000, NSEC_PER_USEC);
-	windowed_write(bar, 0x1e0e218, seq + 2);
+	windowed_write(bar, bhi_base + 0x18, seq + 2);
 	(void) bhi_wait(bar, 200, "C: the doorbell as an edge");
 	tell("pcie: 38: done: status %#x, exec env %#x, error code %#x, ERRBG %#x %#x %#x\n", bhi_status_of(bar),
-	    windowed_read(bar, 0x1e0e228), windowed_read(bar, 0x1e0e230), windowed_read(bar, 0x1e0e234),
-	    windowed_read(bar, 0x1e0e238), windowed_read(bar, 0x1e0e23c));
+	    windowed_read(bar, bhi_base + 0x28), windowed_read(bar, bhi_base + 0x30), windowed_read(bar, bhi_base + 0x34),
+	    windowed_read(bar, bhi_base + 0x38), windowed_read(bar, bhi_base + 0x3c));
 }
 
 /*
@@ -3576,6 +3584,56 @@ step_iatu_inbound(void)
 	step_bhi_retry();
 }
 
+
+/*
+ * Step 44: the BHI base, from the register that holds it -- and INTVEC, which nothing here wrote.
+ *
+ * OpenBSD's qwx(4) is the one implementation of this chip's bring-up outside Linux, and it does two
+ * things this file did not (sys/dev/pci/if_qwx_pci.c):
+ *
+ *	psc->bhi_off = qwx_pci_read(sc, MHI_BHI_OFFSET);   (BAR + 0x28, not a constant)
+ *	qwx_pci_write(sc, psc->bhi_off + MHI_BHI_INTVEC, 0);   (before every download)
+ *
+ * The first says where the BHI block is, instead of assuming 0x1e0e200 (which came from cnss2's
+ * QCA6390_PCIE_BHI_EXECENV_REG minus the EXECENV offset, and is only as good as that arithmetic).
+ * The second is a write that was never made here -- and the register it writes, bhi + 0x20, is the
+ * one this file read as 0xffffffff every time. If the base was wrong, that reading is explained; if
+ * it was right, the write is still the one the working driver makes before it rings the doorbell.
+ *
+ * Both, then the download again.
+ */
+#define MHI_BHI_OFFSET_REG      0x28u   /* (BAR + 0x28 holds the BHI block's offset) */
+#define MHI_BHIE_OFFSET_REG     0x2cu   /* (and BAR + 0x2c the BHIe one) */
+
+static void
+step_bhi_base(void)
+{
+	vm_offset_t bar;
+	uint32_t base, bhie;
+
+	bar = endpoint_bar();
+	if (bar == 0) {
+		tell("pcie: 44: the bar could not be mapped\n");
+		return;
+	}
+	base = rd(bar + MHI_BHI_OFFSET_REG);
+	bhie = rd(bar + MHI_BHIE_OFFSET_REG);
+	tell("pcie: 44: bar + 0x28 says the BHI block is at %#x; bar + 0x2c says BHIe is at %#x (was assumed %#x)\n", base,
+	    bhie, bhi_base);
+	/*
+	 * The value at bar + 0x28 is not the offset this file needs: 0x100 was read there, and the whole
+	 * block at 0x100 answers 0xffffffff, while 0x1e0e200 answers coherently (version 1.2, exec env
+	 * 0, numseg 1, serial 0xc4e10d95). So the assumed base stays, and the register is printed only.
+	 */
+	tell("pcie: 44: using base %#x: version %u.%u, exec env %#x, status %#x, intvec %#x, errcode %#x\n", bhi_base,
+	    windowed_read(bar, bhi_base + 0x04), windowed_read(bar, bhi_base + 0x00), windowed_read(bar, bhi_base + 0x28),
+	    windowed_read(bar, bhi_base + 0x2c), windowed_read(bar, bhi_base + 0x20), windowed_read(bar, bhi_base + 0x30));
+	tell("pcie: 44: writing INTVEC (base + 0x20) <- 0, as qwx(4) does before every download\n");
+	windowed_write(bar, bhi_base + 0x20, 0);
+	tell("pcie: 44: intvec now %#x; trying the download\n", windowed_read(bar, bhi_base + 0x20));
+	step_bhi_retry();
+}
+
 static void
 step_setup(uint32_t steps)
 {
@@ -3780,6 +3838,9 @@ step_setup(uint32_t steps)
 	}
 	if (steps >= 43) {
 		step_iatu_inbound();
+	}
+	if (steps >= 44) {
+		step_bhi_base();
 	}
 }
 
