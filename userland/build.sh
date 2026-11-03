@@ -411,6 +411,14 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
+# the K40's radio (QCA6390 on PCIe) keeps its firmware in ../fw-wifi/qca6390 -- the whole directory, because
+# amss20.bin is not the only file the vendor's stack reads out of it (the board data bd_*.elf and bdwlan.e*,
+# and Data.msc, are picked by board id and mode at run time). bsd/dev/hakios.pcie.c reads them as
+# fw/qca6390/NAME. The vendor's, and not in the repository, for the same reason as everything above.
+if [ -d ../fw-wifi/qca6390 ]; then
+	mkdir -p root/fw/qca6390
+	install -m 0644 ../fw-wifi/qca6390/* root/fw/qca6390/
+fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (bsd/dev/hakios.haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
 if [ -f ../fw-haptic/aw8697_haptic.bin ]; then

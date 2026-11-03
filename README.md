@@ -57,7 +57,7 @@ the phone is `works`; written and not yet seen is `partial`, with a note. The ta
 | haptic | missing | the aw8697 answers on I2C and its waveform RAM reads back correctly, but f0 calibration and playback do not pass and no vibration has been felt |
 | camera | missing | IMX582 and the rest |
 | torch | missing | the flash module is on the PMIC's SPMI and has been read, not driven |
-| wifi | missing | the QCA6390 is a PCIe endpoint behind pcie0 (stream ID 0x1c00) and the link has never trained on this SoC; hakios.wifi.c and wifi/lx in this tree are the POCO X5 Pro's (WCN6750, no PCIe) |
+| wifi | partial | the link trains to L0 and the QCA6390 (17cb:1101) enumerates behind pcie0: four rails voted through RPMh, PERST# released (it is active low), the LTSSM enabled with one plain write. Its configuration space, BAR0 (1 MB at 0x60400000), the half-BAR register window and its BHI block (version 1.2, exec env 0 = PBL) all read and write, and fw/qca6390/amss20.bin is in the image. What does not work yet is the first firmware download: BHI takes the descriptor, the endpoint attempts the transfer and fails (BHI_STATUS stays 0, ERRCODE 0xef128100, its error words echo our IMGADDR and IMGSIZE), so the secondary boot loader never starts and no MHI, QMI or ath11k exists. The driver is hakios.pcie.c, steps 1 to 43, each behind a boot argument |
 | bluetooth | missing | behind the same QCA6390, so behind the same link |
 | cellular | missing | the modem is not started; hakios.mpss.c in this tree is the POCO X5 Pro's |
 | network | missing | follows wifi and cellular; nothing of iOS's networking has been reached |

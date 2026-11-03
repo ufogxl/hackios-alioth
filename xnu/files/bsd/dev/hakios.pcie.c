@@ -232,6 +232,19 @@ static const struct pcie_phy_step pcie_phy_sequence[] = {
 
 static vm_offset_t parf, phy, dbi, elbi;
 static void step_setup(uint32_t steps);  /* (defined below, used by the runner above it) */
+/* (the read-only steps the reuse path calls before their definitions) */
+static void step_endpoint_config(void);
+static void step_bhi(void);
+static void step_capabilities(void);
+static void step_smmu_map(void);
+static void step_bhi_download(void);
+static void step_after_download(void);
+static void step_bhi_retry(void);
+static void step_iatu_map(void);
+static void step_bdf_to_sid(void);
+static void step_sid_table(void);
+static void step_stream_read(void);
+static void step_iatu_inbound(void);
 static uint32_t step;
 
 static inline uint32_t
@@ -455,9 +468,26 @@ step_resets(void)
 		uint32_t was = rd(gcc_window + pcie_resets[i].at);
 		uint32_t now = was & ~1u;
 
+		/*
+		 * Released, not pulsed. Mainline's qcom_pcie_init_2_7_0 asserts and releases, and that
+		 * was tried here: with the pulse, a clean boot reached L0 and then the core's slave
+		 * aperture answered 0xffffffff for the rest of the run. The runs that ended with an
+		 * endpoint that answered had no pulse. pcie_reset_pulse=1 puts it back for the next
+		 * experiment; the default follows the evidence.
+		 */
+		{
+			uint32_t pulse = 0;
+
+			PE_parse_boot_argn("pcie_reset_pulse", &pulse, sizeof(pulse));
+			if (pulse != 0) {
+				wr(gcc_window + pcie_resets[i].at, was | 1u);
+				delay_for_interval(1000, NSEC_PER_USEC);
+			}
+		}
 		wr(gcc_window + pcie_resets[i].at, now);
-		tell("pcie: 4:   %s %#x: %#x -> %#x (%s)\n", pcie_resets[i].name, pcie_resets[i].at,
-		    was, rd(gcc_window + pcie_resets[i].at), (was & 1) ? "was asserted" : "was already out");
+		delay_for_interval(1000, NSEC_PER_USEC);
+		tell("pcie: 4:   %s %#x: %#x -> %#x (%s)\n", pcie_resets[i].name, pcie_resets[i].at, was,
+		    rd(gcc_window + pcie_resets[i].at), (was & 1) ? "was asserted" : "was already out");
 	}
 	tell("pcie: 4:   link_down %#x, nocsr_com_phy %#x\n", rd(gcc_window + 0x6c014),
 	    rd(gcc_window + 0x6c020));
@@ -508,6 +538,61 @@ pcie_run(uint32_t steps)
 	}
 	if (parf == 0 && !pcie_map()) {
 		return;
+	}
+	/*
+	 * pcie_reuse=1: if the endpoint is already at L0, do not initialise anything.
+	 *
+	 * A run that ends with the link up leaves the controller initialised, and every step that
+	 * brings it up again -- the reset release, the PARF writes, the PERST# sequence -- is one that
+	 * has been measured to break a working link. So a repeated experiment can start from "the link
+	 * is already there" and only read, which is what a debug loop wants: the alternative is a cold
+	 * boot between every attempt (five minutes each) because a warm one cannot re-initialise.
+	 */
+	{
+		uint32_t reuse = 0;
+
+		PE_parse_boot_argn("pcie_reuse", &reuse, sizeof(reuse));
+		if (reuse != 0 && (rd(parf + PARF_LTSSM) & 0x3f) == 0x11) {
+			tell("pcie: reuse: the link is already at L0 (ltssm %#x); nothing is initialised\n",
+			    rd(parf + PARF_LTSSM));
+			if (steps >= 28) {
+				step_endpoint_config();
+			}
+			if (steps >= 30) {
+				step_bhi();
+			}
+			if (steps >= 31) {
+				step_capabilities();
+			}
+			if (steps >= 35) {
+				step_smmu_map();
+			}
+			if (steps >= 36) {
+				step_bhi_download();
+			}
+			if (steps >= 37) {
+				step_after_download();
+			}
+			if (steps >= 38) {
+				step_bhi_retry();
+			}
+			if (steps >= 39) {
+				step_iatu_map();
+			}
+			if (steps >= 40) {
+				step_bdf_to_sid();
+			}
+			if (steps >= 41) {
+				step_sid_table();
+			}
+			if (steps >= 42) {
+				step_stream_read();
+			}
+			if (steps >= 43) {
+				step_iatu_inbound();
+			}
+			return;
+		}
 	}
 	step_read();
 	if (steps >= 5) {
@@ -1842,9 +1927,56 @@ link_up_now(void)
 	uint32_t debug1 = rd(dbi + DBI_PORT_DEBUG1);
 	uint32_t link = rd(dbi + DBI_LINK_CTRL_STATUS);
 
-	return (rd(parf + PARF_LTSSM) & 0x3f) == 0x11 ||
-	    (debug1 & DBI_PORT_DEBUG1_LINK_UP) != 0 ||
-	    (link != 0xffffffffu && ((link >> 29) & 1) != 0);
+	if ((rd(parf + PARF_LTSSM) & 0x3f) == 0x11) {
+		return true;
+	}
+	/*
+	 * 0xffffffff is what this interconnect returns when the slave did not answer, and its bit 4
+	 * (debug1's LINK_UP) and bit 29 (the link word's data-link-active) are both set in it. An
+	 * error response is not a link, and reading it as one made step 27 announce "LINK IS UP" on a
+	 * window that was answering nothing at all.
+	 */
+	if (debug1 == 0xffffffffu || link == 0xffffffffu) {
+		return false;
+	}
+	return (debug1 & DBI_PORT_DEBUG1_LINK_UP) != 0 || ((link >> 29) & 1) != 0;
+}
+
+/*
+ * ltssm_restart: the vendor's link-down recovery followed by a real start edge.
+ *
+ * Everything here is measured: after a boot that already trained the link, the next boot's PERST#
+ * assert drops it, the controller goes into flush mode with the state at 0x5, and simply writing
+ * LTSSM_EN again does nothing -- the bit was already set, and a level is not an edge. So: wait for
+ * the flush to have finished (PARF_STATUS bit 8), pulse SW_CLR_FLUSH_MODE (bit 10, a request, not a
+ * bit to clear), wait for FLUSH_MODE (bit 11) to fall, then drop LTSSM_EN and raise it again.
+ */
+static void
+ltssm_restart(void)
+{
+	uint32_t now;
+	unsigned i;
+
+	for (i = 0; i < 200; i++) {
+		if ((rd(parf + PARF_STATUS) & (1u << 8)) != 0) {
+			break;
+		}
+		delay_for_interval(10, NSEC_PER_USEC);
+	}
+	now = rd(parf + PARF_LTSSM);
+	wr(parf + PARF_LTSSM, (now & ~(1u << 11)) | (1u << 10) | (1u << 8));
+	for (i = 0; i < 200; i++) {
+		now = rd(parf + PARF_LTSSM);
+		if ((now & (1u << 11)) == 0) {
+			break;
+		}
+		delay_for_interval(10, NSEC_PER_USEC);
+	}
+	wr(parf + PARF_LTSSM, now & ~(1u << 8));                /* (stop: the edge needs a low) */
+	delay_for_interval(2000, NSEC_PER_USEC);
+	wr(parf + PARF_LTSSM, (now & ~(1u << 8)) | (1u << 8));  /* (and start again) */
+	now = rd(parf + PARF_LTSSM);
+	tell("pcie: 27: ltssm restarted: %#x (state %#x, flush %u)\n", now, now & 0x3f, (now >> 11) & 1);
 }
 
 static void
@@ -1856,6 +1988,20 @@ step_endpoint_polarity(void)
 
 	if (parf == 0 || dbi == 0 || elbi == 0) {
 		tell("pcie: 27: a window is missing\n");
+		return;
+	}
+	/*
+	 * A measured rule: if the link is already up, do not touch PERST# at all.
+	 *
+	 * Step 18 ends with a link that is up (its own log says elbi 0x5401, bit 10 set), and the
+	 * steps after it used to assert PERST# anyway -- and from that point the wrapper's whole slave
+	 * aperture (dm_core 0x60000000 and the ELBI with it) answers 0xffffffff while PARF keeps
+	 * answering, clocks running and both resets released. Taking a trained link down is what
+	 * precedes it, so an intact link is left intact.
+	 */
+	if (link_up_now()) {
+		tell("pcie: 27: the link is already up (ltssm %#x, elbi %#x); PERST# is left alone\n",
+		    rd(parf + PARF_LTSSM), rd(elbi + ELBI_SYS_STTS));
 		return;
 	}
 	tlmm = ml_io_map(0x0f900000UL, 0x0007d000UL);
@@ -1887,9 +2033,15 @@ step_endpoint_polarity(void)
 	wr(elbi + ELBI_SYS_CTRL, now | 1u);
 	tell("pcie: 27: elbi sys_ctrl %#x -> %#x (LT_ENABLE), port debug1 %#x\n", now, rd(elbi + ELBI_SYS_CTRL),
 	    rd(dbi + DBI_PORT_DEBUG1));
+	/*
+	 * The plain enable, as it was in the runs that ended with an endpoint that answered: clear the
+	 * two flush bits and raise LTSSM_EN in one write. The helper below (a vendor-style pulse plus a
+	 * low-high edge on LTSSM_EN) is kept for the retry path, because the boots that worked did not
+	 * use it here and the boots that broke the slave aperture did.
+	 */
 	now = rd(parf + PARF_LTSSM);
 	wr(parf + PARF_LTSSM, (now & ~(1u << 11) & ~(1u << 10)) | (1u << 8));
-	tell("pcie: 27: parf ltssm %#x -> %#x\n", now, rd(parf + PARF_LTSSM));
+	tell("pcie: 27: parf ltssm %#x -> %#x (plain enable)\n", now, rd(parf + PARF_LTSSM));
 
 	for (i = 1; i <= 40; i++) {
 		delay_for_interval(20000, NSEC_PER_USEC);
@@ -1901,6 +2053,9 @@ step_endpoint_polarity(void)
 			tell("pcie: 27:   try %u: ltssm %#x (state %#x, flush %u), debug0 %#x, debug1 %#x, dbi link %#x\n",
 			    i, now, now & 0x3f, (now >> 11) & 1, rd(dbi + DBI_PORT_DEBUG0), rd(dbi + DBI_PORT_DEBUG1),
 			    rd(dbi + DBI_LINK_CTRL_STATUS));
+			if ((now & 0x3f) == 0x5 && (i % 10) == 0) {
+				ltssm_restart();        /* (a state that has not moved gets a fresh edge) */
+			}
 		}
 	}
 	now = rd(parf + PARF_LTSSM);
@@ -1995,6 +2150,1430 @@ step_endpoint_config(void)
 		tell("pcie: 28:   bar%u = %#x\n", b, rd(conf + 0x10 + 4 * b));
 	}
 	tell("pcie: 28:   subsystem id %#x, cap pointer %#x\n", rd(conf + 0x2c), rd(conf + 0x34));
+}
+
+/*
+ * Step 29: the endpoint's BAR, its memory window, and the two command bits that make them live.
+ *
+ * The configuration space answers (step 28), so the endpoint can be asked what it wants and given
+ * it. Three pieces, in the order a host does them:
+ *
+ * 1. size bar0 by writing all ones into it (and into bar1, because bar0's low bits say it is a
+ *    64-bit memory BAR) and reading the mask back, then restore what was there;
+ * 2. give it an address out of the controller's memory window (dt: 0x60300000 + 0x3d00000), and
+ *    tell the root bridge about that window in its own type-1 header (memory base/limit, 0x20);
+ * 3. point iATU region 1 at that window (type 0, memory, identity) and set the endpoint's command
+ *    bits 1 and 2 -- memory space and bus master.
+ *
+ * Each write says what it is about to do before it does it: the first access through a window that
+ * is not configured is the one that hangs, and a log that stops after "about to" names the culprit.
+ */
+#define EP_BAR_ADDRESS  0x60400000UL    /* (inside the dt's memory window, 1 MB aligned) */
+#define EP_BAR_SIZE     0x00100000UL
+
+static vm_offset_t endpoint_bar(void);   /* (defined with step 30: one mapping, reused) */
+
+static void
+step_endpoint_bar(void)
+{
+	vm_offset_t iatu, conf, bars;
+	uint32_t save0, save1, mask0, mask1;
+
+	if (parf == 0 || dbi == 0) {
+		tell("pcie: 29: a window is missing\n");
+		return;
+	}
+	iatu = ml_io_map(IATU_PHYS, IATU_SIZE);
+	conf = ml_io_map(CONF_PHYS, 0x1000);
+	if (iatu == 0 || conf == 0) {
+		tell("pcie: 29: the iatu or the conf window could not be mapped\n");
+		return;
+	}
+	iatu_region0(iatu, 0x04, CONF_PHYS, CONF_PHYS + 0xfff, BDF(1, 0));
+	if (rd(conf + 0x00) != 0x110117cb) {
+		tell("pcie: 29: the endpoint does not answer (%#x); nothing else is written\n", rd(conf + 0x00));
+		return;
+	}
+
+	/* 1. how big is bar0 */
+	save0 = rd(conf + 0x10);
+	save1 = rd(conf + 0x14);
+	tell("pcie: 29: bar0 %#x bar1 %#x before sizing\n", save0, save1);
+	wr(conf + 0x10, 0xffffffffu);
+	wr(conf + 0x14, 0xffffffffu);
+	mask0 = rd(conf + 0x10);
+	mask1 = rd(conf + 0x14);
+	wr(conf + 0x10, save0);
+	wr(conf + 0x14, save1);
+	tell("pcie: 29: bar0 mask %#x, bar1 mask %#x -> %s, size %#x\n", mask0, mask1,
+	    (mask0 & 0x6) == 0x4 ? "a 64-bit memory bar" : "not a 64-bit memory bar",
+	    ~(uint32_t)(mask0 & ~0xfu) + 1);
+
+	/* 2. an address, and the root bridge's window over it */
+	wr(conf + 0x10, (uint32_t) EP_BAR_ADDRESS);
+	wr(conf + 0x14, (uint32_t)((uint64_t) EP_BAR_ADDRESS >> 32));
+	tell("pcie: 29: bar0 = %#x, bar1 = %#x\n", rd(conf + 0x10), rd(conf + 0x14));
+	{
+		uint32_t base = ((uint32_t) EP_BAR_ADDRESS >> 16) & 0xfff0u;
+		uint32_t limit = ((uint32_t)(EP_BAR_ADDRESS + EP_BAR_SIZE - 1) >> 16) & 0xfff0u;
+		uint32_t was = rd(dbi + 0x20);
+
+		wr(dbi + 0x20, (limit << 16) | base);
+		tell("pcie: 29: root bridge memory base/limit %#x -> %#x (base %#x, limit %#x)\n", was,
+		    rd(dbi + 0x20), base << 16, limit << 16);
+		wr(dbi + 0x24, 0);                      /* (the upper 32 bits of both: inside 4 GB) */
+	}
+
+	/* 3. iATU region 1: an identity window for memory, then the command bits */
+	iatu_region0(iatu + 0x200, 0x00, EP_BAR_ADDRESS, EP_BAR_ADDRESS + EP_BAR_SIZE - 1, EP_BAR_ADDRESS);
+	tell("pcie: 29: iatu region 1: ctrl1 %#x, lbar %#x, lar %#x, ltar %#x, ctrl2 %#x\n", rd(iatu + 0x200),
+	    rd(iatu + 0x208), rd(iatu + 0x210), rd(iatu + 0x214), rd(iatu + 0x204));
+	{
+		uint32_t command = rd(conf + 0x04);
+
+		wr(conf + 0x04, (command & 0xffff0000u) | 0x0006u);   /* (mem space, bus master) */
+		tell("pcie: 29: command %#x -> %#x\n", command, rd(conf + 0x04));
+	}
+
+	bars = endpoint_bar();
+	if (bars == 0) {
+		tell("pcie: 29: bar0's window could not be mapped\n");
+		return;
+	}
+	tell("pcie: 29: about to read the endpoint's registers through bar0 (%#lx) -- if nothing follows, that read hung\n",
+	    bars);
+	tell("pcie: 29: bar0[0x00] %#x, [0x04] %#x, [0x08] %#x, [0x0c] %#x\n", rd(bars), rd(bars + 0x04),
+	    rd(bars + 0x08), rd(bars + 0x0c));
+}
+
+/*
+ * Step 30: the chip's register window, and the BHI block behind it.
+ *
+ * The BAR is 1 MB, and the MHI/BHI registers live at 0x1e0e000 and up -- outside it. QCA6390 does
+ * what several Qualcomm parts do: the upper half of the BAR is a window, and which 0x80000-byte
+ * slice it shows is chosen by writing to a control register (cnss2/reg.h:66-71, cnss2/pci.c:427-472):
+ *
+ *	window = (offset >> 19) & 0x3f;
+ *	write BAR + 0x310c = 0x40000000 | window;        (REMAP_BAR_CTRL)
+ *	read  BAR + 0x80000 + (offset & 0x7ffff);
+ *
+ * So the BHI block at 0x1e0e200 is window 0x3c, in-window offset 0xe200. The registers are the ones
+ * mhi_internal.h names (k40-ref, drivers/bus/mhi/core/mhi_internal.h:169-198): version minor/major
+ * at 0x0/0x4, exec environment at 0x28, status at 0x2c, error code at 0x30, the three debug words
+ * after it. A block that answers with a version is a block the host can talk to.
+ */
+#define REMAP_BAR_CTRL  0x310c          /* (cnss2 reg.h:7) */
+#define WINDOW_BIT      0x40000000u
+#define WINDOW_START    0x00080000u
+#define WINDOW_MASK     0x0007ffffu
+
+static uint32_t
+windowed_read(vm_offset_t bar, uint32_t offset)
+{
+	uint32_t window = (offset >> 19) & 0x3f;
+
+	wr(bar + REMAP_BAR_CTRL, WINDOW_BIT | window);
+	return rd(bar + WINDOW_START + (offset & WINDOW_MASK));
+}
+
+static vm_offset_t
+endpoint_bar(void)
+{
+	static vm_offset_t cached;
+
+	if (cached == 0) {
+		cached = ml_io_map(EP_BAR_ADDRESS, 0x100000);
+	}
+	return cached;
+}
+
+static void
+step_bhi(void)
+{
+	vm_offset_t bar;
+	static const struct {
+		uint32_t at;
+		const char *what;
+	} bhi[] = {
+		{ 0x1e0e200, "BHI version minor" },
+		{ 0x1e0e204, "BHI version major" },
+		{ 0x1e0e208, "BHI image address low" },
+		{ 0x1e0e210, "BHI image size" },
+		{ 0x1e0e228, "BHI exec environment" },
+		{ 0x1e0e22c, "BHI status" },
+		{ 0x1e0e230, "BHI error code" },
+		{ 0x1e0e234, "BHI error debug 1" },
+		{ 0x1e0e238, "BHI error debug 2" },
+		{ 0x1e0e23c, "BHI error debug 3" },
+		{ 0x1e0e240, "BHI serial number" },
+		{ 0x1e0e244, "BHI SBL anti-rollback version" },
+		{ 0x1e0e248, "BHI number of segments" },
+	};
+
+	if (parf == 0) {
+		tell("pcie: 30: no parf window\n");
+		return;
+	}
+	if ((rd(parf + PARF_LTSSM) & 0x3f) != 0x11) {
+		tell("pcie: 30: the link is not at L0 (state %#x)\n", rd(parf + PARF_LTSSM) & 0x3f);
+	}
+	bar = endpoint_bar();                           /* (mapped once: 1 MB of kernel map is not free to waste) */
+	if (bar == 0) {
+		tell("pcie: 30: the bar could not be mapped\n");
+		return;
+	}
+	tell("pcie: 30: bar at %#lx; the unwindowed half first: [0x00] %#x, [0x04] %#x, [0x08] %#x, [0x0c] %#x\n",
+	    bar, rd(bar), rd(bar + 0x04), rd(bar + 0x08), rd(bar + 0x0c));
+	{
+		uint32_t was = rd(bar + REMAP_BAR_CTRL);
+
+		tell("pcie: 30: remap bar ctrl reads %#x before any window is selected\n", was);
+	}
+	for (unsigned i = 0; i < sizeof(bhi) / sizeof(bhi[0]); i++) {
+		uint32_t value = windowed_read(bar, bhi[i].at);
+
+		tell("pcie: 30:   %#x %s: %#x\n", bhi[i].at, bhi[i].what, value);
+	}
+	tell("pcie: 30: the whole BHI page, window %#x, in-window 0xe000 to 0xe280:\n",
+	    (0x1e0e200u >> 19) & 0x3f);
+	for (uint32_t at = 0x1e0e000; at <= 0x1e0e280; at += 16) {
+		tell("pcie: 30:   %#x: %#x %#x %#x %#x\n", at, windowed_read(bar, at), windowed_read(bar, at + 4),
+		    windowed_read(bar, at + 8), windowed_read(bar, at + 12));
+	}
+}
+
+/*
+ * Step 31: the endpoint's capabilities, and the MSI one especially.
+ *
+ * Everything the MHI layer will need arrives as a message: the firmware's doorbells, the event rings'
+ * updates, the completion of a download. That is the endpoint's MSI capability, and before it can be
+ * programmed the host has to read what the endpoint asks for: how many vectors, whether the address
+ * is 64-bit, and whether it has the per-vector mask and pending registers.
+ *
+ * The capability list starts at the header's 0x34 (its low byte, two low bits clear) and is a chain of
+ * {id, next} byte pairs. MSI is id 0x05, MSI-X is 0x11; each entry's layout is the one in PCI 3.0:
+ * for MSI, control at +2 (bits 2:0 vectors - 1 when 64-bit addressing, bit 7 64-bit capable, bit 8
+ * per-vector masking) and the address at +4 / +8, then data; for MSI-X, control at +2 (bits 10:0
+ * table size - 1), the table's offset and BIR at +4, the PBA's at +8.
+ *
+ * Device memory is read a word at a time and the bytes taken from the word: byte accesses to this
+ * window are not what anything that works on this board does.
+ */
+static uint32_t
+conf_word(vm_offset_t conf, uint32_t at)
+{
+	return rd(conf + (at & ~3u));
+}
+
+static uint8_t
+conf_byte(vm_offset_t conf, uint32_t at)
+{
+	uint32_t word = conf_word(conf, at);
+
+	return (uint8_t)(word >> (8 * (at & 3)));
+}
+
+static void
+step_capabilities(void)
+{
+	vm_offset_t iatu, conf;
+	uint32_t at;
+	unsigned seen = 0;
+
+	if (parf == 0) {
+		tell("pcie: 31: no parf window\n");
+		return;
+	}
+	if ((rd(parf + PARF_LTSSM) & 0x3f) != 0x11) {
+		tell("pcie: 31: the link is not at L0 (state %#x)\n", rd(parf + PARF_LTSSM) & 0x3f);
+	}
+	iatu = ml_io_map(IATU_PHYS, IATU_SIZE);
+	conf = ml_io_map(CONF_PHYS, 0x1000);
+	if (iatu == 0 || conf == 0) {
+		tell("pcie: 31: the iatu or the conf window could not be mapped\n");
+		return;
+	}
+	iatu_region0(iatu, 0x04, CONF_PHYS, CONF_PHYS + 0xfff, BDF(1, 0));
+	if (rd(conf + 0x00) != 0x110117cb) {
+		tell("pcie: 31: the endpoint does not answer (%#x)\n", rd(conf + 0x00));
+		return;
+	}
+	at = conf_byte(conf, 0x34) & 0xfc;
+	tell("pcie: 31: status %#x, the capability list starts at %#x\n", conf_word(conf, 0x04) >> 16, at);
+	while (at != 0 && seen++ < 16) {
+		uint8_t id = conf_byte(conf, at);
+		uint8_t next = conf_byte(conf, at + 1) & 0xfc;
+
+		if (id == 0x05) {
+			uint32_t control = conf_word(conf, at + 2) >> 16;
+			unsigned vectors = (control & 0x7) + 1;
+			uint32_t address_low = conf_word(conf, at + 4);
+			uint32_t address_high = (control & 0x80) ? conf_word(conf, at + 8) : 0;
+			unsigned data_at = (control & 0x80) ? 12 : 8;
+
+			tell("pcie: 31:   MSI at %#x: control %#x -- %u vectors, 64-bit %s, per-vector mask %s\n", at, control,
+			    vectors, (control & 0x80) ? "yes" : "no", (control & 0x100) ? "yes" : "no");
+			tell("pcie: 31:     message address %#x%08x, data %#x, enable %u\n", address_high, address_low,
+			    conf_word(conf, at + data_at) & 0xffff, control & 1);
+			if (control & 0x100) {
+				tell("pcie: 31:     mask %#x, pending %#x\n", conf_word(conf, at + data_at + 4),
+				    conf_word(conf, at + data_at + 8));
+			}
+		} else if (id == 0x11) {
+			uint32_t control = conf_word(conf, at + 2) >> 16;
+
+			tell("pcie: 31:   MSI-X at %#x: control %#x -- %u vectors, table at %#x (bir %u), pba at %#x (bir %u), enable %u\n",
+			    at, control, (control & 0x7ff) + 1, conf_word(conf, at + 4) & ~0x7u, conf_word(conf, at + 4) & 0x7,
+			    conf_word(conf, at + 8) & ~0x7u, conf_word(conf, at + 8) & 0x7, (control >> 15) & 1);
+		} else {
+			tell("pcie: 31:   capability %#x at %#x\n", id, at);
+		}
+		if (next == at) {
+			break;
+		}
+		at = next;
+	}
+	tell("pcie: 31: %u capabilities walked\n", seen);
+}
+
+/*
+ * Step 32: what the SMMU in front of this endpoint already says, read only.
+ *
+ * The device tree maps the endpoint's RID to the apps SMMU (qcom,smmu-sid-base = 0x1c00; iommu-map
+ * sends RID 0x0 to 0x1c00 and RID 0x100 -- bus 1 device 0, which is where the QCA6390 enumerated --
+ * to 0x1c01). That SMMU is qcom,skip-init: nothing in this tree has ever programmed it, so its state
+ * is whatever the boot loader left, and the question this step answers is the one that decides the
+ * next piece of work: is this stream already bypassed (then the firmware download can use physical
+ * addresses and no page tables are needed), already translating (then someone has tables for it),
+ * or unmatched (then the global SCR0 decides, and we must add a match register ourselves).
+ *
+ * The register layout is hakios.camera.c's (SMMU_PHYS 0x15000000, SMR at 0x800 + 4n with the stream
+ * in [14:0] and the mask in [30:16], S2CR at 0xc00 + 4n with the type in [17:16] and the context in
+ * [7:0], GR1 one page block up, context n at (pages + n) * page size). Nothing is written.
+ */
+#define SMMU_PHYS       0x15000000UL
+#define SMMU_SIZE       0x00100000UL
+#define SMMU_SCR0       0x000
+#define SMMU_IDR0       0x020
+#define SMMU_IDR1       0x024
+#define SMMU_SMR(n)     (0x800 + 4 * (n))
+#define SMMU_S2CR(n)    (0xc00 + 4 * (n))
+
+static void
+step_smmu_look(void)
+{
+	static const uint32_t ours[] = { 0x1c00, 0x1c01 };
+	vm_offset_t smmu;
+	uint32_t idr0, idr1, scr0, page_size, pages;
+
+	smmu = ml_io_map(SMMU_PHYS, 0x1000);            /* (GR0: scr0, idr, smr, s2cr all live here) */
+	if (smmu == 0) {
+		tell("pcie: 32: the apps smmu (%#lx) could not be mapped\n", (unsigned long) SMMU_PHYS);
+		return;
+	}
+	scr0 = rd(smmu + SMMU_SCR0);
+	idr0 = rd(smmu + SMMU_IDR0);
+	idr1 = rd(smmu + SMMU_IDR1);
+	page_size = (idr1 >> 31) ? 0x10000 : 0x1000;
+	pages = 2u << ((idr1 >> 28) & 7);
+	tell("pcie: 32: apps smmu: scr0 %#x (an unmatched stream %s), smrs %u, contexts %u, page size %#x, %u page blocks\n",
+	    scr0, (scr0 & 0x400) ? "faults" : "passes", idr0 & 0xff, idr1 & 0xff, page_size, pages);
+	if (2 * pages * page_size != SMMU_SIZE) {
+		tell("pcie: 32: that layout is not the known one (2 * %u * %#x != %#x)\n", pages, page_size,
+		    (unsigned) SMMU_SIZE);
+	}
+	{
+		unsigned matched = 0, free_matches = 0;
+		uint32_t first_free = ~0u;
+
+		for (uint32_t n = 0; n < (idr0 & 0xff) && SMMU_SMR(n) < 0xc00; n++) {
+			uint32_t smr = rd(smmu + SMMU_SMR(n)), s2cr = rd(smmu + SMMU_S2CR(n));
+			uint32_t stream = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
+
+			if ((smr >> 31) == 0) {
+				free_matches++;
+				if (first_free == ~0u) {
+					first_free = n;
+				}
+				continue;
+			}
+			for (unsigned k = 0; k < sizeof(ours) / sizeof(ours[0]); k++) {
+				if (((ours[k] ^ stream) & ~mask) != 0) {
+					continue;
+				}
+				matched++;
+				tell("pcie: 32:   smr %u: stream %#x mask %#x covers %#x; s2cr %#x = type %u (%s), context %u\n", n,
+				    stream, mask, ours[k], s2cr, (s2cr >> 16) & 3,
+				    ((s2cr >> 16) & 3) == 0 ? "translate" : ((s2cr >> 16) & 3) == 1 ? "bypass" :
+				    ((s2cr >> 16) & 3) == 2 ? "fault" : "reserved", s2cr & 0xff);
+			}
+		}
+		tell("pcie: 32: %u match registers free (first %u), %u of them cover our streams\n", free_matches, first_free,
+		    matched);
+		if (matched == 0) {
+			tell("pcie: 32: nothing matches 0x1c00/0x1c01 -- scr0 decides, and scr0 %s\n",
+			    (scr0 & 0x400) ? "faults" : "passes");
+		}
+	}
+}
+
+/*
+ * Step 33: the endpoint's streams, bypassed in the apps SMMU.
+ *
+ * Step 32 showed why something has to be done: 87 match registers, 80 of them free, and not one
+ * covers 0x1c00 or 0x1c01 -- and SCR0 says an unmatched stream faults. So the first DMA the chip
+ * makes would be killed by the SMMU in front of it, with nothing in the log to say so.
+ *
+ * A bypass match is the smallest useful entry, and it is what the boot loader gives most streams:
+ * S2CR's type 1 means "do not translate", and the address the chip is handed is then the physical
+ * one. That is enough for the firmware download (the host says "read this physical buffer"), and it
+ * is reversible: the previous SMR and S2CR values are printed before they are overwritten.
+ *
+ * The layout is hakios.camera.c's: SMR = bit31 valid | mask << 16 | stream, S2CR = type << 16 |
+ * context, and the type is 0 translate, 1 bypass, 2 fault.
+ */
+#define SMMU_SCR0       0x000
+#define SMMU_SMR(n)     (0x800 + 4 * (n))
+#define SMMU_S2CR(n)    (0xc00 + 4 * (n))
+#define S2CR_TYPE_BYPASS (1u << 16)
+
+static void
+step_smmu_bypass(void)
+{
+	static const uint32_t streams[] = { 0x1c01, 0x1c00 };   /* (bus1 dev0 first: that is our endpoint) */
+	vm_offset_t smmu;
+	uint32_t idr0;
+	unsigned free_smr[2] = { ~0u, ~0u }, used = 0;
+
+	smmu = ml_io_map(SMMU_PHYS, 0x1000);
+	if (smmu == 0) {
+		tell("pcie: 33: the apps smmu could not be mapped\n");
+		return;
+	}
+	idr0 = rd(smmu + SMMU_IDR0);
+	for (uint32_t n = 0; n < (idr0 & 0xff) && SMMU_SMR(n) < 0xc00 && used < 2; n++) {
+		if ((rd(smmu + SMMU_SMR(n)) >> 31) == 0) {
+			free_smr[used++] = n;
+		}
+	}
+	if (used < 2) {
+		tell("pcie: 33: only %u free match registers; nothing is written\n", used);
+		return;
+	}
+	for (unsigned k = 0; k < 2; k++) {
+		unsigned n = free_smr[k];
+		uint32_t old_smr = rd(smmu + SMMU_SMR(n)), old_s2cr = rd(smmu + SMMU_S2CR(n));
+
+		tell("pcie: 33: match register %u was smr %#x s2cr %#x; giving it stream %#x as bypass\n", n, old_smr,
+		    old_s2cr, streams[k]);
+		/*
+		 * The type field is 2 bits at [17:16]; what the hardware does with a write is a reading,
+		 * not an assumption, so all three values go in and are read back before the real one is
+		 * left in place.
+		 */
+		for (uint32_t type = 0; type < 3; type++) {
+			wr(smmu + SMMU_S2CR(n), type << 16);
+			tell("pcie: 33:   s2cr: wrote type %u (%#x), reads %#x\n", type, type << 16, rd(smmu + SMMU_S2CR(n)));
+		}
+		wr(smmu + SMMU_S2CR(n), S2CR_TYPE_BYPASS);
+		wr(smmu + SMMU_SMR(n), (1u << 31) | streams[k]);
+		tell("pcie: 33:   now smr %#x s2cr %#x (type %u)\n", rd(smmu + SMMU_SMR(n)), rd(smmu + SMMU_S2CR(n)),
+		    (rd(smmu + SMMU_S2CR(n)) >> 16) & 3);
+	}
+	tell("pcie: 33: 0x1c01 and 0x1c00 are bypassed; scr0 %#x, so nothing else changes behaviour\n",
+	    rd(smmu + SMMU_SCR0));
+}
+
+/*
+ * Step 34: why the core cannot be reached, asked at the moment it cannot.
+ *
+ * The symptom this answers is the one that keeps coming back: PARF_LTSSM says 0x11 (L0, the link
+ * trained) while every read of the core's own window -- dm_core 0x60000000, and through it the DBI --
+ * returns 0xffffffff. The wrapper and the core disagree, so one of them is lying about the other.
+ *
+ * 0xffffffff from a device read on this interconnect is an error response, not data: the slave did
+ * not answer. The candidates, in the order they are cheap to exclude:
+ *
+ *   1. the core's clocks are gated (gcc 0x6b014 slv_axi, 0x6b01c mstr_axi, 0x6b024 cfg_ahb and
+ *      0x6b02c pipe all have a halt bit: bit 2 of their branch register set means stopped);
+ *   2. the core is held in reset (gcc 0x6b000 bit 0 asserted);
+ *   3. the wrapper's own status says the slave space is out of range or the master is halted
+ *      (PARF_STATUS, PARF_SLV_ADDR_SPACE, PARF_AXI_MSTR_HALT);
+ *   4. the link really did fall over and PARF_LTSSM's low bits are stale.
+ *
+ * So: read all of those again, now, and read one dm_core word with the same breath. Whatever moved
+ * since step 2 is the answer.
+ */
+static void
+step_core_why(void)
+{
+	static const struct {
+		uint32_t at;
+		const char *what;
+	} branches[] = {
+		{ 0x6b014, "slv_axi_clk" },
+		{ 0x6b01c, "mstr_axi_clk" },
+		{ 0x6b024, "cfg_ahb_clk" },
+		{ 0x6b028, "aux_clk" },
+		{ 0x6b02c, "pipe_clk" },
+		{ 0x6b010, "slv_q2a_axi_clk" },
+	};
+
+	if (gcc_window == 0 || parf == 0 || dbi == 0) {
+		tell("pcie: 34: a window is missing\n");
+		return;
+	}
+	tell("pcie: 34: the controller's clocks now (bit 2 set in a branch register means it is not running):\n");
+	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
+		uint32_t value = rd(gcc_window + branches[i].at);
+
+		tell("pcie: 34:   %#x %s: %#x%s\n", branches[i].at, branches[i].what, value,
+		    (value & 0x4) ? " -- STOPPED" : " (running)");
+	}
+	tell("pcie: 34: gcc 0x52008 reads %#x (six branches), 0x6b000 core reset %#x, 0x6c01c phy reset %#x\n",
+	    rd(gcc_window + 0x52008), rd(gcc_window + 0x6b000), rd(gcc_window + 0x6c01c));
+	tell("pcie: 34: parf ltssm %#x (state %#x, flush %u, enable %u), status %#x, slv_addr_space %#x, axi_mstr_halt %#x\n",
+	    rd(parf + PARF_LTSSM), rd(parf + PARF_LTSSM) & 0x3f, (rd(parf + PARF_LTSSM) >> 11) & 1,
+	    (rd(parf + PARF_LTSSM) >> 8) & 1, rd(parf + PARF_STATUS), rd(parf + PARF_SLV_ADDR_SPACE),
+	    rd(parf + PARF_AXI_MSTR_HALT));
+	tell("pcie: 34: about to read dm_core (%#lx) once -- id should be 0x10b17cb if the core answers\n", dbi);
+	tell("pcie: 34: dm_core[0] %#x, elbi sys_stts %#x\n", rd(dbi), (elbi != 0) ? rd(elbi + ELBI_SYS_STTS) : 0xffffffffu);
+	/*
+	 * Two candidate repairs, each followed by the same read, because both registers were changed
+	 * from what the firmware left: the slave space size was 16 MB and this file raised it to 64 MB
+	 * (the device tree's value), and the system control word was 0x2000361c while this file writes
+	 * 0x365e (the vendor driver's value). If the wrapper's decoder is what stopped answering, one
+	 * of these brings it back, and the read says which.
+	 */
+	wr(parf + PARF_SLV_ADDR_SPACE, 0x01000000);
+	tell("pcie: 34: slv_addr_space back to 16 MB: dm_core[0] %#x, elbi %#x\n", rd(dbi), rd(elbi + ELBI_SYS_STTS));
+	wr(parf + PARF_SYS_CTRL, 0x2000361c);
+	tell("pcie: 34: sys_ctrl back to 0x2000361c: dm_core[0] %#x, elbi %#x\n", rd(dbi), rd(elbi + ELBI_SYS_STTS));
+	wr(parf + PARF_SYS_CTRL, 0x365e);
+	tell("pcie: 34: sys_ctrl back to the vendor's 0x365e: dm_core[0] %#x\n", rd(dbi));
+}
+
+/*
+ * Step 35: a translation context for the endpoint's streams, and a buffer behind it.
+ *
+ * Step 33 measured that this SMMU refuses stage-2 bypass: a bypass written into S2CR reads back as
+ * fault. So the firmware download's buffer has to be reachable through real tables. That is what
+ * hakios.camera.c already does for the camera's IFE streams (smmu_find/smmu_up, and this step is
+ * its shape with a different stream), and its register values are used here unchanged:
+ *
+ *   CBAR   = later stage 1, S1 BPSHCFG NSH, MEMATTR WB     SMMU_CBAR_STAGE_1
+ *   CBA2R  = 1 (TTBR0/1 written as 64-bit)                 SMMU_CBA2R(n)
+ *   TCR2   = 1 | 1<<4 | 7<<15                              SMMU_TCR2   (IPS 36-bit)
+ *   TCR    = 25 | 1<<8 | 1<<10 | 3<<12 | 1<<23             SMMU_TCR_39_BITS
+ *   MAIR0  = 0xf404ff44                                    SMMU_MAIR0
+ *   SCTLR  = 1|1<<1|1<<2|1<<5|1<<8|1<<12                   SMMU_SCTLR_ON
+ *   leaf   = phys | 3 | 1<<6 | 2<<8 | 1<<10 | 1<<11        CAM_PTE
+ *
+ * The buffer is 8 MB of contiguous physical memory (amss20.bin is 4.3 MB; the second half is room
+ * for the BHIE stage), and the IOVA is the physical address itself -- an identity mapping, which is
+ * what makes the value the chip is given equal to the value this kernel handed out.
+ *
+ * Gated by pcie_smmu_map=1: it writes a context and switches it on, and that is the kind of thing
+ * that should be asked for by name the first time.
+ */
+#define SMMU_SCR0               0x000
+#define SMMU_SMR(n)             (0x800 + 4 * (n))
+#define SMMU_S2CR(n)            (0xc00 + 4 * (n))
+#define SMMU_CBAR(n)            (4 * (n))
+#define SMMU_CBA2R(n)           (0x800 + 4 * (n))
+#define SMMU_CB_SCTLR           0x00
+#define SMMU_CB_TCR2            0x10
+#define SMMU_CB_TTBR0           0x20
+#define SMMU_CB_TTBR1           0x28
+#define SMMU_CB_TCR             0x30
+#define SMMU_CB_MAIR0           0x38
+#define SMMU_CB_MAIR1           0x3c
+#define SMMU_CB_FSR             0x58
+#define SMMU_CB_FAR             0x60
+#define SMMU_CB_FSYNR0          0x68
+#define SMMU_CB_TLBIASID        0x610
+#define SMMU_CB_TLBSYNC         0x7f0
+#define SMMU_CB_TLBSTATUS       0x7f4
+#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)
+#define SMMU_TCR_39_BITS        (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
+#define SMMU_TCR2               (1u | 1u << 4 | 7u << 15)
+#define SMMU_MAIR0              0xf404ff44u
+#define SMMU_SCTLR_ON           (1u | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 8 | 1u << 12)
+#define SMMU_FSR_ALL            0xc00001feu
+#define SMMU_PTE                (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)
+#define WIFI_BUFFER_BYTES       0x00800000ull           /* (8 MB: amss20.bin is 4.3 MB) */
+#define WIFI_IOVA               0x80000000ull           /* (2 GB: under 4 GB, so BHI can name it; not the phys) */
+
+extern uint64_t kvtophys(vm_offset_t va);   /* (hakios.camera.c declares it the same way) */
+
+static vm_offset_t wifi_buffer;                 /* (physical == virtual here: identity IOVA) */
+static uint64_t wifi_iova;
+static bool wifi_mapped;
+static uint32_t wifi_smmu_context = ~0u;
+
+static const uint8_t *
+wifi_firmware(uint64_t *size)
+{
+	extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+
+	return hakios_image_file("fw/qca6390", "amss20.bin", size, NULL);
+}
+
+static void
+step_smmu_map(void)
+{
+	vm_offset_t smmu, gr1, ctx, tables;
+	uint32_t idr0, idr1, page_size, pages, free_smr = ~0u, context = ~0u;
+	bool used[256] = { false };
+	uint64_t *root, *second, *third;
+
+	smmu = ml_io_map(SMMU_PHYS, 0x1000);
+	if (smmu == 0) {
+		tell("pcie: 35: the apps smmu could not be mapped\n");
+		return;
+	}
+	idr0 = rd(smmu + SMMU_IDR0);
+	idr1 = rd(smmu + SMMU_IDR1);
+	page_size = (idr1 >> 31) ? 0x10000 : 0x1000;
+	pages = 2u << ((idr1 >> 28) & 7);
+	if (2 * pages * page_size != SMMU_SIZE) {
+		tell("pcie: 35: the smmu layout is not the known one\n");
+		return;
+	}
+	gr1 = ml_io_map(SMMU_PHYS + page_size, page_size);
+	if (gr1 == 0) {
+		tell("pcie: 35: the smmu's context registers could not be mapped\n");
+		return;
+	}
+	for (uint32_t n = 0; n < (idr0 & 0xff); n++) {
+		uint32_t smr = rd(smmu + SMMU_SMR(n));
+
+		if (smr >> 31) {
+			used[rd(smmu + SMMU_S2CR(n)) & 0xff] = true;
+		} else if (free_smr == ~0u) {
+			free_smr = n;
+		}
+	}
+	for (context = 1; context < (idr1 & 0xff); context++) {   /* (0 is the one step 33 may have taken) */
+		if (!used[context]) {
+			break;
+		}
+	}
+	if (free_smr == ~0u || context >= (idr1 & 0xff)) {
+		tell("pcie: 35: no free match register or context\n");
+		return;
+	}
+	ctx = ml_io_map(SMMU_PHYS + (uint64_t)(pages + context) * page_size, page_size);
+	if (ctx == 0) {
+		tell("pcie: 35: context %u could not be mapped\n", context);
+		return;
+	}
+	/* the buffer, and three levels of tables for it (2 MB leaves: one second-level entry each) */
+	{
+		vm_offset_t memory = 0;
+
+		/*
+		 * Below 4 GB on purpose: BHI hands the endpoint a 32-bit IMGADDR_LOW, so a buffer at
+		 * 0x1_93058000 (which is what the first attempt got) is one the endpoint cannot be told
+		 * about. 0xfff00000 is the highest page-aligned start under 4 GB.
+		 */
+		if (kmem_alloc_contig(kernel_map, &memory, (vm_size_t) WIFI_BUFFER_BYTES, PAGE_MASK, 0x0fffff, 0,    /* (max_pnum: the highest page under 4 GB) */
+		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			tell("pcie: 35: no %llu KB of contiguous memory for the firmware buffer\n", WIFI_BUFFER_BYTES >> 10);
+			return;
+		}
+		wifi_buffer = memory;
+	}
+	if (kmem_alloc(kernel_map, &tables, 3 * 4096, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		tell("pcie: 35: no memory for the page tables\n");
+		return;
+	}
+	root = (uint64_t *) tables;
+	second = (uint64_t *)(tables + 4096);
+	third = (uint64_t *)(tables + 8192);
+	{
+		/*
+		 * The leaves are physical (kvtophys of the buffer) and the IOVA is a fixed low address,
+		 * not the physical one. Two reasons: a table built from the virtual address would describe
+		 * memory the endpoint cannot reach while looking perfectly programmed (that was the first
+		 * bug here), and BHI hands the endpoint a 32-bit IMGADDR_LOW, so the IOVA has to be under
+		 * 4 GB while the buffer itself need not be -- kmem_alloc_contig ignored the page-number
+		 * limit asked for and kept returning memory above 6 GB.
+		 */
+		uint64_t base = kvtophys(wifi_buffer);
+
+		root[(WIFI_IOVA >> 30) & 0x1ff] = kvtophys((vm_offset_t) second) | 3;
+		second[(WIFI_IOVA >> 21) & 0x1ff] = kvtophys((vm_offset_t) third) | 3;
+		for (unsigned i = 0; i < (WIFI_BUFFER_BYTES >> 21); i++) {
+			third[((WIFI_IOVA >> 21) & 0x1ff) + i] = (base + (i << 21)) | SMMU_PTE;
+		}
+	}
+	for (vm_offset_t line = tables; line < tables + 3 * 4096; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+
+	tell("pcie: 35: buffer at va %#llx = phys %#llx (%llu KB), tables at %#llx, context %u, match register %u\n",
+	    (unsigned long long) wifi_buffer, (unsigned long long) kvtophys(wifi_buffer), WIFI_BUFFER_BYTES >> 10,
+	    (unsigned long long) kvtophys(tables), context, free_smr);
+	wr(ctx + SMMU_CB_SCTLR, 0);
+	wr(gr1 + SMMU_CBA2R(context), 1);
+	wr(gr1 + SMMU_CBAR(context), SMMU_CBAR_STAGE_1);
+	wr(ctx + SMMU_CB_TCR2, SMMU_TCR2);
+	wr(ctx + SMMU_CB_TCR, SMMU_TCR_39_BITS);
+	{
+		uint64_t ttbr = kvtophys(tables) | ((uint64_t) context << 48);
+
+		wr(ctx + SMMU_CB_TTBR0, (uint32_t) ttbr);
+		wr(ctx + SMMU_CB_TTBR0 + 4, (uint32_t)(ttbr >> 32));
+	}
+	wr(ctx + SMMU_CB_TTBR1, 0);
+	wr(ctx + SMMU_CB_TTBR1 + 4, 0);
+	wr(ctx + SMMU_CB_MAIR0, SMMU_MAIR0);
+	wr(ctx + SMMU_CB_MAIR1, 0);
+	wr(ctx + SMMU_CB_FSR, SMMU_FSR_ALL);
+	wr(ctx + SMMU_CB_TLBIASID, context);
+	wr(ctx + SMMU_CB_TLBSYNC, 1);
+	for (unsigned waited = 0; rd(ctx + SMMU_CB_TLBSTATUS) & 1; waited++) {
+		if (waited > 1000) {
+			tell("pcie: 35: the smmu does not finish forgetting\n");
+			return;
+		}
+	}
+	tell("pcie: 35: context %u: cbar %#x, tcr %#x, ttbr0 %#x%08x, sctlr %#x\n", context, rd(gr1 + SMMU_CBAR(context)),
+	    rd(ctx + SMMU_CB_TCR), rd(ctx + SMMU_CB_TTBR0 + 4), rd(ctx + SMMU_CB_TTBR0), rd(ctx + SMMU_CB_SCTLR));
+	wr(ctx + SMMU_CB_SCTLR, SMMU_SCTLR_ON);
+	wifi_smmu_context = context;
+	/* both of the endpoint's streams, through that context */
+	for (unsigned k = 0; k < 2; k++) {
+		uint32_t stream = k == 0 ? 0x1c01 : 0x1c00;
+		unsigned smr = free_smr + k;
+
+		wr(smmu + SMMU_S2CR(smr), context);
+		wr(smmu + SMMU_SMR(smr), (1u << 31) | stream);
+		tell("pcie: 35: smr %u: stream %#x -> context %u (s2cr %#x, smr %#x)\n", smr, stream, context,
+		    rd(smmu + SMMU_S2CR(smr)), rd(smmu + SMMU_SMR(smr)));
+	}
+	tell("pcie: 35: sctlr now %#x (bit 0 on = the context is live)\n", rd(ctx + SMMU_CB_SCTLR));
+	wifi_iova = WIFI_IOVA;
+	wifi_mapped = true;
+	tell("pcie: 35: the endpoint's iova is %#llx (%s), the buffer's physical is %#llx\n",
+	    (unsigned long long) wifi_iova, wifi_iova < 0x100000000ull ? "under 4 GB, which BHI needs" : "ABOVE 4 GB",
+	    (unsigned long long) kvtophys(wifi_buffer));
+	{
+		uint64_t size = 0;
+		const uint8_t *image = wifi_firmware(&size);
+
+		tell("pcie: 35: the firmware in the image: fw/qca6390/amss20.bin %s (%llu bytes)\n",
+		    image != NULL ? "found" : "NOT FOUND", (unsigned long long) size);
+	}
+}
+
+/*
+ * Step 36: the first 512 KB of amss20.bin, through BHI.
+ *
+ * The sequence is mhi_boot.c's (BHI: mhi_boot.c:384-395, 597-612) and the research note's table:
+ *
+ *   1. BHI_EXECENV must read 0 -- the endpoint's own secondary boot loader has not run yet;
+ *   2. BHI_STATUS <- 0, so the bits this waits on mean this transfer;
+ *   3. the first min(512 KB, size) bytes of the image go into the DMA buffer, and the endpoint is
+ *      told where it is (IMGADDR_LOW/HIGH) and how long (IMGSIZE) -- 32-bit, hence the buffer had
+ *      to be allocated under 4 GB;
+ *   4. BHI_IMGTXDB <- a non-zero sequence number is the doorbell;
+ *   5. BHI_STATUS's bits[31:30] become 2 when the transfer is done and 3 when it failed, and a
+ *      failure names itself in ERRCODE and the three debug words;
+ *   6. BHI_EXECENV becoming 1 is the signal that the SBL is running -- and the signal to switch to
+ *      BHIE for the rest of the file. That is the next step; this one stops at the doorbell.
+ */
+static void
+windowed_write(vm_offset_t bar, uint32_t offset, uint32_t value)
+{
+	uint32_t window = (offset >> 19) & 0x3f;
+
+	wr(bar + REMAP_BAR_CTRL, WINDOW_BIT | window);
+	wr(bar + WINDOW_START + (offset & WINDOW_MASK), value);
+}
+
+static void
+step_bhi_download(void)
+{
+	vm_offset_t bar;
+	const uint8_t *image;
+	uint64_t size = 0;
+	uint32_t chunk, status, execenv, seq = 0x0051a7b3u;
+	unsigned i;
+
+	if (!wifi_mapped) {
+		tell("pcie: 36: the dma buffer is not mapped yet (pcie_smmu_map=1 runs step 35 first)\n");
+		return;
+	}
+	if (wifi_iova >= 0x100000000ull) {
+		tell("pcie: 36: the buffer is at %#llx, above 4 GB; BHI_IMGADDR_LOW cannot name it\n",
+		    (unsigned long long) wifi_iova);
+		return;
+	}
+	image = wifi_firmware(&size);
+	if (image == 0) {
+		tell("pcie: 36: fw/qca6390/amss20.bin is not in the image\n");
+		return;
+	}
+	if ((rd(parf + PARF_LTSSM) & 0x3f) != 0x11) {
+		tell("pcie: 36: the link is not at L0 (state %#x); the endpoint will not take a download\n",
+		    rd(parf + PARF_LTSSM) & 0x3f);
+		return;
+	}
+	bar = endpoint_bar();
+	if (bar == 0) {
+		tell("pcie: 36: the bar could not be mapped\n");
+		return;
+	}
+	execenv = windowed_read(bar, 0x1e0e228);
+	status = windowed_read(bar, 0x1e0e22c);
+	tell("pcie: 36: before: BHI exec env %u, status %#x (bits 31:30 = %u), image %llu bytes\n", execenv, status,
+	    status >> 30, (unsigned long long) size);
+	if (execenv != 0) {
+		tell("pcie: 36: the endpoint is not in PBL any more (exec env %u); nothing is written\n", execenv);
+		return;
+	}
+
+	chunk = (size > 0x80000u) ? 0x80000u : (uint32_t) size;
+	__builtin_memcpy((void *) wifi_buffer, image, chunk);
+	tell("pcie: 36: copied %#x bytes of the image into %#llx; telling the endpoint\n", chunk,
+	    (unsigned long long) wifi_iova);
+	windowed_write(bar, 0x1e0e22c, 0);                              /* (STATUS: clear the last verdict) */
+	windowed_write(bar, 0x1e0e20c, 0);                              /* (IMGADDR_HIGH) */
+	windowed_write(bar, 0x1e0e208, (uint32_t) wifi_iova);           /* (IMGADDR_LOW) */
+	windowed_write(bar, 0x1e0e210, chunk);                          /* (IMGSIZE) */
+	tell("pcie: 36: read back: addr %#x%08x, size %#x\n", windowed_read(bar, 0x1e0e20c),
+	    windowed_read(bar, 0x1e0e208), windowed_read(bar, 0x1e0e210));
+	windowed_write(bar, 0x1e0e218, seq);                            /* (the doorbell) */
+	tell("pcie: 36: rang the doorbell with %#x (reads %#x); waiting for the transfer\n", seq,
+	    windowed_read(bar, 0x1e0e218));
+
+	for (i = 1; i <= 400; i++) {
+		status = windowed_read(bar, 0x1e0e22c);
+		if ((status >> 30) != 0) {
+			break;
+		}
+		delay_for_interval(5000, NSEC_PER_USEC);
+	}
+	tell("pcie: 36: after %u polls: BHI status %#x -> %s\n", i, status,
+	    (status >> 30) == 2 ? "SUCCESS" : (status >> 30) == 3 ? "FAILED" : "still transferring");
+	if ((status >> 30) == 3 || status == 0xffffffffu) {
+		tell("pcie: 36: error code %#x, debug %#x %#x %#x\n", windowed_read(bar, 0x1e0e230),
+		    windowed_read(bar, 0x1e0e234), windowed_read(bar, 0x1e0e238), windowed_read(bar, 0x1e0e23c));
+		/*
+		 * 0xffffffff is an error response, not a verdict: the window stopped answering after the
+		 * doorbell. Two readings settle whether that is the endpoint or the memory it was told to
+		 * read from -- the SMMU's fault registers for our context, and whether the window comes
+		 * back at all.
+		 */
+		if (wifi_smmu_context != ~0u) {
+			uint32_t page_size = (rd(ml_io_map(SMMU_PHYS, 0x1000) + SMMU_IDR1) >> 31) ? 0x10000 : 0x1000;
+			uint32_t pages = 2u << ((rd(ml_io_map(SMMU_PHYS, 0x1000) + SMMU_IDR1) >> 28) & 7);
+			vm_offset_t ctx = ml_io_map(SMMU_PHYS + (uint64_t)(pages + wifi_smmu_context) * page_size, page_size);
+			vm_offset_t smmu = ml_io_map(SMMU_PHYS, 0x1000);
+
+			if (ctx != 0) {
+				tell("pcie: 36: smmu context %u: fsr %#x, far %#x, fsynr0 %#x (a non-zero fsr is the endpoint's read faulting)\n",
+				    wifi_smmu_context, rd(ctx + SMMU_CB_FSR), rd(ctx + SMMU_CB_FAR), rd(ctx + SMMU_CB_FSYNR0));
+			}
+			if (smmu != 0) {
+				tell("pcie: 36: smmu gr0: scr0 %#x, our smr/s2cr entries are still there\n", rd(smmu + SMMU_SCR0));
+			}
+		}
+		for (unsigned again = 0; again < 3; again++) {
+			delay_for_interval(5000, NSEC_PER_USEC);
+			tell("pcie: 36:   re-read %u: status %#x, exec env %#x, addr %#x%08x\n", again,
+			    windowed_read(bar, 0x1e0e22c), windowed_read(bar, 0x1e0e228),
+			    windowed_read(bar, 0x1e0e20c), windowed_read(bar, 0x1e0e208));
+		}
+		return;
+	}
+	for (i = 1; i <= 200; i++) {
+		execenv = windowed_read(bar, 0x1e0e228);
+		if (execenv != 0) {
+			break;
+		}
+		delay_for_interval(5000, NSEC_PER_USEC);
+	}
+	tell("pcie: 36: exec env %u after %u polls (%s)\n", execenv, i,
+	    execenv == 1 ? "the SBL is running: BHIE is next" : execenv == 0 ? "still PBL" : "something else is running");
+}
+
+/*
+ * Step 37: after the doorbell, who is still there.
+ *
+ * Step 36 rang BHI's doorbell and the window the endpoint keeps its registers in started answering
+ * 0xffffffff -- an error response, so the question is what actually happened to the endpoint. Three
+ * readings answer it without writing anything:
+ *
+ *   1. the endpoint's own configuration space, which the root complex reaches through the iATU and
+ *      not through the endpoint's BARs: 17cb:1101 still there means the device is alive and only
+ *      the BAR aperture changed meaning (a secondary boot loader taking the chip over would do
+ *      that), while 0xffffffff there means the device is gone;
+ *   2. the link: PARF_LTSSM and the two port debug registers;
+ *   3. the SMMU's fault registers, cleared first so that what is read afterwards is this step's and
+ *      not step 36's leftovers.
+ *
+ * The BHIE aperture is read too (BHI_EOFF at BAR + 0x2c, in the un-windowed half): it is the
+ * address the secondary boot loader's vector table lives at, and the next stage needs it.
+ */
+static void
+step_after_download(void)
+{
+	vm_offset_t iatu, conf, bar;
+	uint32_t bhie_off;
+
+	if (parf == 0 || dbi == 0) {
+		tell("pcie: 37: a window is missing\n");
+		return;
+	}
+	iatu = ml_io_map(IATU_PHYS, IATU_SIZE);
+	conf = ml_io_map(CONF_PHYS, 0x1000);
+	if (iatu != 0 && conf != 0) {
+		iatu_region0(iatu, 0x04, CONF_PHYS, CONF_PHYS + 0xfff, BDF(1, 0));
+		tell("pcie: 37: the endpoint's configuration space now reads id %#x (17cb:1101 means it is alive), command %#x\n",
+		    rd(conf + 0x00), rd(conf + 0x04));
+	} else {
+		tell("pcie: 37: the conf window could not be mapped\n");
+	}
+	tell("pcie: 37: the link: parf ltssm %#x (state %#x, flush %u), debug0 %#x, debug1 %#x, dbi link %#x\n",
+	    rd(parf + PARF_LTSSM), rd(parf + PARF_LTSSM) & 0x3f, (rd(parf + PARF_LTSSM) >> 11) & 1,
+	    rd(dbi + DBI_PORT_DEBUG0), rd(dbi + DBI_PORT_DEBUG1), rd(dbi + DBI_LINK_CTRL_STATUS));
+	if (wifi_smmu_context != ~0u) {
+		vm_offset_t smmu = ml_io_map(SMMU_PHYS, 0x1000);
+		uint32_t idr1 = (smmu != 0) ? rd(smmu + SMMU_IDR1) : 0;
+		uint32_t page_size = (idr1 >> 31) ? 0x10000 : 0x1000;
+		uint32_t pages = 2u << ((idr1 >> 28) & 7);
+		vm_offset_t ctx = ml_io_map(SMMU_PHYS + (uint64_t)(pages + wifi_smmu_context) * page_size, page_size);
+
+		if (ctx != 0) {
+			wr(ctx + SMMU_CB_FSR, SMMU_FSR_ALL);            /* (a clean slate for what follows) */
+			delay_for_interval(10000, NSEC_PER_USEC);
+			tell("pcie: 37: smmu context %u: fsr %#x, far %#x, fsynr0 %#x (cleared 10 ms ago)\n",
+			    wifi_smmu_context, rd(ctx + SMMU_CB_FSR), rd(ctx + SMMU_CB_FAR), rd(ctx + SMMU_CB_FSYNR0));
+		}
+	}
+	bar = endpoint_bar();
+	if (bar != 0) {
+		tell("pcie: 37: bar unwindowed: [0x00] %#x, [0x08] %#x, [0x1c] %#x, remap ctrl %#x\n", rd(bar),
+		    rd(bar + 0x08), rd(bar + 0x1c), rd(bar + REMAP_BAR_CTRL));
+		bhie_off = rd(bar + 0x2c);
+		tell("pcie: 37: BHI_EOFF (bar + 0x2c) %#x -> the BHIE aperture would be bar + %#x%s\n", bhie_off, bhie_off,
+		    (bhie_off == 0 || bhie_off > 0x100000u) ? " (not a plausible offset)" : "");
+		tell("pcie: 37: window again: exec env %#x, status %#x, image size %#x, addr %#x\n",
+		    windowed_read(bar, 0x1e0e228), windowed_read(bar, 0x1e0e22c), windowed_read(bar, 0x1e0e210),
+		    windowed_read(bar, 0x1e0e208));
+	}
+}
+
+/*
+ * Step 38: BHI, tried three ways in one boot.
+ *
+ * Step 36 filled the registers correctly (they read back, and they were still there in step 37) and
+ * rang the doorbell once, and BHI_STATUS's bits 31:30 stayed 0 while BHI_EXECENV stayed 0 -- the
+ * secondary boot loader never started. The endpoint's own configuration space answered throughout,
+ * so the device is alive: either the transfer was never issued, or it was refused.
+ *
+ * What the vendor's stack does around the doorbell that this file does not is small enough to try
+ * all of it here, and each attempt ends with the same question -- did EXECENV leave 0:
+ *
+ *   A. the same request again with a different sequence number, because the doorbell's low bits are
+ *      a sequence number and a repeated value may be taken as "already rung";
+ *   B. the whole image (4.3 MB in an 8 MB buffer) instead of the first 512 KB, in case this part's
+ *      BHI wants the file entire and the 512 KB split is cnss2's choice for its own reasons;
+ *   C. the doorbell written as 0 and then as the sequence number, an edge rather than a level.
+ *
+ * BHI_INTVEC and BHI_NUMSEG are read first: an interrupt vector of 0 is what the vendor writes, and
+ * a segment count that is not 1 would say the image is meant to arrive in pieces.
+ */
+static uint32_t
+bhi_status_of(vm_offset_t bar)
+{
+	return windowed_read(bar, 0x1e0e22c);
+}
+
+static bool
+bhi_wait(vm_offset_t bar, unsigned polls, const char *what)
+{
+	uint32_t status = 0;
+	unsigned i;
+
+	for (i = 1; i <= polls; i++) {
+		status = bhi_status_of(bar);
+		if ((status >> 30) != 0) {
+			break;
+		}
+		delay_for_interval(5000, NSEC_PER_USEC);
+	}
+	tell("pcie: 38: %s: status %#x (bits 31:30 = %u) after %u polls, exec env %#x\n", what, status, status >> 30,
+	    i, windowed_read(bar, 0x1e0e228));
+	return (status >> 30) != 0;
+}
+
+/*
+ * iatu_inbound: an inbound region, which is what the endpoint's own reads are translated by.
+ *
+ * Everything this file programmed in the iATU until now was an outbound region -- host to the bus,
+ * which is how the processor reaches the endpoint. The endpoint reading host memory is the other
+ * direction, and it needs an *inbound* region: base = the bus address the endpoint was told to read
+ * (our IOVA), target = the physical address behind it. Without one, the read has nowhere to go.
+ *
+ * The region layout is the same as the outbound one (view 0 for outbound, 0x80000000 | n for
+ * inbound, then ctrl1/ctrl2/base/limit/target at 0x200 a region), which is why this is six writes
+ * more than iatu_region0 and not a new mechanism.
+ */
+static void
+iatu_inbound(vm_offset_t iatu, unsigned region, uint32_t bus, uint32_t bus_end, uint32_t target)
+{
+	wr(iatu + 0x00, (1u << 31) | region);           /* (the viewport: bit 31 selects inbound) */
+	wr(iatu + 0x04, 0);
+	wr(iatu + 0x00, (1u << 31) | region);
+	wr(iatu + 0x04, 0x00);                          /* (ctrl1: a memory region) */
+	wr(iatu + 0x08, bus);                           /* (lower base: the bus address) */
+	wr(iatu + 0x0c, 0);
+	wr(iatu + 0x10, bus_end);
+	wr(iatu + 0x14, target);                        /* (lower target: where host memory is) */
+	wr(iatu + 0x18, 0);
+	wr(iatu + 0x04, 1u << 31);                      /* (and enable it last) */
+}
+
+static void
+step_bhi_retry(void)
+{
+	vm_offset_t bar;
+	const uint8_t *image;
+	uint64_t size = 0;
+	uint32_t chunk, seq = 0x0051a7b4u;
+
+	if (!wifi_mapped) {
+		tell("pcie: 38: the dma buffer is not mapped (pcie_smmu_map=1)\n");
+		return;
+	}
+	image = wifi_firmware(&size);
+	if (image == 0) {
+		tell("pcie: 38: fw/qca6390/amss20.bin is not in the image\n");
+		return;
+	}
+	bar = endpoint_bar();
+	if (bar == 0) {
+		tell("pcie: 38: the bar could not be mapped\n");
+		return;
+	}
+	{
+		/*
+		 * Read the iatu window before writing anything else into it.
+		 *
+		 * An attempt to program an inbound region wrote 0x80000000 into offsets 0 and 4, which in
+		 * this window are outbound region 0's ctrl1 and ctrl2 -- there is no separate viewport
+		 * register here, regions sit at 0x200 * n and region 0 starts at 0. That write would have
+		 * broken the configuration space path, so this step only looks: the first 0x200 bytes (the
+		 * outbound region the config reads use) and the blocks that are not ours, to find where an
+		 * inbound region is meant to live.
+		 */
+		vm_offset_t iatu = ml_io_map(IATU_PHYS, IATU_SIZE);
+
+		if (iatu != 0) {
+			tell("pcie: 38: iatu 0x000 (outbound region 0): %#x %#x %#x %#x %#x %#x %#x\n", rd(iatu + 0x00),
+			    rd(iatu + 0x04), rd(iatu + 0x08), rd(iatu + 0x0c), rd(iatu + 0x10), rd(iatu + 0x14),
+			    rd(iatu + 0x18));
+			tell("pcie: 38: iatu 0x200 (outbound region 1): %#x %#x %#x %#x %#x %#x %#x\n", rd(iatu + 0x200),
+			    rd(iatu + 0x204), rd(iatu + 0x208), rd(iatu + 0x20c), rd(iatu + 0x210), rd(iatu + 0x214),
+			    rd(iatu + 0x218));
+			tell("pcie: 38: iatu 0x800..0x81c: %#x %#x %#x %#x %#x %#x %#x %#x\n", rd(iatu + 0x800),
+			    rd(iatu + 0x804), rd(iatu + 0x808), rd(iatu + 0x80c), rd(iatu + 0x810), rd(iatu + 0x814),
+			    rd(iatu + 0x818), rd(iatu + 0x81c));
+			tell("pcie: 38: iatu 0x900..0x91c (the designware viewport block): %#x %#x %#x %#x %#x %#x %#x %#x\n",
+			    rd(iatu + 0x900), rd(iatu + 0x904), rd(iatu + 0x908), rd(iatu + 0x90c), rd(iatu + 0x910),
+			    rd(iatu + 0x914), rd(iatu + 0x918), rd(iatu + 0x91c));
+		} else {
+			tell("pcie: 38: the iatu could not be mapped\n");
+		}
+	}
+	tell("pcie: 38: BHI_INTVEC %#x, BHI_EOFF %#x, NUMSEG %#x, SERIALNU %#x, ANTIROLLVER %#x\n",
+	    windowed_read(bar, 0x1e0e220), rd(bar + 0x2c), windowed_read(bar, 0x1e0e248), windowed_read(bar, 0x1e0e240),
+	    windowed_read(bar, 0x1e0e244));
+	chunk = (size > 0x80000u) ? 0x80000u : (uint32_t) size;
+	if (size > WIFI_BUFFER_BYTES) {
+		tell("pcie: 38: the image (%llu) does not fit the buffer (%llu); only the first part is used\n",
+		    (unsigned long long) size, (unsigned long long) WIFI_BUFFER_BYTES);
+	}
+	__builtin_memcpy((void *) wifi_buffer, image, (size_t)((size > WIFI_BUFFER_BYTES) ? WIFI_BUFFER_BYTES : size));
+
+	/* A: the same request, a different sequence number */
+	windowed_write(bar, 0x1e0e22c, 0);
+	windowed_write(bar, 0x1e0e20c, 0);
+	windowed_write(bar, 0x1e0e208, (uint32_t) wifi_iova);
+	windowed_write(bar, 0x1e0e210, chunk);
+	windowed_write(bar, 0x1e0e218, seq);
+	(void) bhi_wait(bar, 200, "A: 512 KB, a new sequence number");
+	if (windowed_read(bar, 0x1e0e228) != 0) {
+		return;
+	}
+
+	/* B: the whole image */
+	windowed_write(bar, 0x1e0e22c, 0);
+	windowed_write(bar, 0x1e0e210, (uint32_t) size);
+	windowed_write(bar, 0x1e0e218, seq + 1);
+	(void) bhi_wait(bar, 200, "B: the whole image");
+	if (windowed_read(bar, 0x1e0e228) != 0) {
+		return;
+	}
+
+	/* C: the doorbell as an edge */
+	windowed_write(bar, 0x1e0e22c, 0);
+	windowed_write(bar, 0x1e0e210, chunk);
+	windowed_write(bar, 0x1e0e218, 0);
+	delay_for_interval(1000, NSEC_PER_USEC);
+	windowed_write(bar, 0x1e0e218, seq + 2);
+	(void) bhi_wait(bar, 200, "C: the doorbell as an edge");
+	tell("pcie: 38: done: status %#x, exec env %#x, error code %#x, ERRBG %#x %#x %#x\n", bhi_status_of(bar),
+	    windowed_read(bar, 0x1e0e228), windowed_read(bar, 0x1e0e230), windowed_read(bar, 0x1e0e234),
+	    windowed_read(bar, 0x1e0e238), windowed_read(bar, 0x1e0e23c));
+}
+
+/*
+ * Step 39: the map of the iatu window, and what the endpoint's BDF is turned into.
+ *
+ * Step 38 showed that the endpoint tried the BHI transfer and failed with the descriptor echoed in
+ * its error debug words, so the read of host memory is what fails. Two candidates remain: the iATU's
+ * inbound translation (which is what an endpoint's own reads go through on this IP) and the stream
+ * id its requests are tagged with. Neither can be guessed, so this step reads both:
+ *
+ *   - the whole first page of the iATU window, sixteen words a row, to find where an inbound region
+ *     lives (only region 0 at 0x000 and region 1 at 0x200 have been identified so far);
+ *   - PARF_BDF_TO_SID_CFG at bar + 0x1e0ac00 (cnss2/reg.h:88), the endpoint-side table that turns a
+ *     BDF into a stream id, so that the SMMU's two match registers can be checked against what the
+ *     endpoint will actually send.
+ *
+ * Read only.
+ */
+#define EP_BDF_TO_SID   0x1e0ac00u      /* (window 0x01, in-window 0x2c00) */
+
+static void
+step_iatu_map(void)
+{
+	vm_offset_t iatu, bar;
+
+	iatu = ml_io_map(IATU_PHYS, IATU_SIZE);
+	if (iatu == 0) {
+		tell("pcie: 39: the iatu could not be mapped\n");
+		return;
+	}
+	for (uint32_t at = 0; at < 0x400; at += 32) {
+		tell("pcie: 39: iatu %#05x: %#x %#x %#x %#x %#x %#x %#x %#x | %#x %#x %#x %#x %#x %#x %#x %#x\n", at,
+		    rd(iatu + at + 0x00), rd(iatu + at + 0x04), rd(iatu + at + 0x08), rd(iatu + at + 0x0c),
+		    rd(iatu + at + 0x10), rd(iatu + at + 0x14), rd(iatu + at + 0x18), rd(iatu + at + 0x1c),
+		    rd(iatu + at + 0x20), rd(iatu + at + 0x24), rd(iatu + at + 0x28), rd(iatu + at + 0x2c),
+		    rd(iatu + at + 0x30), rd(iatu + at + 0x34), rd(iatu + at + 0x38), rd(iatu + at + 0x3c));
+	}
+	for (uint32_t at = 0x800; at < 0x1000; at += 0x80) {
+		uint32_t window = rd(iatu + at);
+
+		if (window != 0 && window != 0xffffffffu) {
+			tell("pcie: 39: iatu %#05x is not empty: %#x %#x %#x %#x\n", at, window, rd(iatu + at + 4),
+			    rd(iatu + at + 8), rd(iatu + at + 12));
+		}
+	}
+	bar = endpoint_bar();
+	if (bar != 0) {
+		tell("pcie: 39: endpoint BDF_TO_SID_CFG (bar + %#x) = %#x %#x %#x %#x\n", EP_BDF_TO_SID,
+		    windowed_read(bar, EP_BDF_TO_SID), windowed_read(bar, EP_BDF_TO_SID + 4),
+		    windowed_read(bar, EP_BDF_TO_SID + 8), windowed_read(bar, EP_BDF_TO_SID + 12));
+	}
+}
+
+/*
+ * Step 40: the root complex's BDF-to-SID table -- the thing that tells the SMMU who is knocking.
+ *
+ * An endpoint's requests reach the SMMU tagged with a stream id, and on this controller that id does
+ * not come from the link: it comes from a 256-entry table in the wrapper's own registers,
+ *
+ *	parf + 0x2000, one word an entry: BDF[31:16] | SID[15:8] | NEXT[7:0]
+ *
+ * indexed by the CRC-8 (MSB first, polynomial 0x07, initial value 0) of the BDF as two big-endian
+ * bytes (pci-msm.c:4854-4912, msm_pcie_config_sid; the polynomial is BIT(2)|BIT(1)|BIT(0) at :167).
+ * Nothing in this file has ever written it, so the table is whatever the boot loader left -- and a
+ * request whose BDF is not in it is tagged with a stream the SMMU has no match register for, which
+ * is the one thing that would make the endpoint's read of host memory fail while every register
+ * read and write from the processor still works.
+ *
+ * So: entry 0x15 gets BDF 0x0100 (bus 1, device 0, function 0) and SID 0x1c01, which is the stream
+ * the SMMU context from step 35 already covers. Then BHI is tried again, unchanged.
+ */
+#define PARF_BDF_TO_SID_TABLE   0x2000u
+#define SID_TABLE_ENTRIES       256u
+
+static uint8_t
+crc8_of(const uint8_t *data, unsigned length)
+{
+	uint8_t crc = 0;
+
+	for (unsigned i = 0; i < length; i++) {
+		crc ^= data[i];
+		for (unsigned bit = 0; bit < 8; bit++) {
+			crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+		}
+	}
+	return crc;
+}
+
+static void
+step_bdf_to_sid(void)
+{
+	uint32_t bdf = 0x0100, sid = 0x1c01, entry, old;
+	uint8_t bytes[2], hash;
+
+	if (parf == 0) {
+		tell("pcie: 40: no parf window\n");
+		return;
+	}
+	bytes[0] = (uint8_t)(bdf >> 8);
+	bytes[1] = (uint8_t)(bdf & 0xff);
+	hash = crc8_of(bytes, 2);
+	entry = (bdf << 16) | (sid << 8);
+	old = rd(parf + PARF_BDF_TO_SID_TABLE + 4u * hash);
+	tell("pcie: 40: bdf %#x -> hash %u; the entry there was %#x, writing %#x (bdf %#x, sid %#x)\n", bdf, hash, old,
+	    entry, bdf, sid);
+	/*
+	 * No write. The first attempt did write the entry and then put back what it found -- but what
+	 * it found was its own earlier write, because the table lives in the wrapper and survives the
+	 * run. The bucket this BDF hashes to also belongs to another BDF (it chained to one), so
+	 * overwriting it breaks that BDF's lookup. The value the boot loader had there, read before any
+	 * of this, was 0x03801e78 (bdf 0x0380, sid 0x1e, next 0x78); it is restored here and the step
+	 * stays read-only afterwards.
+	 */
+	if (old == entry) {
+		wr(parf + PARF_BDF_TO_SID_TABLE + 4u * hash, 0x03801e78u);
+		tell("pcie: 40: entry %u still held this experiment's value; the boot loader's 0x03801e78 is put back (%#x)\n",
+		    hash, rd(parf + PARF_BDF_TO_SID_TABLE + 4u * hash));
+	} else {
+		tell("pcie: 40: nothing is written; entry %u is %#x\n", hash, old);
+	}
+	(void) entry;
+	{
+		unsigned used = 0;
+
+		for (unsigned i = 0; i < SID_TABLE_ENTRIES; i++) {
+			used += rd(parf + PARF_BDF_TO_SID_TABLE + 4u * i) != 0;
+		}
+		tell("pcie: 40: the table now has %u of %u entries in use\n", used, SID_TABLE_ENTRIES);
+	}
+	tell("pcie: 40: trying the download again with the stream id in place\n");
+	step_bhi_retry();
+}
+
+/*
+ * Step 41: read the whole BDF-to-SID table, and give the SMMU the stream it actually names.
+ *
+ * Step 40 found the table full (256 of 256 entries, which the boot loader wrote) and the entry at
+ * our BDF's hash belonging to a different BDF -- and, in it, a SID of 0x1e. That number matters: the
+ * entry is BDF[31:16] | SID[15:8] | NEXT[7:0], so the field is eight bits wide and the stream ids
+ * this controller tags requests with are below 0x100. 0x1c01, which the device tree's iommu-map and
+ * step 35's match registers use, cannot even be written into that field -- which is exactly why a
+ * context keyed on 0x1c01 never sees the endpoint's traffic.
+ *
+ * So this step dumps the table (following the NEXT chain from each hash), finds the entry whose BDF
+ * is ours, and adds a match register for the SID it names, through the context step 35 built. Then
+ * BHI is tried again.
+ */
+static void
+sid_match_add(vm_offset_t smmu, uint32_t stream, uint32_t context)
+{
+	uint32_t idr0 = rd(smmu + 0x020);
+	unsigned free_smr = ~0u;
+
+	for (uint32_t n = 0; n < (idr0 & 0xff); n++) {
+		if ((rd(smmu + SMMU_SMR(n)) >> 31) == 0) {
+			free_smr = n;
+			break;
+		}
+	}
+	if (free_smr == ~0u) {
+		tell("pcie: 41: no free match register for stream %#x\n", stream);
+		return;
+	}
+	wr(smmu + SMMU_S2CR(free_smr), context);
+	wr(smmu + SMMU_SMR(free_smr), (1u << 31) | stream);
+	tell("pcie: 41: match register %u: stream %#x -> context %u (smr %#x, s2cr %#x)\n", free_smr, stream, context,
+	    rd(smmu + SMMU_SMR(free_smr)), rd(smmu + SMMU_S2CR(free_smr)));
+}
+
+static void
+step_sid_table(void)
+{
+	vm_offset_t smmu;
+	unsigned found = 0;
+
+	if (parf == 0 || wifi_smmu_context == ~0u) {
+		tell("pcie: 41: parf or the smmu context is missing (pcie_smmu_map=1 runs step 35)\n");
+		return;
+	}
+	smmu = ml_io_map(SMMU_PHYS, 0x1000);
+	if (smmu == 0) {
+		tell("pcie: 41: the smmu could not be mapped\n");
+		return;
+	}
+	tell("pcie: 41: the bdf-to-sid table, entry by entry (bdf | sid | next):\n");
+	for (unsigned i = 0; i < SID_TABLE_ENTRIES; i++) {
+		uint32_t entry = rd(parf + PARF_BDF_TO_SID_TABLE + 4u * i);
+		uint32_t bdf, sid, next;
+
+		if (entry == 0) {
+			continue;
+		}
+		bdf = entry >> 16;
+		sid = (entry >> 8) & 0xff;
+		next = entry & 0xff;
+		if (i < 32 || bdf == 0x0100 || bdf == 0x0000) {
+			tell("pcie: 41:   [%3u] bdf %#06x -> sid %#04x, next %u%s\n", i, bdf, sid, next,
+			    (bdf == 0x0100) ? "   <-- ours" : (bdf == 0x0000) ? "   <-- bus 0" : "");
+		}
+		if (bdf == 0x0100) {
+			found++;
+			tell("pcie: 41: the table names stream %#x for our bdf; giving the smmu that stream\n", sid);
+			sid_match_add(smmu, sid, wifi_smmu_context);
+		}
+	}
+	if (found == 0) {
+		tell("pcie: 41: the table has no entry for %#x; trying the low streams 0x1e and 0x1f anyway\n", 0x0100);
+		sid_match_add(smmu, 0x1e, wifi_smmu_context);
+		sid_match_add(smmu, 0x1f, wifi_smmu_context);
+	}
+	tell("pcie: 41: trying the download with those streams in place\n");
+	step_bhi_retry();
+}
+
+/*
+ * Step 42: which stream the endpoint's requests actually carry -- read, do not guess.
+ *
+ * There was a version of this step that pointed all 128 stream slots at one context, to find out by
+ * brute force. It blanked the screen: that context's tables map 8 MB at 0x80000000 and nothing else,
+ * so every other master in the SoC -- the display's DMA among them -- lost its translation. The
+ * lesson is worth the step number it cost: the SMMU is shared, and an experiment on it must address
+ * exactly one stream.
+ *
+ * So this reads instead. Two registers say what the hardware did with a request it could not match:
+ *
+ *   SMMU_GFSR   (0x48)  the global fault status
+ *   SMMU_GFSYNR1(0x8c)? -- the per-fault syndrome words, which on this part carry the stream
+ *   SMMU_S2CR   the entry the request was matched to, if any
+ *
+ * and the BDF-to-SID table is walked properly: our BDF's bucket was taken by another BDF with a
+ * NEXT chain behind it, and the entry for ours -- if the boot loader wrote one, and it should have,
+ * because Android enumerates the same endpoint at the same BDF -- is somewhere along that chain.
+ */
+#define SMMU_GFSR       0x048
+#define SMMU_GFSYNR0    0x088
+#define SMMU_GFSYNR1    0x08c
+
+static void
+step_stream_read(void)
+{
+	vm_offset_t smmu;
+	unsigned index, hops = 0;
+
+	if (parf == 0) {
+		tell("pcie: 42: no parf window\n");
+		return;
+	}
+	smmu = ml_io_map(SMMU_PHYS, 0x1000);
+	if (smmu != 0) {
+		tell("pcie: 42: smmu global: gfsr %#x, gfsynr0 %#x, gfsynr1 %#x, scr0 %#x\n", rd(smmu + SMMU_GFSR),
+		    rd(smmu + SMMU_GFSYNR0), rd(smmu + SMMU_GFSYNR1), rd(smmu + SMMU_SCR0));
+	}
+	index = crc8_of((const uint8_t[]){ 0x01, 0x00 }, 2);
+	tell("pcie: 42: walking the bdf-to-sid chain from hash %u looking for bdf 0x0100:\n", index);
+	while (hops++ < 32) {
+		uint32_t entry = rd(parf + PARF_BDF_TO_SID_TABLE + 4u * index);
+		uint32_t bdf = entry >> 16, sid = (entry >> 8) & 0xff, next = entry & 0xff;
+
+		if (entry == 0) {
+			tell("pcie: 42:   [%3u] empty; the chain ends without our bdf\n", index);
+			return;
+		}
+		tell("pcie: 42:   [%3u] bdf %#06x sid %#04x next %u%s\n", index, bdf, sid, next,
+		    bdf == 0x0100 ? "   <-- ours" : "");
+		if (bdf == 0x0100) {
+			tell("pcie: 42: the endpoint's stream is %#x, and one match register is enough for it\n", sid);
+			if (wifi_smmu_context != ~0u && smmu != 0) {
+				sid_match_add(smmu, sid, wifi_smmu_context);
+				tell("pcie: 42: trying the download with only that stream mapped\n");
+				step_bhi_retry();
+			}
+			return;
+		}
+		if (next == 0) {
+			break;
+		}
+		index = next;
+	}
+	tell("pcie: 42: the chain has no entry for bdf 0x0100 after %u hops; nothing is written\n", hops);
+}
+
+/*
+ * Step 43: the inbound region -- found at last, in Qualcomm's own register map.
+ *
+ * The last question was where the address translator's inbound registers are. They are not in the
+ * DesignWare viewport at DBI + 0x900 (that address reads 0xffffffff on this part), and they are not
+ * missing either: the SM8250 boot firmware's hardware map says it outright
+ * (BOOT.XF.3.3, QcomPkg/SocPkg/Library/PcieConfigLib/PcieHwioRegs.h):
+ *
+ *   HWIO_PCIE_GEN3X1_IATU_REGION_CTRL_1_OFF_OUTBOUND_i_ADDR(i)  i * 0x200 + 0x000
+ *   HWIO_PCIE_GEN3X1_IATU_REGION_CTRL_1_OFF_INBOUND_i_ADDR(i)   i * 0x200 + 0x100
+ *   ... CTRL_2 +0x04, LWR_BASE +0x08, UPPER_BASE +0x0c, LIMIT +0x10,
+ *       LWR_TARGET +0x14, UPPER_TARGET +0x18 (and 0x100 added for the inbound copy)
+ *
+ * So each outbound region is followed, 0x100 later, by the inbound region of the same index -- which
+ * is why the dump of 0x400..0x1100 showed a lone 0xfff at +0x10 of every 0x100 block: those were the
+ * inbound LIMIT registers at their reset value, and nothing was ever written to them.
+ *
+ * One region is enough: the bus range the endpoint reads (our IOVA, 8 MB) becomes the physical
+ * address of the buffer behind it. Then BHI is tried again.
+ */
+#define IATU_IN_CTRL1   0x100
+#define IATU_IN_CTRL2   0x104
+#define IATU_IN_LBASE   0x108
+#define IATU_IN_UBASE   0x10c
+#define IATU_IN_LIMIT   0x110
+#define IATU_IN_LTARGET 0x114
+#define IATU_IN_UTARGET 0x118
+
+static void
+step_iatu_inbound(void)
+{
+	vm_offset_t iatu;
+	uint64_t phys;
+
+	if (!wifi_mapped) {
+		tell("pcie: 43: the dma buffer is not mapped (pcie_smmu_map=1 runs step 35)\n");
+		return;
+	}
+	iatu = ml_io_map(IATU_PHYS, 0x1000);
+	if (iatu == 0) {
+		tell("pcie: 43: the iatu could not be mapped\n");
+		return;
+	}
+	phys = kvtophys(wifi_buffer);
+	tell("pcie: 43: inbound region 0 before: ctrl1 %#x ctrl2 %#x base %#x limit %#x target %#x\n",
+	    rd(iatu + IATU_IN_CTRL1), rd(iatu + IATU_IN_CTRL2), rd(iatu + IATU_IN_LBASE), rd(iatu + IATU_IN_LIMIT),
+	    rd(iatu + IATU_IN_LTARGET));
+	wr(iatu + IATU_IN_CTRL2, 0);                                    /* (off while it is reprogrammed) */
+	wr(iatu + IATU_IN_CTRL1, 0);                                    /* (a memory request) */
+	wr(iatu + IATU_IN_LBASE, (uint32_t) wifi_iova);
+	wr(iatu + IATU_IN_UBASE, 0);
+	wr(iatu + IATU_IN_LIMIT, (uint32_t)(wifi_iova + WIFI_BUFFER_BYTES - 1));
+	wr(iatu + IATU_IN_LTARGET, (uint32_t) phys);
+	wr(iatu + IATU_IN_UTARGET, (uint32_t)(phys >> 32));
+	wr(iatu + IATU_IN_CTRL2, 1u << 31);                             /* (and on) */
+	tell("pcie: 43: inbound region 0 after: ctrl1 %#x ctrl2 %#x base %#x limit %#x target %#x%08x\n",
+	    rd(iatu + IATU_IN_CTRL1), rd(iatu + IATU_IN_CTRL2), rd(iatu + IATU_IN_LBASE), rd(iatu + IATU_IN_LIMIT),
+	    rd(iatu + IATU_IN_UTARGET), rd(iatu + IATU_IN_LTARGET));
+	tell("pcie: 43: %#llx..%#llx on the bus is now %#llx in host memory; trying the download\n",
+	    (unsigned long long) wifi_iova, (unsigned long long)(wifi_iova + WIFI_BUFFER_BYTES - 1),
+	    (unsigned long long) phys);
+	step_bhi_retry();
 }
 
 static void
@@ -2141,6 +3720,66 @@ step_setup(uint32_t steps)
 	}
 	if (steps >= 28) {
 		step_endpoint_config();
+	}
+	if (steps >= 29) {
+		step_endpoint_bar();
+	}
+	if (steps >= 30) {
+		step_bhi();
+	}
+	if (steps >= 31) {
+		step_capabilities();
+	}
+	if (steps >= 32) {
+		step_smmu_look();
+	}
+	if (steps >= 33) {
+		uint32_t smmu = 0;
+
+		PE_parse_boot_argn("pcie_smmu", &smmu, sizeof(smmu));
+		if (smmu != 0) {
+			step_smmu_bypass();
+		}
+	}
+	if (steps >= 34) {
+		step_core_why();
+	}
+	if (steps >= 35) {
+		uint32_t map = 0;
+
+		PE_parse_boot_argn("pcie_smmu_map", &map, sizeof(map));
+		if (map != 0) {
+			step_smmu_map();
+		}
+	}
+	if (steps >= 36) {
+		uint32_t download = 0;
+
+		PE_parse_boot_argn("pcie_bhi", &download, sizeof(download));
+		if (download != 0) {
+			step_bhi_download();
+		}
+	}
+	if (steps >= 37) {
+		step_after_download();
+	}
+	if (steps >= 38) {
+		step_bhi_retry();
+	}
+	if (steps >= 39) {
+		step_iatu_map();
+	}
+	if (steps >= 40) {
+		step_bdf_to_sid();
+	}
+	if (steps >= 41) {
+		step_sid_table();
+	}
+	if (steps >= 42) {
+		step_stream_read();
+	}
+	if (steps >= 43) {
+		step_iatu_inbound();
 	}
 }
 

@@ -5983,3 +5983,738 @@ pcie: 28:   bar0 = 0x4, bar1..bar5 = 0
   终结了"链路时灵时不灵"这个假问题；mainline 的 `qcom_pcie_2_1_0_ltssm_enable` 给了
   `ELBI_SYS_CTRL` bit0；mainline 的 `msm_pcie_cfg_bdf` 给了 iATU 配置方式。
 - 搜索方式：GitHub 代码搜索（带 token）搜 `alioth_pcie`、`PARF_LTSSM`，比按仓库名找有效得多。
+
+---
+
+## 23:40–23:50 BAR 通了：能直接读写芯片的寄存器
+
+第 29 步：给端点分配 BAR、配根桥的内存窗口和 iATU 的 memory outbound、置 command 的
+MEM/BUS_MASTER 两位，然后**从 BAR0 读寄存器**。
+
+```
+pcie: 29: bar0 mask 0xfff00004, bar1 mask 0xffffffff -> a 64-bit memory bar, size 0x100000
+pcie: 29: bar0 = 0x60400004, bar1 = 0
+pcie: 29: root bridge memory base/limit 0 -> 0x60406040 (base 0x60400000, limit 0x60400000)
+pcie: 29: iatu region 1: ctrl1 0, lbar 0x60400000, lar 0x604fffff, ltar 0x60400000, ctrl2 0x80000000
+pcie: 29: command 0x100000 -> 0x100006
+pcie: 29: bar0[0x00] 0x100, [0x04] 0, [0x08] 0xdeadbeef, [0x0c] 0
+```
+
+- `bar0 mask 0xfff00004` —— 64 位 memory BAR，**大小 1 MB**；
+- 分配地址 `0x60400000`（在设备树 `memory 0x60300000 + 0x3d00000` 窗口内）；
+- 根桥 type-1 头的 memory base/limit 写成 `0x6040/0x6040`；
+- iATU region 1 做恒等映射（host = bus = `0x60400000`）；
+- command `0x100006` = MEM_SPACE | BUS_MASTER；
+- **从 BAR0 读出 `0x100`、`0xdeadbeef`** —— 芯片的寄存器可以直接访问了。
+
+至此为止，"控制器 → PHY → 四路电源 → PERST# → L0 → 配置空间 → BAR/MMIO" 全部打通。
+
+### 接下来（驱动阶段）
+
+1. **MSI**：端点 cap 指针在 `0x40`，先按 capability 链找到 MSI（id 0x05）看它要几个向量；
+   然后要接 RC 的 MSI 控制器到 GIC 的 SPI —— 这一步比寄存器复杂，得先看 vendor 的
+   `msm_pcie_msi_init` 和 kona 的 GIC ITS/SPI 分配。
+2. **MHI**：BAR0 里读到的 `0xdeadbeef` 通常出现在 QCA 的 MHI/BHI 错误寄存器附近；接下来应当
+   打印 BAR0 前 0x1000 的更多已知偏移（BHI 版本、MHI 版本、CRDB），确认接口活着。
+3. **固件**：`fw-wifi/` 还是空的。要从手机 `/vendor/firmware_mnt/image/` 取 qca6390 那一套
+   （`amss.bin`、`m3.bin`、`bdwlan.bin`、`bdwlanXX.bin` 等），BHI 下载走 DMA —— 又需要
+   能用的 DMA 描述符和 MSI。
+4. **ath11k**：QCA6390 的驱动是 ath11k（不是 ath12k），UniXNU 里没有对应组件。
+
+---
+
+## 23:50–00:00 BHI 应答：芯片在 PBL，等着固件
+
+### QCA6390 的寄存器窗口
+
+BAR 只有 1 MB，而 MHI/BHI 寄存器在 `0x1e0e000` 以上 —— 不在 BAR 里。这颗芯片用的是"半 BAR
+窗口"方案（`cnss2/reg.h:66-71`、`cnss2/pci.c:427-472`）：
+
+```c
+window = (offset >> 19) & 0x3f;
+写 BAR + 0x310c = 0x40000000 | window;          /* REMAP_BAR_CTRL */
+读 BAR + 0x80000 + (offset & 0x7ffff);
+```
+
+BHI 块 `0x1e0e200` 就是窗口 `0x3c`、窗内偏移 `0xe200`。
+
+### 读数
+
+```
+pcie: 30: remap bar ctrl reads 0x40000000 before any window is selected
+pcie: 30:   0x1e0e200 BHI version minor: 0x2
+pcie: 30:   0x1e0e204 BHI version major: 0x1
+pcie: 30:   0x1e0e208 BHI image address low: 0
+pcie: 30:   0x1e0e210 BHI image size: 0
+pcie: 30:   0x1e0e228 BHI exec environment: 0
+pcie: 30:   0x1e0e22c BHI status: 0
+pcie: 30:   0x1e0e230 BHI error code: 0
+pcie: 30:   0x1e0e240 BHI serial number: 0xc4e10d95
+pcie: 30:   0x1e0e248 BHI number of segments: 0x1
+```
+
+- **BHI 版本 1.2**（major 1 / minor 2）—— 一个真实、合理的版本号，说明寄存器接口是活的；
+- `EXECENV = 0` = **PBL**（pre-bootloader），`STATUS = 0` = reset，`ERROR = 0`；
+- 镜像地址/大小都是 0 —— **芯片正在 PBL 里等固件**，和 Android 上电那一刻的状态一致。
+
+（`BAR+0x08` 和 `0x1e0e108` 读出的 `0xdeadbeef` 是这块共享窗口的哨兵值，不是错误码。）
+
+### 下一步
+
+1. **MSI**：先读端点的 MSI capability（cap 指针 `0x40`），看要几个向量；再把 RC 的 MSI
+   控制器接到 GIC —— 固件下载完成后的 MHI 事件都靠它。
+2. **BHI 下载**：`BHI_IMGADDR_LOW/HIGH` + `BHI_IMGSIZE` + `BHI_IMGTXDB` 门铃，镜像要放在芯片
+   能 DMA 读到的地方（iATU 映射宿主内存，SMMU 那个 stream 还没配）。
+3. **固件文件**：`fw-wifi/` 仍是空的，需要从手机 `/vendor/firmware_mnt/image/` 取
+   `amss.bin`（QCA6390 的 SBL/AMSS 镜像）与 `bdwlan.bin` 等。
+4. 之后才是 MHI 环、QMI、ath11k。
+
+### 参考出处
+
+- 窗口方案与 BHI 偏移：`k40-ref/drivers/net/wireless/cnss2/{reg.h,pci.c}`、`drivers/bus/mhi/core/mhi_internal.h`
+- XNU 侧的分发/门铃写法：`UniXNU/UniXNU-sheng` 的 `package/WifiProbe.cpp`（阶段 5）
+
+---
+
+## 00:00–00:10 端点能力表：MSI 在 0x50，目前是关的
+
+第 31 步走了一遍 capability 链（从配置空间 `0x34` 的低字节开始，`{id, next}` 字节对）：
+
+```
+pcie: 31: status 0x10, the capability list starts at 0x40
+pcie: 31:   capability 0x1 at 0x40                 (Power Management)
+pcie: 31:   MSI at 0x50: control 0x10a
+pcie: 31:     message address 0, data 0, enable 0
+pcie: 31:     mask 0, pending 0
+pcie: 31:   capability 0x10 at 0x70                (PCI Express)
+pcie: 31: 3 capabilities walked
+```
+
+MSI 控制字 `0x10a`：bit0 = 0（未使能）、bit8 = 1（**支持 per-vector masking**）、
+bits[6:4] = 0（**Multiple Message Capable = 1 个向量**）、bit7 = 0（32 位地址）；
+消息地址和数据都还是 0 —— 主机还没给它们赋值。
+
+**没有 MSI-X**，只有传统 MSI。
+
+### 这对下一步意味着什么
+
+MSI 的"收端"是 RC 侧的事：vendor 里是 `pci-msm-msi.c` 这套独立的中断域驱动，把端点的 MSI
+写引到 SoC 的 SPI 上，再挂到 GIC。在 XNU 这棵树上要接进中断框架，是个比寄存器大得多的工程。
+
+但**它不挡下一步**：BHI 的固件下载是纯寄存器 + 轮询（`BHI_IMGADDR/SIZE` 写好后打
+`BHI_IMGTXDB` 门铃，再轮询 `BHI_STATUS` 的 bits[31:30]），不需要 MSI。MSI 是后面 MHI 事件环
+才必需。
+
+所以顺序调整为：**先取固件 → 做 BHI 下载（轮询）→ 芯片从 PBL 出去 → 再回头做 MSI + MHI**。
+
+### 取固件的方式
+
+手机现在在 loader，但可以直接开 Android 用 adb 拉：
+
+```
+adb pull /vendor/firmware_mnt/image/amss.bin fw-wifi/
+adb pull /vendor/firmware_mnt/image/m3.bin fw-wifi/
+adb pull /vendor/firmware_mnt/image/bdwlan.bin fw-wifi/
+adb shell ls /vendor/firmware_mnt/image | grep -i -e qca -e bdwlan
+```
+
+（`fw-wifi/` 目前是空的；`userland/build.sh` 会把 `fw-wifi/` 里的东西打进内核旁的小镜像，
+`hakios.adreno.c` 的 `hakios_image_file()` 就是从这里读的。）
+
+---
+
+## 00:10–00:30 SMMU 查清了；研究文档到手；但链路又"假 L0"了
+
+### A. apps-SMMU 的现状（第 32 步，只读）
+
+```
+pcie: 32: apps smmu: scr0 0x210406 (an unmatched stream faults), smrs 87, contexts 74, page size 0x1000, 128 page blocks
+pcie: 32: 80 match registers free (first 7), 0 of them cover our streams
+pcie: 32: nothing matches 0x1c00/0x1c01 -- scr0 decides, and scr0 faults
+```
+
+结论很干脆：**没有任何 SMR 匹配我们这两个 SID，而 SCR0 的策略是"不匹配就 fault"**。
+所以端点在能 DMA 之前，必须由我们给它建一条：要么写一条 SMR + S2CR 走 bypass（最简单，
+固件下载用物理地址），要么建上下文 + 页表。
+
+顺带的重要修正（研究文档给的）：`iommu-map` 把 **RID 0x100（bus1 dev0）映射到 SID `0x1c01`**，
+不是 `0x1c00`（那是 bus0）。两条都要建。
+
+### B. 研究文档已产出
+
+`<主机>\Develop\iOSOnAndroid\pcie-wifi-research.md`（21 KB）。要点：
+- **SMMU**：树里 `hakios.camera.c` 已有一份完整的 apps-SMMU 上下文/页表实现（SID 0x800 的 IFE），
+  寄存器偏移与本板实测一致，可以直接改成 0x1c01；风险是 `qcom,skip-init` 下 SCR0/CX 电源的假设。
+- **BHI**：QCA6390 是**两段**下载 —— BHI 只灌前 512 KB（SBL），之后必须等 `BHI_EXECENV==1`，
+  再按 BHIE 向量表（512 KB/段）灌完整 `amss`。文件名随 SOC_HW_VERSION 变化（`amss20.bin` 等）。
+- **ath11k**：QMI 走 QRTR、骑在 MHI 的 IPCR 通道 20/21 上；到能扫描为止的最小消息序列已列出。
+
+### C. 这轮踩到的两个新问题
+
+1. **内核 KVA 被 1 MB 的 map 用光**：`kmem_alloc(1048576) failed with 3` —— 第 29/30 步各自
+   `ml_io_map` 一次整个 BAR。已改成缓存一份（`endpoint_bar()`），29/30 共用。
+2. **我们从没复位过控制器**：mainline 的 `qcom_pcie_init_2_7_0` 是 assert→1 ms→deassert，
+   而第 3 步只做了"释放"。已改成先置位再释放，并各等 1 ms。
+
+### D. 但链路又变成"假 L0"
+
+这一轮：第 9 步 DBI 读得出 `0x10b17cb`（核心是活的），可到第 27 步之后 `PARF_LTSSM` 报
+`0x111`（L0），**而 dm_core / BAR 全读回 `0xffffffff`**，端点也不应答（第 28/29 步）。
+也就是说 wrapper 说链路起来了，核心却不见了 —— 两者不一致。
+
+这不是新问题，而是之前就有的不稳定：冷启动那一轮能一路通到 `17cb:1101` + BHI 1.2，其它轮次
+会在某个点之后"核心消失"。下一步该做的是**把每段之间加验证并定位第一个坏掉的点**，而不是继续
+往前加功能：
+
+1. 第 9 步之后、第 18 步（dm_core 七连写）之后、第 27 步（PERST 重启）之后**各读一次 DBI id**，
+   三个读数就能指出核心是在哪一段消失的。
+2. 只要 PERST# 在链路已起的情况下再拉低，控制器就进 flush；如果确认是它导致的，正式流程里
+   **链路起来之后不再碰 PERST#**。
+
+---
+
+## 00:30–00:45 SMMU 的 bypass 被硬件拒绝：必须走页表
+
+### 测出来的，不是猜的
+
+第 33 步先找空闲的匹配寄存器，然后把 SID `0x1c01`/`0x1c00` 写进去，并逐个试 S2CR 的
+type 字段（[17:16]：0 翻译 / 1 bypass / 2 fault）：
+
+```
+pcie: 33: match register 9 was smr 0 s2cr 0x200ff; giving it stream 0x1c01 as bypass
+pcie: 33:   s2cr: wrote type 0 (0),         reads 0
+pcie: 33:   s2cr: wrote type 1 (0x10000),   reads 0x20000     ← bypass 被改写成 fault
+pcie: 33:   s2cr: wrote type 2 (0x20000),   reads 0x20000
+pcie: 33:   now smr 0x80001c01 s2cr 0x20000 (type 2)
+```
+
+**这个 SMMU 不支持 stage-2 bypass**：写进去的 bypass 被硬件变成 fault。也就是说 PCIe 端点
+没法和别的流一样"直接过"——必须给它建**翻译上下文 + 页表**（研究文档 A 节给的就是这条路，
+`hakios.camera.c` 里有一份完整实现可以照抄：CAM 的 SID 0x800 就是走翻译的）。
+
+### 顺手修掉的 KVA 问题
+
+之前两次 panic 都是 `kmem_alloc(1048576) failed with 3`：第 32/33 步各自
+`ml_io_map(SMMU, 0x100000)`。SMMU 的 SCR0/IDR/SMR/S2CR 全在头 4 KB 里，改成 map 0x1000 就好了，
+这一轮干净返回。
+
+### 当前状态
+
+- SMMU：SCR0 0x210406（未匹配即 fault）、87 个匹配寄存器、74 个上下文、**80 个空闲**；
+  两条 SMR 已经被我们占住（9、10），但 type 被硬件锁在 fault —— **下一步必须写上下文和页表**。
+- 链路：这一轮又是"假 L0/核心不在"（dm_core 全 `0xffffffff`），和上一轮同一个症状。
+- 固件：TWRP 官方下载被广告页挡（curl 只能拿到 HTML），需要手动下载
+  `twrp-3.7.1_12-0-alioth.img`（192 MB）放到 `<主机>\Downloads\`。
+
+---
+
+## 00:45–01:00 "假 L0 / 核心不在" 找到根因：是我们自己的 LTSSM 重启序列
+
+### 症状是什么意思
+
+`PARF_LTSSM`（wrapper 侧）报 `0x11`（L0，链路已训练），但读核心自己的窗口 —— `dm_core`
+`0x60000000`（以及同一片地址里的 ELBI `0x60000f20`）—— 全部返回 `0xffffffff`。在这条互连上
+`0xffffffff` 不是数据，是**从设备没有应答的错误响应**。也就是说 wrapper 说"链路在"，核心却不在了。
+
+第 34 步在故障那一刻把能查的都查了：
+
+```
+pcie: 34: 0x6b014 slv_axi_clk: 0x220 (running)
+pcie: 34: 0x6b01c mstr_axi_clk: 0x220 (running)
+pcie: 34: 0x6b024 cfg_ahb_clk: 0 (running)   ... 0x6b028 aux / 0x6b02c pipe / 0x6b010 q2a 都是 running
+pcie: 34: gcc 0x52008 reads 0x410007f, core reset 0, phy reset 0
+pcie: 34: parf ltssm 0x105 ..., slv_addr_space 0x4000000, axi_mstr_halt 0x80000014
+pcie: 34: dm_core[0] 0xffffffff, elbi sys_stts 0xffffffff
+```
+
+时钟全在跑、复位都松了、PARF 正常，而 **dm_core 和 ELBI 一起死** —— 所以问题在 wrapper 的
+"slave 口"（0x60000000 那片），不在核心、不在 PHY、不在时钟。
+
+把两个被我们改过的寄存器改回固件值（`slv_addr_space=0x1000000`、`sys_ctrl=0x2000361c`）也没用，
+排除了"解码器被写坏"。
+
+### 根因
+
+**是我们自己的 `ltssm_restart()` 干的。** 那个函数是照 vendor 的 link-down recovery 写的：
+先等 `PARF_STATUS` 的 FLUSH_COMPLETED，再**脉冲** `SW_CLR_FLUSH_MODE`（bit10 置 1），等 bit11 掉，
+然后把 `LTSSM_EN`（bit8）**清零再置起**做成一个边沿。
+
+把第 27 步的启用改回"一次写：清 bit11/bit10 + 置 bit8"（也就是早先成功那几轮的样子），
+同一台机器、同一次冷启动，立刻恢复正常：
+
+```
+pcie: 27: parf ltssm 0x100 -> 0x100 (plain enable)
+pcie: 27: after 1 tries: ltssm 0x111 (state 0x11, flush 0), debug0 0x3d17c11, debug1 0x8000010, dbi link 0xb0120008
+pcie: 28: endpoint 01:00.0: id 0x110117cb (vendor 0x17cb, device 0x1101)
+pcie: 30:   0x1e0e200 BHI version minor: 0x2
+```
+
+结论：**这块 IP 上不能用厂商那套 flush 脉冲 + LTSSM 使能边沿**；一次写清的"plain enable"才是对的。
+`ltssm_restart()` 保留但只用于重试路径，默认路径不再调用。
+
+### 社区有没有方案
+
+没有。两个 alioth 移植（`FFT-infra/UniXNU-alioth`、`MrMoxing/ios-alioth`）都停在
+"第一次读 dm_core 就**挂死**"（hang，日志冻结），和我们的症状不同（我们是快速返回 0xffffffff），
+两边都没有越过这一点，也没有任何记录提到 wrapper 的 slave 口会在 LTSSM 重启后失效。
+这条是我们自己踩出来的。
+
+### 顺带修掉的假阳性
+
+`0xffffffff` 的 bit4（`PORT_DEBUG1.LINK_UP`）和 bit29（link word 的 data-link-active）**都是 1**，
+所以"链路是否已起"的判据必须显式排除 `0xffffffff`，否则会对着一片错误响应报 "LINK IS UP"。
+`link_up_now()` 已经改掉。
+
+---
+
+## 01:00–01:10 固件拿到了（TWRP 路线）
+
+### 怎么拿的
+
+1. `fastboot boot <主机>\Develop\alioth-local\twrp-alioth.img`（192 MB，官方 TWRP 3.7.1_12，`fastboot boot` 不刷入，重启即恢复）
+2. TWRP 里 `adb shell` 直接是 **uid=0(root)**
+3. `/vendor/firmware_mnt` 没有自动挂载；**它是 `modem_a` 分区**：
+   `mount -t vfat -o ro /dev/block/by-name/modem_a /mnt/fw`
+4. 固件在 `/mnt/fw/image/qca6390/`，共 **51 个文件、7.8 MB**
+5. `cp` 到 `/sdcard/qca6390`，再 `adb pull sdcard/qca6390 .`（注意：WSL 里调 Windows 的 adb.exe
+   时给绝对路径 `/sdcard/...` 会被 WSL 改写成本机路径，用**相对路径**才行）
+
+### 拿到的东西
+
+`fw-wifi/qca6390/`（51 个文件）：
+
+| 文件 | 大小 | 用途 |
+|---|---|---|
+| `amss20.bin` | 4.3 MB | **主固件**（BHI 灌的就是它） |
+| `bdwlan.e01` … `bdwlan.e1x` | 各几十 KB | 板级数据（ath11k 按 board id 挑一个） |
+| `bd_*.elf` | 各 57 KB | 各地区的板级变体 |
+| `Data.msc` | 646 KB | 杂项 |
+
+（`qca6390` 的实际名字是 `amss20.bin`，不是 `amss.bin` —— 和研究文档里"文件名随 SOC_HW_VERSION
+变化"的提示一致。）
+
+手机已从 TWRP 回到 Android（`sys.boot_completed=1`，`wlan0` 有 IP），随时可以继续实验。
+
+### 下一步
+
+`amss20.bin` 是 BHI 要灌的第一个镜像（前 512 KB 走 BHI SBL，之后走 BHIE 向量表）。但 BHI 的
+`IMGADDR` 是**芯片要去读的地址**，所以在那之前必须先有：
+1. 一段连续物理内存（`kmem_alloc_contig`，树里 adreno/audio/camera 都在用）；
+2. apps-SMMU 的**翻译上下文 + 页表**（bypass 已被硬件拒绝，见上一节），把这段内存映成一个
+   芯片能用的 IOVA；
+3. iATU 里一条 outbound，把该 IOVA 暴露到总线上。
+
+---
+
+## 01:10–01:25 固件归档 + SMMU 翻译上下文活了
+
+### 固件归档
+
+- 工作副本：`fw-wifi/qca6390/`（51 个文件，7.8 MB）—— 给 `userland/build.sh` 打包用
+- 长期归档：`<主机>\Develop\alioth-local\firmware-archive\`，同 51 个文件 +
+  `MANIFEST.txt`（每个文件的 sha256 与大小，以及从手机取固件的完整步骤）
+- **不入 git**：这是高通厂商固件，仓库 `.gitignore` 是白名单，`fw-*` 从不入库（文档里也是这么
+  写的）。所以"归档"落在仓库旁的 `alioth-local` 里，而不是提交里。
+- `userland/build.sh` 新增一段：把 `../fw-wifi/qca6390/*` 装进镜像的 `fw/qca6390/`，
+  这样内核能用 `hakios_image_file("fw/qca6390", "amss20.bin", …)` 读到它。
+  重建后 `userland/root.apfs` 从 6.2 MB 变成 **10 MB**（含 `amss20.bin` 4.3 MB）。
+
+### 第 35 步：SMMU 翻译上下文 + 8 MB 缓冲
+
+bypass 被硬件拒绝（第 33 步），所以照 `hakios.camera.c` 的 `smmu_up` 建真表：
+
+```
+pcie: 35: buffer at va 0xfffffffb2b9b0000 = phys 0x193058000 (8192 KB), tables at 0x1cd1dc000, context 7, match register 9
+pcie: 35: context 7: cbar 0x1f300, tcr 0x803519, ttbr0 0x70001cd1dc000, sctlr 0
+pcie: 35: smr 9: stream 0x1c01 -> context 7 (s2cr 0x7, smr 0x80001c01)
+pcie: 35: smr 10: stream 0x1c00 -> context 7 (s2cr 0x7, smr 0x80001c00)
+pcie: 35: sctlr now 0x127 (bit 0 on = the context is live)
+pcie: 35: the firmware in the image: fw/qca6390/amss20.bin found (4352144 bytes)
+```
+
+- 8 MB 连续物理内存（`kmem_alloc_contig`），物理地址 `0x193058000`，**恒等映射**（IOVA = PA）；
+- 三级页表（2 MB 叶），`CBAR 0x1f300 / TCR 0x803519 / TTBR0 带 ASID / SCTLR 0x127`，与 camera 的
+  值逐位一致；
+- 两条 SMR（`0x1c01`、`0x1c00`）都指到这个上下文，`SCTLR` bit0 = 1，**上下文是活的**；
+- 镜像里读得到 `amss20.bin`，4,352,144 字节。
+
+### 修掉的一个真 bug
+
+页表最初是用**内核虚拟地址**建的（打印出来才发现 `buffer at phys 0xfffffffa...` 明显是 VA）。
+SMMU 表翻译的是总线地址到物理地址，叶子和 IOVA 都必须是 `kvtophys()`；已改，现在的
+`phys 0x193058000` 才是芯片真能访问的地址。
+
+### 下一步（第 36 步：BHI 灌第一段）
+
+1. 把 `amss20.bin` 拷进那段缓冲；
+2. 写 `BHI_IMGADDR_LOW/HIGH = phys`、`BHI_IMGSIZE`、`BHI_IMGTXDB` 门铃；
+3. 轮询 `BHI_STATUS` 的 bits[31:30]（2 = 成功，3 = 出错，出错再读 `BHI_ERRDBG1/2/3`）；
+4. 等 `BHI_EXECENV` 变成 1（SBL 已起），再按 BHIE 向量表灌后面的段（512 KB 一段）。
+
+---
+
+## 01:25–01:35 第一次 BHI 下载：门铃响了，状态读回 0xffffffff
+
+### 做了什么（第 36 步）
+
+按 `mhi_boot.c` 的时序，把 `amss20.bin` 的前 512 KB 交给端点：
+
+```
+pcie: 36: before: BHI exec env 0, status 0 (bits 31:30 = 0), image 4352144 bytes
+pcie: 36: copied 0x80000 bytes of the image into 0x80000000; telling the endpoint
+pcie: 36: read back: addr 080000000, size 0x80000
+pcie: 36: rang the doorbell with 0x51a7b3 (reads 0x51a7b3); waiting for the transfer
+pcie: 36: after 32 polls: BHI status 0xffffffff -> FAILED
+pcie: 36: error code 0xef128100, debug 0x80000000 0 0x80000
+pcie: 36: smmu context 6: fsr 0x400, far 0xb3efaf9d, fsynr0 0x71092c
+pcie: 36:   re-read 0: status 0xffffffff, exec env 0, addr 080000000
+```
+
+- 端点确实在 PBL（EXECENV=0），地址/长度/门铃三次写都读回一致；
+- 门铃之后约 160 ms（32 次轮询）窗口开始返回 **0xffffffff** —— 错误响应，不是判据；
+- SMMU 那个上下文里 FSR 只有 bit10（SS，安全流），STATUS 字段是 0，FAR 是 `0xb3efaf9d`
+  这种不像是我们给的地址 —— 说明**很可能不是我们的翻译出错**，而是端点自己在访问别的东西。
+
+### 关键修复：DMA 缓冲的 I/O 地址
+
+`BHI_IMGADDR_LOW` 只有 32 位，而 `kmem_alloc_contig` 一直返回 6 GB 以上的物理地址
+（`0x193054000`，传 `max_pnum` 也没能限制住）。既然我们用翻译上下文，就**不必恒等映射**：
+叶子表指物理地址，I/O 地址固定取 `0x80000000`（2 GB）。现在是：
+
+```
+pcie: 35: the endpoint's iova is 0x80000000 (under 4 GB, which BHI needs), the buffer's physical is 0x193054000
+```
+
+### 顺带加的开发用快速路径
+
+`pcie_reuse=1`：如果开局 `PARF_LTSSM` 已经是 L0，就**跳过全部初始化**，只做只读步骤和 BHI。
+原因是实测规律：一轮跑完链路是好的，下一轮再做复位/PARF/PERST 就会把它弄坏，而冷启动要 5 分钟。
+
+### 下一步
+
+“门铃之后窗口返回 0xffffffff”有两种可能，要用一次开机分开：
+
+1. **端点活着但它的 BAR 窗口语义变了**（比如 SBL 接管了 BAR）→ 门铃之后再去读**配置空间**
+   （`17cb:1101` 还在不在）。还在就说明端点没死，只是窗口不能这么读；
+2. **端点读了我们给的内存但内容不对**（SBL 拿着错误数据跳飞了）→ 要看 SMMU 的 FAR 是否
+   落在 `amss20.bin` 里某个值上，并把 `BHIE`/向量表那段也准备好。
+
+---
+
+## 01:35–01:45 门铃之后：端点还活着，BHI 寄存器里还是我们写的值
+
+用新加的 `pcie_reuse=1`（链路已在 L0 就完全不初始化）跑第 37 步，一次开机就看清楚了：
+
+```
+pcie: reuse: the link is already at L0 (ltssm 0x111); nothing is initialised
+pcie: 37: the endpoint's configuration space now reads id 0x110117cb (17cb:1101 means it is alive), command 0x20100006
+pcie: 37: the link: parf ltssm 0x111 (state 0x11, flush 0), debug0 0x30c9f11, debug1 0x8000010, dbi link 0xb0120008
+pcie: 37: bar unwindowed: [0x00] 0x100, [0x08] 0xdeadbeef, [0x1c] 0, remap ctrl 0x4000003c
+pcie: 37: BHI_EOFF (bar + 0x2c) 0x224 -> the BHIE aperture would be bar + 0x224
+pcie: 37: window again: exec env 0, status 0, image size 0x80000, addr 0x80000000
+pcie: 37: smmu context 7: fsr 0x400, far 0x951a2bb, fsynr0 0x7c0d55 (cleared 10 ms ago)
+```
+
+结论：
+
+1. **端点没死**：配置空间仍读回 `17cb:1101`，链路仍在 L0，BAR 也能读（`[0x00]=0x100`）；
+2. **BHI 窗口也恢复了**，里面 **`IMGSIZE=0x80000`、`IMGADDR=0x80000000` 正是我们写的值**，
+   说明那三次写确实进了寄存器，不是丢在总线上；
+3. 但 **`EXECENV` 仍是 0（PBL）**、`STATUS` 的 bits[31:30] 是 0 —— SBL **没有起来**；
+4. `BHI_EOFF`（`bar + 0x2c`）= **0x224**，也就是 BHIE 的基址是 `bar + 0x224`（下一步要用）；
+5. SMMU 的 FSR 清掉 10 ms 后又是 `0x400`（只有 SS 位，状态字段是 0），FAR 每次不同
+   （`0xb3efaf9d`、`0x951a2bb`）——**不像稳定的翻译故障**，先记下不下结论。
+
+### 现在的问题收窄成一句
+
+门铃写了、值在、端点活着，但 SBL 不启动。两种可能：
+
+1. **端点读不到我们给的内存**（SMMU 翻译没生效，或页表条目不对）——它读到 0 或错误，就停在那里；
+2. **BHI 的启动条件不止"地址+长度+门铃"**——比如还需要先把镜像的某个头部写对，或
+   `BHI_STATUS` 的写入顺序有讲究（研究文档里第 2 步是"STATUS <- 0"，我们做了）。
+
+下一步该做的验证（都不需要固件、一次开机）：
+
+- 让端点**读一小段我们控制的字节并回显**：把 0x80000000 换成一个内容已知的小页，用 BHIE 的
+  向量表机制试一次（那条路的判据是 `BHIE_TXVECSTATUS[31:30]==2`），能读出内容就说明翻译是对的；
+- 或者反过来：把 S2CR 临时改成 **bypass**（第 33 步实测写进去会变 fault），确认这条路彻底不通，
+  再把 IOVA 直接设成物理地址（>4GB 的那个）试一次，看是否与"32 位地址"有关。
+
+---
+
+## 01:45–01:55 BHI 失败点收窄：端点确实试了，但读不到我们给的内存
+
+### 一次开机把三种写法都试了（`pcie_reuse=1`，不用冷启动）
+
+```
+pcie: 38: iatu 0x000 (outbound region 0): 0x4 0x80000000 0x60100000 0 0x60100fff 0x1000000 0
+pcie: 38: iatu 0x200 (outbound region 1): 0 0x80000000 0x60400000 0 0x604fffff 0x60400000 0
+pcie: 38: iatu 0x800..0x81c: 0 0 0 0 0xfff 0 0 0
+pcie: 38: iatu 0x900..0x91c: 0 0 0 0 0xfff 0 0 0
+pcie: 38: A: 512 KB, a new sequence number: status 0 (bits 31:30 = 0) after 201 polls, exec env 0
+pcie: 38: B: the whole image: status 0 after 201 polls, exec env 0
+pcie: 38: C: the doorbell as an edge: status 0 after 201 polls, exec env 0
+pcie: 38: done: status 0, exec env 0, error code 0xef128100, ERRBG 0x80000000 0 0x80000
+```
+
+### 读出来的东西
+
+1. **outbound 两个 region 都是好的**：region 0 = 配置空间（ctrl1 `0x4` = CFG0，lbar `0x60100000`），
+   region 1 = 内存窗（`0x60400000..0x604fffff`）；
+2. **这个 iatu 窗口里没有单独的 viewport 寄存器**，region n 就在 `0x200 * n`，region 0 从 `0x000`
+   开始 —— 所以我先前写的"inbound"直接覆盖了配置空间那一路（已撤掉，第 28 步会重新写好）；
+3. `0x800`、`0x900` 两个块基本是空的（只有 `+0x10 = 0xfff`），**inbound region 不在这一页**；
+4. `ERRBG` 三个字 = 我们写的 `IMGADDR_LOW / IMGADDR_HIGH / IMGSIZE`（`0x80000000 / 0 / 0x80000`）
+   —— 说明端点**确实尝试了**这次传输并读失败，错误码 `0xef128100`；`EXECENV` 停在 0。
+
+### 结论
+
+门铃、寄存器、长度都对了，端点也动了，**卡在"端点读不到那块宿主内存"**。剩下的可能：
+
+1. **inbound 区在 iatu 窗口的别处**（`0x1000` 或 `0x10000` 起）——下一轮直接在那些页里找非零块；
+2. **端点 DMA 的 stream id 不是 `0x1c01`**：设备侧还有一张 `PARF_BDF_TO_SID_CFG`（`bar + 0x1e0ac00`，
+   `cnss2/reg.h:88`），可以读出来看它把 BDF 映到哪个 SID；若 SID 不是我们映射的那个，
+   SMMU 那边要么没匹配（SCR0 fault）要么走到别的上下文；
+3. 或者根本不需要 SMMU 翻译，而是 RC 的 **inbound iATU** 把总线地址翻给宿主 —— 这两条要分开验证。
+
+---
+
+## 01:55–02:10 BHI 失败的根因线索：设备侧 BDF→SID 表只有 8 位
+
+### 读到了什么
+
+第 39/40/41 三次快跑（`pcie_reuse=1`，每轮约 1.5 分钟，不用冷启动）把 iATU 与 stream id 都翻了出来：
+
+```
+pcie: 39: iatu 0x000  = outbound region 0（配置空间）: ctrl1 0x4, ctrl2 0x80000000, lbar 0x60100000
+pcie: 39: iatu 0x200  = outbound region 1（内存窗）: 0x60400000..0x604fffff -> 0x60400000
+pcie: 39: 0x800 / 0x900 两个块基本全 0（只有 +0x10 = 0xfff）→ inbound 区不在这 4 KB 页
+pcie: 39: endpoint BDF_TO_SID_CFG (bar + 0x1e0ac00) = 0x1 0 0 0
+```
+
+然后是 RC 自己的 **BDF→SID 表**（`parf + 0x2000`，256 项，格式 `BDF[31:16] | SID[15:8] | NEXT[7:0]`）：
+
+```
+pcie: 40: bdf 0x100 -> hash 21; 该槽原值 0x3801e78  → bdf 0x0380, sid 0x1e, next 0x78
+pcie: 40: the table has 256 of 256 entries in use      ← 固件已经写满了
+```
+
+**关键**：SID 字段只有 8 位。也就是说这块控制器给请求打的 stream id 是 `0x1e` 这种小值，
+而设备树 `iommu-map` 与第 35 步用的 `0x1c01` **根本写不进这个字段**。这就解释了为什么
+"端点活着、寄存器都对、SMMU 上下文也活"，但端点的 DMA 仍然失败：它带的流 id 从来不在
+我们的匹配寄存器里。
+
+### 还没解决的
+
+1. 表里**没有** `bdf 0x0100`（我们的端点）的条目 —— 固件是按它自己的设备集填的，
+   而我们的总线号是 1。给 `0x1e/0x1f` 加匹配寄存器后 BHI 仍然 `status 0 / exec env 0`，
+   说明流的真实编号还没找到；
+2. 第 41 步里给 SMR 写入后读回是 **0**（第 35 步同样的操作是能读回的），这一异常要单独查；
+3. inbound iATU 区还没找到（0x800/0x900 是空的，需要看 0x1000 / 0x10000 页）。
+
+### 收尾
+
+- 第 40 步已改成**只读**：把它先前覆盖掉的那个槽（`0x03801e78`）放回去了。那张表是 bootloader
+  的，槽位按 BDF 的 CRC8 哈希分配还带 NEXT 链，覆盖会破坏别人的查找。
+- 手机留在 loader，链路在 L0，`pcie_reuse=1` 可以直接继续做只读/低风险实验（每轮 1.5 分钟）。
+
+### 下一步（下次继续时从这里开始）
+
+1. **找出端点真正的 stream id**：SMMU-500 的全局故障寄存器（`SCR0`/`GFSR`/`GFSYNR0`）在
+   "不匹配流" 时会记录流号，读它们就能知道端点到底用的哪个号；
+2. 或者反向：把 `SMR` 全部填成"指向我们的上下文"，让任何流都能翻译（80 个空闲槽够用），
+   再试 BHI —— 如果这时成了，就证明问题纯粹是流 id 不匹配；
+3. 第 41 步的 SMR 写入不生效要查（可能是 SMMU 全局被锁，或写入需要先关 `SCTLR`）。
+
+---
+
+## 02:10 收工状态（USB 掉了，最后一次实验没拿到结果）
+
+最后一轮（第 42 步：把 SMMU 的**所有** stream 槽都指向我们的上下文，再试 BHI）**已经编译好并启动**，
+但跑到一半 **手机的 USB 消失了**：`xl state` 报 `absent`，`adb devices` 与 `fastboot devices` 都是空。
+这是今天之前出现过两次的老毛病（`fastboot` 看得到但所有命令超时 / 或者干脆消失），
+**需要物理拔插一次数据线**（必要时按住电源键让机器重启）。
+
+所以：
+
+- 第 42 步的代码在树里、编译通过，但**没有实测结果**；
+- 手机现在既不在 loader 也不在 Android，只剩物理操作能救。
+
+### 今晚从"链路还在 0x5"到这里的全部进展
+
+| 环节 | 状态 |
+|---|---|
+| 链路 L0（PERST# 低有效、plain LTSSM enable） | ✅ 可复现（冷启动一轮必成） |
+| 配置空间 `17cb:1101` | ✅ |
+| BAR + iATU outbound（配置/内存两区） | ✅ |
+| QCA6390 半 BAR 窗口（`bar+0x310c` + `bar+0x80000+off`） | ✅ |
+| BHI 读出版本 1.2 / EXECENV=0 / NUMSEG=1 / SERIALNU | ✅ |
+| RPMh 四路电源（12 条请求全部应答） | ✅ |
+| apps-SMMU 翻译上下文 + 8 MB 缓冲（IOVA `0x80000000`）+ 页表 | ✅ 编程成功 |
+| 固件 `amss20.bin` 进镜像（`fw/qca6390/`，`root.apfs` 9.7 MB） | ✅ |
+| BHI 灌前 512 KB | ❌ 端点尝试了（ERRBG 回显我们的描述符），SBL 不启动 |
+| BHI 之后（BHIE / MHI / QMI / ath11k） | 未开始 |
+
+### 明早第一件事
+
+1. 拔插数据线，`DEVICE=alioth ./xl state` 确认能看到手机；
+2. 若在 loader：直接
+   `XL_SECS=110 XL_FOLLOW=0 XL_SB_DELAY=8 XL_CMDLINE="bootcpu=7 pcie_step=42 pcie_rail=2 pcie_smmu_map=1 pcie_reuse=1 pcie_at=2" ./xl run`
+   —— 这一轮会打印 SMMU 的 IDR0（判断"匹配寄存器能不能自选"），把全部 128 个 stream 槽指向我们的
+   上下文，然后重试 BHI；判据是 `pcie: 38: A: ...` 里 `exec env` 是否变成 1。
+3. 若不在 loader：`./xl reboot` → 等 100 秒 → `./xl enter` → `./xl ramdisk userland/system.apfs` → 上面那条。
+
+---
+
+## 02:15–02:25 iATU 的 inbound 区找不到；BHI 的读根本没到 SMMU
+
+### 关键否定证据
+
+第 42 步走了 BDF→SID 表的 NEXT 链（8 跳），**没有我们的 BDF**，而且链上的"BDF"是
+`0xf5b1`、`0x5d17` 这种不可能是 BDF 的值 —— 说明 `parf+0x2000` 这块在这个 IP 版本上
+**不是 BDF→SID 表**。同时：
+
+```
+pcie: 42: smmu global: gfsr 0, gfsynr0 0, gfsynr1 0, scr0 0x220406
+```
+
+**GFSR = 0** —— 如果端点的读因为"流不匹配"被拒，SMMU 会记一条全局故障。它是 0，所以
+**端点的读根本没有到达 SMMU**，它在上游就被丢掉了：也就是控制器自己的地址翻译没把它放行。
+
+### 试过但不对的两条路
+
+1. DBI 的 `0x900`（DesignWare 标准 iATU viewport 位置）读回全 `0xffffffff` —— 这个地址在
+   这块 wrapper 上不存在，不能在那里配 inbound；
+2. iATU 窗口（`0x60001000`，设备树只给 0x1000）里翻遍了 `0x400..0x1100`，除了每个 `0x100`
+   块里 `+0x10 = 0xfff`（未用区域的默认 limit）之外全是空 —— **inbound 区不在这个窗口里**。
+
+### 现在的完整认识
+
+```
+端点活着（17cb:1101）→ 链路 L0 → 配置空间/BAR/窗口/BHI 寄存器全部可读写
+BHI: 描述符进了寄存器，端点也尝试了（ERRBG 回显 IMGADDR/IMGSIZE），读失败
+                       ↑
+        读请求在到达 SMMU 之前就被丢弃（GFSR=0）
+                       ↑
+        控制器/包装器的"入向"通路没有配（outbound 只有两条：配置区 0x000、内存区 0x200）
+```
+
+### 下一步的三条候选（都需要新信息，不再瞎试）
+
+1. **查 wrapper 手册/其它实现**：`0x60001000` 这块 iATU 的**入向**寄存器在哪个偏移
+   （mainline 的 `dw_pcie_prog_inbound_atu` 用的是 DBI+0x900，这块 IP 显然把 iATU 挪到了别处；
+   最可靠的是找 sm8250 的 vendor PCIe 手册或别的平台的寄存器图）；
+2. **看 vendor 驱动有没有碰过入向**：`pci-msm.c` 里只有 outbound（`msm_pcie_iatu_config`），
+   说明 QCA6390 的 DMA 在 Android 上**默认就是通的** —— 那么它靠的可能不是 iATU 入向，
+   而是**端点自己的 PCIe 桥把请求直接发到总线上**，再由 SMMU 翻译。若是这样，问题回到
+   "为什么 SMMU 没收到" —— 需要确认端点的请求是否真的发出去了（BHI 的 ERRBG 只是回显，
+   不代表发出了读）；
+3. **用 SMMU 自己的"未匹配流"策略做实验**：`SCR0.USFCFG`（bit 10）现在是 1 = fault，
+   若能临时置 0（忽略）并观察行为变化，就能判断请求到底有没有到 SMMU。
+
+### 收尾
+
+手机仍在 loader、链路在 L0（`pcie_reuse=1` 可随时继续做只读实验）。
+今晚**没有让屏幕再黑**：第 42 步那种"把所有 stream 指向一个上下文"的做法已经删除，
+现在第 42/43 步都是只读的。
+
+---
+
+## 02:25 交接：我会继续做，不需要你决策
+
+状态（留给早上读）：
+
+- 手机在 **loader**，链路 **L0**，`pcie_reuse=1` 可以直接做只读/低风险实验（每轮约 1.5 分钟）。
+- 已确认：端点活着、配置空间/BAR/半 BAR 窗口/BHI 寄存器全部可读写、RPMh 四路电源已投、
+  apps-SMMU 上下文+页表已建（IOVA `0x80000000` → 物理 `0x193048000`）、`amss20.bin` 在镜像里。
+- 卡点：BHI 的 512 KB 传输被端点尝试后失败，而 **SMMU 全局故障寄存器是 0**，说明读请求没到 SMMU；
+  控制器/包装器那边缺"入向"配置，但它的入向寄存器偏移还没找到（DBI `0x900` 读回 `0xffffffff`，
+  iATU 窗口 `0x60001000` 里 `0x400..0x1100` 也没有）。
+- 我接着做的事（不碰别人的流、不写坏状态）：去 **edk2-platforms 的 QcomPkg PCIe 驱动**里找
+  inbound iATU 的偏移与写法（UEFI 在 Qualcomm 平台上必须配入向，DMA 才能工作），找到就照着实现、
+  编译、用 `pcie_reuse=1` 直接验证。
+
+---
+
+## 02:20–02:30 找到了 inbound iATU（Qualcomm 自己的 HWIO 表），配上了，但 BHI 仍失败
+
+### 来源：Qualcomm 的 UEFI/XBL 源码
+
+GitHub 上有一份 SM8250 的 `BOOT.XF.3.3`（`SwedMlite/BOOT.XF.3.3`），里面的
+`QcomPkg/SocPkg/Library/PcieConfigLib/PcieHwioRegs.h` 就是这块 PCIe 的**完整寄存器图**（11 万行）。
+其中写得很清楚：
+
+```c
+HWIO_PCIE_GEN3X1_IATU_REGION_CTRL_1_OFF_OUTBOUND_i_ADDR(i)  = base + i*0x200 + 0x000
+HWIO_PCIE_GEN3X1_IATU_REGION_CTRL_1_OFF_INBOUND_i_ADDR(i)   = base + i*0x200 + 0x100
+                 CTRL_2 +0x04 / LWR_BASE +0x08 / UPPER_BASE +0x0c / LIMIT +0x10
+                 LWR_TARGET +0x14 / UPPER_TARGET +0x18      （入向整体再 +0x100）
+```
+
+也就是说**每个 outbound region 后面 0x100 处就是同号的 inbound region**。这解释了之前
+dump `0x400..0x1100` 时"每 0x100 块里只有 +0x10 = 0xfff"的现象 —— 那些正是**未配置的
+inbound LIMIT 寄存器**的复位值。
+
+### 已配置（读回确认）
+
+```
+pcie: 43: inbound region 0 before: ctrl1 0 ctrl2 0 base 0 limit 0xfff target 0
+pcie: 43: inbound region 0 after:  ctrl1 0 ctrl2 0x80000000 base 0x80000000 limit 0x807fffff target 0x193048000
+```
+
+总线地址 `0x80000000..0x807fffff` → 宿主物理 `0x193048000`，region 已使能。
+
+### 但 BHI 仍然失败，一字不差
+
+```
+pcie: 38: A: 512 KB, a new sequence number: status 0 (bits 31:30 = 0) after 201 polls, exec env 0
+pcie: 38: done: status 0, exec env 0, error code 0xef128100, ERRBG 0x80000000 0 0x80000
+```
+
+`ERRBG` 依旧回显我们的 `IMGADDR/IMGADDR_HIGH/IMGSIZE`，`EXECENV` 停在 0。
+
+### 现在的两种可能（下一轮先分清）
+
+1. **请求到了 SMMU，但被二次翻译**：iATU 已经把总线地址换成物理 `0x193048000`，如果 SMMU 再看一眼
+   就会因为表里只映射 `0x80000000` 而拒掉 → 需要给上下文**再加一段恒等映射**（物理地址映射到自己）；
+2. **请求还是没到** → 那问题在端点侧（BHI 自己的状态或镜像格式），要转去查 `mhi_boot.c`
+   对 `BHI_ERRCODE` 的判读（`0xef128100` 还没解读）。
+
+判断依据已经写进代码：跑完 BHI 后读 **SMMU 全局 `GFSR`/`GFSYNR`** 和**我们上下文的 `FSR/FAR`**——
+非零就说明请求到了并被拒（走方案 1），全零就说明没到（走方案 2）。这一版补丁的转义没打进去，
+下次直接手写这段即可。
+
+### 备注
+
+- 这份 `BOOT.XF.3.3` 还有 `PcieConfigLib/PcieSIDProg.c`（BDF→SID 编程）和 `pcie_props.xml`
+  （各根桥的时序参数），后面配 MHI/DMA 时都用得上，值得整份拉下来放 `alioth-local/`。
+- 手机在 loader、链路 L0，`pcie_reuse=1` 每轮 1.5 分钟。
+
+---
+
+## 02:30 阶段总结（写进 README 的状态表，`devices/alioth/status` 是唯一来源）
+
+`devices/alioth/status` 里 wifi 那一行从 `missing` 改成了 `partial`，README.md / README.zh.md 的表
+由 `tools/device-status.py update alioth` 重新生成（6 works / 4 partial / 8 missing），内容记的是
+**已经实测到的**：
+
+| 环节 | 状态 |
+|---|---|
+| 四路电源（RPMh，12 条请求全应答） | ✅ |
+| PHY 序列（设备树 99 组）+ ready | ✅ |
+| 链路 **L0**（PERST# 低有效、plain LTSSM enable） | ✅ |
+| 端点枚举 `17cb:1101`（iATU region 0 + conf 低 4 KB） | ✅ |
+| BAR0 1 MB @ `0x60400000` + 根桥窗口 + iATU outbound region 1 | ✅ |
+| 半 BAR 窗口（`+0x310c` / `+0x80000+off`）读 BHI | ✅ 版本 1.2、EXECENV=0(PBL)、NUMSEG=1 |
+| 固件 `amss20.bin` 在镜像里（`fw/qca6390/`） | ✅ |
+| apps-SMMU 翻译上下文 + 页表 + 8 MB 缓冲（IOVA `0x80000000`） | ✅ |
+| iATU **inbound** region（位置取自 Qualcomm HWIO 表：`i*0x200+0x100`） | ✅ 已配、读回正确 |
+| **BHI 灌 512 KB → SBL 启动** | ❌ 端点尝试后失败（`ERRCODE 0xef128100`，EXECENV 停在 0） |
+| MHI / QMI / ath11k | 未开始 |
+
+### 下一步（按你的新规矩：先看社区，再动手）
+
+1. **OpenBSD 的 `qwx(4)`**（`sys/dev/pci/if_qwx_pci.c`）是一份**非 Linux 内核**里从零写的
+   QCA6390 BHI/MHI 实现 —— 对 XNU 移植参考价值最高（Linux 的 mhi 框架太重，OpenBSD 的是裸寄存器）；
+2. Qualcomm 的 `BOOT.XF.3.3`（UEFI/XBL）里有 `PcieSIDProg.c` 与 `pcie_props.xml`，配 DMA 时要用；
+3. 用 `GFSR`/`FSR` 判据分清 BHI 失败是"二次翻译"还是"请求没到"。
