@@ -274,7 +274,7 @@ SOUTH  85..91     NORTH  92..124    SOUTH 125..132   WEST  133..179
 | 项目 | 状态 | 说明 |
 |---|---|---|
 | GPU | ✅ 真机跑起来 | 见上 |
-| Wi-Fi | ❌ | **QCA6390**（`qcom,cnss-qca6390`，wlan-en = gpio20），走 PCIe；XNU 侧没有 PCIe 代码，`hakios.wifi.c` 还是 WCN6750 版本 |
+| Wi-Fi | ⚠️ | **QCA6390**，走 PCIe。主机侧已经跑通到"BHI 寄存器可读写、端点枚举成功"，卡在端点不响应 BHI 门铃——见下面的 WLAN 小节 |
 | 音频 | ⚠️ 部分 | 两颗 CS35L41 在 `i2c@98c000`（SE3，gpio119/120，reset gpio114），DEVID `0x035a40`，能读能写；出声还差 ADSP + 三级 TDM（0x9020 / 0x9120）。麦克风走 SoundWire（WCD938x） |
 | 振动 | ❌ | aw8697 在 I2C 上认得出（地址 `0x5a`、ID `0x97`）、原厂波形 RAM 回读一致、内部 ADC 约 4.3 V，但 **f0 校准和 RAM 播放都没 PASS**，iOS 的 haptic 服务没接上，也没有真实震感验收——见 `PROGRESS.md`「AW8697 振动：已到硬件驱动阻塞点」 |
 | 相机 | ❌ | IMX582 等，最复杂，最后做 |
@@ -288,6 +288,53 @@ soc_rsc=0x18220000       soc_apps_smmu=0x15000000 soc_smem=0x80900000
 soc_imem=0x14600000      soc_ipa_stream=0x5c0     soc_ipa_stream_uc=0x5c2
 soc_pas_ipa=0xf          soc_ipa_fw=ipa_fws
 ```
+
+## WLAN（QCA6390，PCIe）
+
+节点是 `qcom,cnss-qca6390@b0000000`（`dump/twrp-fdt.dts:8159`；`twrp-fdt.dts` 就是这台手机的 fdt）。
+
+| 项目 | 值 |
+|---|---|
+| 根桥 | `qcom,pcie0@1c00000`（`qcom,wlan-rc-num = <0>`），PERST# = tlmm **gpio79**，WAKE = gpio81 |
+| 使能脚 | `wlan-en-gpio = <&tlmm 20 0>`：高有效、8 mA、上拉（`cnss_wlan_en_active`）。**上电序列里拉高，不是事后补的**：Android 自己 0.595 s 上电、0.697 s 拉 EN、0.771 s 才 probe PCIe |
+| 电源 | `vdd-wlan-aon` 与 `vdd-wlan-dig` 是**同一路**（phandle 0xa9），`vdd-wlan-io` 0xab、`vdd-wlan-rfa1` 0xac、`vdd-wlan-rfa2` 0xad——四路，和 `hakios.pcie.c` 里投的四路一致 |
+| 电压 | aon/dig 950 mV（`0xe7ef0`）、io 1.8 V、rfa1 1.9 V、rfa2 1.35 V |
+| 关键 flag | `qcom,smmu-s1-enable`（SMMU stage-1 必须开；bypass 被硬件拒绝，写 type1 读回 type2）、`qcom,set-wlaon-pwr-ctrl`、`qcom,cmd_db_name = "smpf2"`、`mhi,m2-no-db-access`、`qcom,no-l0s-supported`、`qcom,use-19p2mhz-aux-clk` |
+| IOVA 池 | `qcom,iommu-dma-addr-pool = <0xa0000000 0x10000000>`；**MSI 门铃也落在这里**（实测 address `0xa0000040`、data `0x320`） |
+| 枚举 ID | `17cb:1101`，BAR0 = 1 MB，链路 **Gen2 x1**，端点命令寄存器 `0x0406`（memory+busmaster+serr） |
+
+### 能直接照抄的一组参考读数（同一颗芯片，`BHI_SERIALNU = 0xc4e10d95`）
+
+厂商栈在两种状态下的实测值（用 `alioth-local/tools/regpeek` 从 Android root 读的）：
+
+| 地址 | 含义 | 固件运行（AMSS） | 停在 PBL 等固件 |
+|---|---|---|---|
+| 0x1e0e228 | BHI_EXECENV | 0x2 | 0 |
+| 0x1e0e22c | BHI_STATUS | 0x9aae8427 | 0 |
+| 0x1e0e21c | BHI_RSVD2（主线误当 INTVEC） | — | 每次启动不同的随机值 |
+| 0x1e0e240 | BHI_SERIALNU | 0xc4e10d95 | 0xc4e10d95 |
+| 0x1e08000 | PARF_PHY_CTRL | 0x2000321c | 0x2000361c |
+| 0x1e08174 | PARF_MHI_CLOCK_RESET_CTRL | 0x1 | 0x3 |
+| 0x1e081b0 | PARF_LTSSM | 0x111 | 0x111（L0） |
+| 0x1f8002c | WL_PWR_STATUS | 0x9 | 0xf |
+| 0x1f806b0 / 0x1f806ac / 0x1f80318 | 三个时钟切换字 | 0 | 0 |
+
+**0x1e00000 以上的寄存器怎么读**：BAR 只有 1 MB，芯片内部寄存器在 0x1e0e200 这类地址上，
+靠 `BAR+0x310c`（`QCA6390_PCIE_REMAP_BAR_CTRL_OFFSET`）开窗——写
+`0x40000000 | ((addr >> 19) & 0x3f)`，然后访问 `BAR + 0x80000 + (addr & 0x7ffff)`。
+
+**寄存器地址和 bring-up 顺序的权威来源**是厂商 `cnss2` 驱动，本机副本在
+`<主机>\Develop\alioth-local\cnss2-src\`（取自 LineageOS `android_kernel_xiaomi_sm8250`
+的 `drivers/net/wireless/cnss2/`，`main.c` `bus.c` `pci.c` `reg.h` `pci.h`）：
+
+- `reg.h` 是 QCA6390 的完整地址表：`BHI_EXECENV = 0x1e0e228`、`PCIE_BHI_ERRDBG2/3 = 0x1e0e238/23c`、
+  WLAON 一整片 `0x1f80000`~`0x1f80700`、WCSS/Q6 那片 `0xb6*` `0xc3*` `0xdb*` `0xd0*`、
+  `PBL_WLAN_BOOT_CFG = 0x1e22b34`、`PBL_BOOTSTRAP_STATUS = 0x1910008`、
+  PBL 日志 SRAM `0x1403d58`（80 B）。
+- `pci.c` 是顺序：`cnss_power_on_device`（四路电源）→ `cnss_resume_pci_link` →
+  `cnss_pci_set_wlaon_pwr_ctrl`（读改写 `QFPROM_PWR_CTRL` @0x1f8031c，清 shutdown/vdd4blow 位）→
+  `cnss_pci_start_mhi`（`mhi_prepare_for_power_up` + `mhi_sync_power_up`，BHI 下载在里面）。
+  它在 BHI 之前**没有**别的芯片寄存器写。
 
 ## 启动参数速查（本机常用）
 

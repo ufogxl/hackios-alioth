@@ -82,6 +82,7 @@ struct lx_radio {
 	struct ieee80211_vif *vif;		/* the one interface, while it is up */
 	void *vif_memory;
 	bool started;
+	uint16_t management_sequence;	/* Sequence Control, shared by management types; survives leave/join */
 
 	/* a scan */
 	volatile int scan;			/* 0: none, 1: running, 2: over, 3: given up by the driver */
@@ -480,9 +481,22 @@ linuxkpi_ieee80211_handle_wake_tx_queue(struct ieee80211_hw *hw, struct ieee8021
 {
 }
 
+/* Only management type/status/length: no peer addresses, network names or frame bytes. */
+static void
+management_tx_trace(struct sk_buff *skb, const char *how, int status)
+{
+	if (!lx_os_option("wifi_mgmt_trace") || skb->len < 24 || (skb->data[0] & 0x0c) != 0 ||
+	    (IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_CTL_HW_80211_ENCAP)) {
+		return;
+	}
+	lx_tell("lx: management %s type %#x length %u ack %u status %d\n", how, skb->data[0] & 0xfc, skb->len,
+	    (IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_STAT_ACK) != 0, status);
+}
+
 void
 linuxkpi_ieee80211_tx_status(struct ieee80211_hw *hw, struct sk_buff *skb)
 {
+	management_tx_trace(skb, "complete", 0);
 	dev_kfree_skb_any(skb);
 }
 
@@ -490,13 +504,14 @@ void
 linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_status *status)
 {
 	if (status->skb != NULL) {
-		dev_kfree_skb_any(status->skb);
+		linuxkpi_ieee80211_tx_status(hw, status->skb);
 	}
 }
 
 void
 linuxkpi_ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb, int status)
 {
+	management_tx_trace(skb, "drop", status);
 	dev_kfree_skb_any(skb);
 }
 
@@ -548,6 +563,37 @@ static const uint8_t wmm[4] = { 0x00, 0x50, 0xf2, 0x02 };	/* Microsoft's, which 
 
 /* ---- what the radio hears -------------------------------------------------------------------------- */
 
+/* RX metadata can describe a neighbouring channel. DS or HT operation gives the BSS primary.
+ * This is the cfg80211 channel-selection rule, implemented with this shim's existing IE parser.
+ * Never turn an invalid or disabled advertised primary into permission to transmit elsewhere.
+ */
+static struct linuxkpi_ieee80211_channel *
+beacon_channel(struct wiphy *wiphy, const uint8_t *elements, unsigned length, unsigned received)
+{
+	struct linuxkpi_ieee80211_channel *channel = linuxkpi_ieee80211_get_channel(wiphy, received);
+	const uint8_t *operation;
+	unsigned primary;
+
+	if (channel == NULL) {
+		return (NULL);
+	}
+	if (channel->band == NL80211_BAND_2GHZ || channel->band == NL80211_BAND_5GHZ) {
+		operation = element(elements, length, 3);
+		if (operation != NULL && operation[1] == 1) {
+			primary = operation[2];
+		} else {
+			operation = element(elements, length, 61);
+			if (operation == NULL || operation[1] < 22) {
+				return ((channel->flags & IEEE80211_CHAN_DISABLED) ? NULL : channel);
+			}
+			primary = operation[2];
+		}
+		channel = linuxkpi_ieee80211_get_channel(wiphy,
+		    linuxkpi_ieee80211_channel_to_frequency(primary, channel->band));
+	}
+	return (channel != NULL && !(channel->flags & IEEE80211_CHAN_DISABLED) ? channel : NULL);
+}
+
 /*
  * A beacon or an answer to a probe (IEEE 802.11-2020, 9.3.3): after the 24 bytes every
  * management frame begins with -- the sender's network is the third address -- a time stamp, the
@@ -560,7 +606,16 @@ heard(struct lx_radio *radio, const uint8_t *frame, unsigned length, unsigned fr
 {
 	struct lx_heard *network = NULL;
 	const uint8_t *elements = frame + 36, *name = element(elements, length - 36, 0);
+	struct linuxkpi_ieee80211_channel *primary = beacon_channel(radio->wiphy, elements, length - 36, frequency);
 
+	if (primary == NULL) {
+		return;
+	}
+	if (lx_os_option("wifi_mgmt_trace") && frequency != primary->center_freq && name != NULL &&
+	    radio->want_length != 0 && name[1] == radio->want_length && memcmp(name + 2, radio->want, name[1]) == 0) {
+		lx_tell("lx: beacon primary corrected from %u to %u MHz\n", frequency, primary->center_freq);
+	}
+	frequency = primary->center_freq;
 	lx_os_lock();
 	if (name != NULL && radio->want_length != 0 && name[1] == radio->want_length &&
 	    memcmp(name + 2, radio->want, radio->want_length) == 0 && (!radio->target.found || signal > radio->target.signal) &&
@@ -676,7 +731,7 @@ say_heard(struct lx_radio *radio)
 			snprintf(line + strlen(line), sizeof(line) - strlen(line), " %u on %u,", on_channel[channel], channel);
 		}
 	}
-	printf("lx: THE SCAN HEARD %u NETWORKS (access points): %u at 2.4 GHz, %u at 5 GHz; by channel:%s the strongest at %d dBm, "
+	lx_tell("lx: THE SCAN HEARD %u NETWORKS (access points): %u at 2.4 GHz, %u at 5 GHz; by channel:%s the strongest at %d dBm, "
 	    "the weakest at %d; %u open, %u without a name; %u frames in all, %u of them neither beacon nor answer to a probe%s\n",
 	    radio->heard_count, low, high, line, radio->heard_count ? strongest : 0, radio->heard_count ? weakest : 0, open, nameless,
 	    radio->frames, radio->others, radio->heard_lost ? "; MORE WERE HEARD THAN THERE WAS ROOM FOR" : "");
@@ -708,6 +763,7 @@ frame_send(struct lx_radio *radio, struct sk_buff *skb)
 {
 	struct ieee80211_tx_control control = { .sta = radio->sta };
 
+	management_tx_trace(skb, "submit", 0);
 	radio->ops->tx(&radio->hw, &control, skb);
 }
 
@@ -715,7 +771,16 @@ frame_send(struct lx_radio *radio, struct sk_buff *skb)
 static uint8_t *
 management(struct lx_radio *radio, uint8_t *frame, unsigned kind)
 {
+	uint16_t sequence;
+
+	/* The ath11k WMI management path sends this header unchanged. Fragment number stays zero. */
+	lx_os_lock();
+	sequence = radio->management_sequence;
+	radio->management_sequence = (uint16_t)((sequence + 0x10u) & 0xfff0u);
+	lx_os_unlock();
 	bzero(frame, 24);
+	frame[22] = (uint8_t)sequence;
+	frame[23] = (uint8_t)(sequence >> 8);
 	frame[0] = (uint8_t)kind;
 	memcpy(frame + 4, radio->target.address, ETH_ALEN);
 	memcpy(frame + 10, radio->vif->addr, ETH_ALEN);
@@ -832,6 +897,12 @@ management_received(struct lx_radio *radio, const uint8_t *f, unsigned length)
 	int answer = ANSWER_NONE;
 	unsigned status = 0;
 
+	if (lx_os_option("wifi_mgmt_trace") && length >= 24 &&
+	    (f[0] == 0xb0 || f[0] == 0x10 || f[0] == 0xa0 || f[0] == 0xc0)) {
+		lx_tell("lx: management receive type %#x length %u own %u peer %u station %u\n", f[0], length,
+		    radio->vif != NULL && memcmp(f + 4, radio->vif->addr, ETH_ALEN) == 0,
+		    memcmp(f + 10, radio->target.address, ETH_ALEN) == 0, radio->sta != NULL);
+	}
 	if (radio->sta == NULL || length < 26 || memcmp(f + 10, radio->target.address, ETH_ALEN) != 0 ||
 	    memcmp(f + 4, radio->vif->addr, ETH_ALEN) != 0) {
 		return;
@@ -1048,7 +1119,7 @@ station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 	mutex_lock(&hw->wiphy->mtx);
 	ret = radio->ops->hw_scan(hw, radio->vif, request);
 	mutex_unlock(&hw->wiphy->mtx);
-	printf("lx: THE DRIVER IS ASKED TO SCAN %d channels, %s: %d\n", request->req.n_channels, quiet ? "listening only" :
+	lx_tell("lx: THE DRIVER IS ASKED TO SCAN %d channels, %s: %d\n", request->req.n_channels, quiet ? "listening only" :
 	    name_length != 0 ? "asking for one network by name where it may send" : "asking for any network where it may send", ret);
 	if (ret == 0) {
 		lx_os_lock();
@@ -1056,7 +1127,7 @@ station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 			lx_os_sleep(&radio->scan, 100 * 1000000ull);
 		}
 		lx_os_unlock();
-		printf("lx: %llu ms later the scan is %s\n", (lx_os_nanoseconds() - began) / 1000000ull, radio->scan == 2 ? "OVER" :
+		lx_tell("lx: %llu ms later the scan is %s\n", (lx_os_nanoseconds() - began) / 1000000ull, radio->scan == 2 ? "OVER" :
 		    radio->scan == 3 ? "GIVEN UP by the driver" : "NOT OVER: the driver has not said so");
 		say_heard(radio);
 		if (radio->scan == 1 && radio->ops->cancel_hw_scan != NULL) {
@@ -1630,11 +1701,10 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 		lx_tell("lx: THE NETWORK THAT IS WANTED WAS NOT HEARD (a name of %u bytes), in three scans\n", name_length);
 		return (ENOENT);
 	}
-	channel = linuxkpi_ieee80211_get_channel(hw->wiphy, target->frequency);
-	if ((e = element(target->elements, target->elements_length, 3)) != NULL && e[1] == 1 && channel != NULL &&
-	    linuxkpi_ieee80211_get_channel(hw->wiphy, linuxkpi_ieee80211_channel_to_frequency(e[2], channel->band)) != NULL) {
-		/* (a beacon can be heard on the channel next to its own: where it says it is counts) */
-		channel = linuxkpi_ieee80211_get_channel(hw->wiphy, linuxkpi_ieee80211_channel_to_frequency(e[2], channel->band));
+	channel = beacon_channel(hw->wiphy, target->elements, target->elements_length, target->frequency);
+	if (lx_os_option("wifi_mgmt_trace") && channel != NULL) {
+		lx_tell("lx: management channel frequency %u flags %#x original %#x max_power %d\n",
+		    channel->center_freq, channel->flags, channel->orig_flags, channel->max_power);
 	}
 	obstacle = protection(target, &group_cipher);
 	lx_tell("lx: the network that is wanted: an access point on channel %u (%u MHz) at %d dBm, capabilities %#x, beacons every "

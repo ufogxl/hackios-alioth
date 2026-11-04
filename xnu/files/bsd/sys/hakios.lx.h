@@ -101,4 +101,18 @@ int	 lx_transmit(const unsigned char *frame, unsigned long length);
 /* before lx_start(), if the kernel wants it early: take the memory the radio will be shown. 0, or an errno. */
 int	 lx_prepare(void);
 
+/* K40 PCIe backend; plain C types also used by the LinuxKPI object. */
+int lx_os_pcie(void);
+unsigned lx_os_pcie_read32(unsigned offset);
+void lx_os_pcie_write32(unsigned offset, unsigned value);
+int hakios_pcie_radio_map(unsigned long long physical, unsigned long size, unsigned long long *address);
+int hakios_pcie_radio_up(void);
+int hakios_qrtr_external_start(int (*send)(const void *, unsigned));
+void hakios_qrtr_external_input(const void *data, unsigned length);
+void hakios_qrtr_external_poll(void);
+void hakios_qrtr_external_stop(void);
+int hakios_lx_prepare(void);
+int hakios_lx_start(void);
+void hakios_lx_stop(void);
+
 #endif

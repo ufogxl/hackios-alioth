@@ -755,8 +755,8 @@ iounmap(void *address)
  * or the other way round. The first part of it is handed out for good, a stretch at a time
  * (rings); the rest is slots of one size, taken and given back (buffers).
  */
-#define POOL_SIZE	(44u << 20)
-#define POOL_RINGS	(12u << 20)		/* (the data path's rings and link descriptors come to about 6 MB) */
+#define POOL_SIZE	(56u << 20)
+#define POOL_RINGS	(20u << 20)		/* (the data path's rings and link descriptors come to about 6 MB) */
 #define POOL_SLOT	4096u
 #define POOL_SLOTS	((POOL_SIZE - POOL_RINGS) / POOL_SLOT)
 
@@ -796,18 +796,29 @@ linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle
 {
 	uint32_t at;
 
-	size = roundup2(size, 64);
+	/* Linux coherent DMA provides at least page alignment. Large firmware
+	 * allocations on K40 also keep the verified standalone probe's 64 KiB alignment.
+	 * The AHB backend retains its existing allocation geometry.
+	 */
+	size_t alignment = lx_os_pcie() ? (size >= 0x10000 ? 0x10000 : 0x1000) : 64;
+	if (!size || size > POOL_RINGS) return NULL;
+	size = roundup2(size, alignment);
 	lx_os_lock();
-	at = pool.rings_used;
-	if (pool.memory == NULL || at + size > POOL_RINGS) {
+	if (pool.rings_used > POOL_RINGS) { lx_os_unlock(); return NULL; }
+	at = roundup2(pool.rings_used, alignment);
+	if (pool.memory == NULL || at > POOL_RINGS || size > POOL_RINGS - at) {
 		lx_os_unlock();
 		printf("lx: no room for %zu more bytes of rings\n", size);
 		return (NULL);
 	}
-	pool.rings_used += size;
+	pool.rings_used = at + size;
 	lx_os_unlock();
 	bzero(pool.memory + at, size);
 	*dma_handle = pool.address + at;
+	if (lx_os_pcie() && size >= 0x40000) {
+		lx_tell("lx: coherent allocation %zu bytes at IOVA %#llx, alignment %#zx\n", size,
+		    (unsigned long long)*dma_handle, alignment);
+	}
 	return (pool.memory + at);
 }
 
@@ -877,7 +888,7 @@ linuxkpi_dev_alloc_skb(size_t size, gfp_t gfp)
 	uint32_t slot;
 
 	if (size + NET_SKB_PAD > POOL_SLOT) {
-		printf("lx: a buffer of %zu bytes is asked for; the slots are %u\n", size, POOL_SLOT);
+		lx_tell("lx: a buffer of %zu bytes is asked for; the slots are %u\n", size, POOL_SLOT);
 		return (NULL);
 	}
 	raw = lkpi_kmalloc(all, gfp);
@@ -888,7 +899,7 @@ linuxkpi_dev_alloc_skb(size_t size, gfp_t gfp)
 	if (pool.free_count == 0) {
 		lx_os_unlock();
 		lkpi_kfree(raw);
-		printf("lx: no buffer left\n");
+		lx_tell("lx: no buffer left (%u slots, request %zu bytes)\n", POOL_SLOTS, size);
 		return (NULL);
 	}
 	slot = pool.free_slots[--pool.free_count];

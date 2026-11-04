@@ -419,6 +419,13 @@ if [ -d ../fw-wifi/qca6390 ]; then
 	mkdir -p root/fw/qca6390
 	install -m 0644 ../fw-wifi/qca6390/* root/fw/qca6390/
 fi
+# ... and the network the radio is to join: its name on the first line, its passphrase on the second. Yours,
+# and so not in the repository. src/net_test.m reads it out of the small image ("autojoin", which joins the
+# network the way Settings does); the WCN6750 path above puts the same file in place for bsd/dev/hakios.wifi.c.
+if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then
+	mkdir -p root/fw
+	install -m 0600 ../fw-wifi/network root/fw/network
+fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (bsd/dev/hakios.haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
 if [ -f ../fw-haptic/aw8697_haptic.bin ]; then

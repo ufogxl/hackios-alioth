@@ -210,6 +210,8 @@ static const char interface_name[16] = "en0";   /* (bsd/dev/hakios.net.c makes o
 static LCK_GRP_DECLARE(apple80211_lock_group, "hakios-apple80211");
 static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
 static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
+/* iOS location hint only. The radio continues enforcing its firmware channel/power rules. */
+static uint8_t location_country[3] = { '0', '0', 0 };
 static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
@@ -248,6 +250,56 @@ give(const struct apple80211req *request, const void *data, size_t length)
 {
 	return request->req_data == USER_ADDR_NULL ? 0 : copyout(data, request->req_data, length < request->req_len ? length :
 	       request->req_len);
+}
+
+/* These describe configured metadata, even when no network is associated.
+ * COUNTRY_CODE is a location hint; accepting one does not expand firmware channel permissions.
+ */
+static int
+get_country(const struct apple80211req *request)
+{
+	uint8_t country[3];
+
+	if (request->req_len < sizeof(country)) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&apple80211_lock);
+	memcpy(country, location_country, sizeof(country));
+	lck_mtx_unlock(&apple80211_lock);
+	return give(request, country, sizeof(country));
+}
+
+static int
+set_country(const struct apple80211req *request)
+{
+	struct { uint32_t version; uint8_t country[3], padding; } hint;
+	int error;
+
+	if (request->req_len != sizeof(hint)) {
+		return EINVAL;
+	}
+	if ((error = copyin(request->req_data, &hint, sizeof(hint))) != 0) {
+		return error;
+	}
+	if (hint.version != 1 || hint.country[2] != 0 ||
+	    !((hint.country[0] >= 'A' && hint.country[0] <= 'Z' && hint.country[1] >= 'A' && hint.country[1] <= 'Z') ||
+	    (hint.country[0] == '0' && hint.country[1] == '0'))) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&apple80211_lock);
+	memcpy(location_country, hint.country, sizeof(location_country));
+	lck_mtx_unlock(&apple80211_lock);
+	return 0;
+}
+
+static int
+get_auth(const struct apple80211req *request, const struct hakios_sta_state *state)
+{
+	struct { uint32_t version, lower, upper, extended; } answer = {
+	    .version = 1, .lower = 1, .upper = state->phase == HAKIOS_STA_JOINED ? 8 : 0
+	};
+
+	return give(request, &answer, sizeof(answer));
 }
 
 /* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
@@ -374,6 +426,8 @@ get(struct apple80211req *request)
 		kfree_data(answer, sizeof(*answer));
 		return error;
 	}
+	case 51:                                /* location country: iOS 16.5 requests the three bytes without a version */
+		return get_country(request);
 	case 21:                                /* how the last join went (0: not over yet) */
 		lck_mtx_lock(&apple80211_lock);
 		request->req_val = (int32_t)join_result;
@@ -446,14 +500,9 @@ get(struct apple80211req *request)
 	case 103:                               /* all of it, as a scan's result */
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give_network(request, &state->bss);
 		break;
-	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
-		struct {
-			uint32_t version, lower, upper, extended;
-		} answer = { .version = 1, .lower = 1, .upper = 8 };
-
-		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+	case 2:                                 /* authentication metadata remains readable while disconnected */
+		error = get_auth(request, state);
 		break;
-	}
 	default:
 		error = EOPNOTSUPP;
 		break;
@@ -581,6 +630,8 @@ static int
 set(const struct apple80211req *request, char *said, size_t said_size)
 {
 	switch (request->req_type) {
+	case 51:
+		return set_country(request);
 	case 20:
 		return set_join(request, said, said_size);
 	case 22:                                /* leave the network */

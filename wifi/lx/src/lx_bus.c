@@ -45,6 +45,7 @@
 #include "lx.h"
 
 static struct {
+	bool pcie;
 	unsigned how;				/* wifi_lx */
 	bool mission;				/* the firmware has been asked for mission mode, and for no other since */
 	bool closed;				/* the driver has stopped the bus: the registers are not touched again */
@@ -182,7 +183,7 @@ window(struct ath11k_base *ab, u32 offset)
 static bool
 refused(struct ath11k_base *ab, u32 offset)
 {
-	bool known = offset < ATH11K_PCI_WINDOW_START || (offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK ||
+	bool known = (bus.pcie && !(offset & 3) && offset < 0x2000000) || offset < ATH11K_PCI_WINDOW_START || (offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK ||
 	    (offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) < ATH11K_PCI_WINDOW_RANGE_MASK;
 
 	if (known && bus.mission && !bus.closed) {
@@ -251,7 +252,7 @@ bus_read32(struct ath11k_base *ab, u32 offset)
 	}
 	bus.reads++;
 	if (bus.how >= 2 && ab->mem != NULL) {
-		value = ioread32((u8 *)ab->mem + window(ab, offset));
+		value = bus.pcie ? lx_os_pcie_read32(offset) : ioread32((u8 *)ab->mem + window(ab, offset));
 	}
 	if (bus.said < SAID_FIRST) {
 		say_repeats();
@@ -276,7 +277,8 @@ bus_write32(struct ath11k_base *ab, u32 offset, u32 value)
 	}
 	if (bus.how >= 2 && ab->mem != NULL) {
 		__asm __volatile("dsb sy");	/* (what was written to a ring is in memory before the radio is told of it) */
-		iowrite32(value, (u8 *)ab->mem + window(ab, offset));
+		if (bus.pcie) lx_os_pcie_write32(offset, value);
+		else iowrite32(value, (u8 *)ab->mem + window(ab, offset));
 	}
 }
 
@@ -725,6 +727,7 @@ lx_start(void)
 	bool up;
 	int ret;
 
+	bus.pcie = lx_os_pcie();
 	bus.how = lx_os_option("wifi_lx");
 	if (lx_prepare() != 0) {
 		lx_tell("lx: no thread, or no memory the radio can be given\n");
@@ -747,13 +750,13 @@ lx_start(void)
 	device.kobj.name = "wifi";
 
 	/* ahb.c: ath11k_ahb_probe(), for this chip */
-	ab = ath11k_core_alloc(&device, 0, ATH11K_BUS_AHB);
+	ab = ath11k_core_alloc(&device, 0, bus.pcie ? ATH11K_BUS_PCI : ATH11K_BUS_AHB);
 	if (ab == NULL) {
 		return (ENOMEM);
 	}
 	ab->hif.ops = &bus_ops;
 	bus.irq = false;
-	if (lx_os_option("wifi_irq")) {
+	if (!bus.pcie && lx_os_option("wifi_irq")) {
 		unsigned long long address;
 		unsigned data;
 
@@ -771,9 +774,23 @@ lx_start(void)
 			lx_tell("lx: wifi_irq: the radio cannot be shown where to raise an interrupt: the rings are looked at, as before\n");
 		}
 	}
-	ab->hw_rev = ATH11K_HW_WCN6750_HW10;
+	ab->hw_rev = bus.pcie ? ATH11K_HW_QCA6390_HW20 : ATH11K_HW_WCN6750_HW10;
 	ab->fw_mode = ATH11K_FIRMWARE_MODE_NORMAL;
-	if ((ret = ath11k_core_pre_init(ab)) != 0 || (ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {
+	if ((ret = ath11k_core_pre_init(ab)) != 0) return -ret;
+	if (bus.pcie) {
+		/* The phone supplies its sleep clock; it has no PCI host PM backend. */
+		ab->hw_params.internal_sleep_clock = false;
+		ab->hw_params.global_reset = false;
+		ab->hw_params.supports_suspend = false;
+		ab->hw_params.idle_ps = false;
+		ab->hw_params.supports_sta_ps = false;
+		ab->hw_params.supports_regdb = true;
+		ab->mem = lx_os_map_registers(0x60300000ull, 0x100000);
+		if (!ab->mem) return ENOMEM;
+		/* pci.c: CE and all other register offsets share BAR0. */
+		ab->mem_ce = ab->mem;
+	}
+	if ((ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {
 		lx_tell("lx: the driver does not get as far as its exchange with the firmware: %d\n", ret);
 		return (-ret);
 	}
@@ -806,7 +823,10 @@ lx_start(void)
 	    ab->dev_flags);
 	if (!up) {
 		lx_pause_ms(600);		/* (for core.c to have wound down: the mode "off") */
-		ath11k_qmi_deinit_service(ab);
+		set_bit(ATH11K_FLAG_UNREGISTERING, &ab->dev_flags);
+		ath11k_qmi_deinit_service(ab); /* closes callbacks, then drains QMI work */
+		bus_quiet();
+		bus.closed = true;
 		return (test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) ? ETIMEDOUT : EIO);
 	}
 	lx_pause_ms(1000);			/* (for what the firmware says unasked once it is ready) */

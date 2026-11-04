@@ -6763,3 +6763,1999 @@ pcie: 38: done: status 0, exec env 0, error code 0xef128100, ERRBG 0x80000000 0 
 - 已提交：`2c90e95`（README/README.zh.md 状态表、`devices/alioth/status`、`userland/build.sh`、
   `hakios.pcie.c`、`PROGRESS.md`），**未 push**；
 - 工作区干净；手机在 loader、链路 L0。
+
+---
+
+## 08:30–08:40 端点自己的 PARF 查过了：它也说链路 L0；错误码是残留；刷 cache 也没用
+
+### 第 45 步读数（只读）
+
+```
+pcie: 45: the error code before anything is written: 0xef128100 (a value that never changes is not a verdict)
+pcie: 45:   0x1e08024 chip PARF_PM_STTS: 0xc0000400
+pcie: 45:   0x1e08028 chip PARF_PM_STTS_1: 0x800
+pcie: 45:   0x1e08174 chip PARF_MHI_CLOCK_RESET_CTRL: 0x3
+pcie: 45:   0x1e08178 chip PARF_MHI_BASE_ADDR_LOWER: 0x1e00000
+pcie: 45:   0x1e0817c chip PARF_MHI_BASE_ADDR_HIGHER: 0
+pcie: 45:   0x1e081b0 chip PARF_LTSSM: 0x111
+pcie: 45:   0x1e08640 chip PCIE_CORE_CONFIG: 0x276ad01
+```
+
+四条结论：
+
+1. **芯片自己的 LTSSM 也是 0x111（L0）** —— 双方都认为链路是通的；
+2. **`MHI_BASE_ADDR_LOWER = 0x1e00000`** 不是 0，是它在自己地址空间里的 MHI 区，正常；
+3. `PCIE_CORE_CONFIG = 0x276ad01`，`MHI_CLOCK_RESET_CTRL = 0x3`，没有明显"未初始化"的迹象；
+4. **`ERRCODE 0xef128100` 在写任何东西之前就存在** —— 它是上电残留，**不是本次传输的判词**。
+   （之前一直拿它当错误码读，是误判。）
+
+### 又排除了一个：cache 没刷
+
+怀疑点：`memcpy` 进 DMA 缓冲后没有刷 cache，芯片读到的是全 0 的旧内存。已在第 36/38 步都加上
+`dc civac` + `dsb sy` 刷整段。**结果不变**：
+
+```
+pcie: 38: A: 512 KB, a new sequence number: status 0 (bits 31:30 = 0) after 1001 polls, exec env 0
+pcie: 38: B: the whole image: status 0
+pcie: 38: C: the doorbell as an edge: status 0
+```
+
+`BHI_STATUS` 的 bits 31:30 始终是 0（既非成功也非失败），`EXECENV` 始终 0。
+
+### 现在的假设（下一步按序试）
+
+1. **芯片自己那颗 PCIe 核的 iATU**：它的 PARF 在 `0x1e08000`，BDF_TO_SID 在 `0x1e0ac00`，说明它的
+   iATU/相关块就在 `0x1e0a000`~`0x1e0b000` 一带。BHI 阶段它要主动读宿主内存，如果它自己的
+   outbound/inbound 区没配，读不出去 —— 把那一带 dump 出来看（只读、便宜）；
+2. **BHI_STATUS 的语义**：也许 bits[31:30] = 0 在这颗芯片上意味着"尚未接受请求"而不是"传输中"，
+   真正的判据是 `EXECENV`（它一直 0）。要确认得看 MHI 规范之外的资料（`qwx` 里也是拿 EE 当判据）；
+3. 门铃的值：我们用的 `0x51a7b3` 之类，qwx 用 `arc4random_uniform(0x3fffffff)`；理论上任意非零都行。
+
+---
+
+## 09:00–09:15 又试了三条：IOVA 移进窗口、WLAON 电源、芯片侧 iATU dump —— 都不是
+
+### 1. I/O 地址移进 slave 窗口
+
+`PARF_SLV_ADDR_SPACE_SIZE` 我们写的是设备树的 `0x4000000`（64 MB），而 IOVA 一直是 `0x80000000`
+（2 GB）—— **在窗口之外**，端点访问会被 wrapper 直接丢掉，这正好能解释"GFSR=0、BHI 读不通"。
+
+改成 `0x01000000`（16 MB，窗口内、32 位、非零），iATU inbound 与 SMMU 表都跟着改：
+
+```
+pcie: 43: inbound region 0 after: ctrl1 0 ctrl2 0x80000000 base 0x1000000 limit 0x17fffff target 0x193060000
+pcie: 38: A: 512 KB, a new sequence number: status 0 ... exec env 0
+```
+
+**没有变化。**
+
+### 2. 芯片的 WLAON 电源开关（vendor 上电路径里有）
+
+`cnss_pci_power_up` 的顺序是：`cnss_power_on_device` → 恢复 PCIe 链路 →
+**`cnss_pci_set_wlaon_pwr_ctrl(false, false, false)`** → `cnss_pci_start_mhi`。
+那一句读 `QCA6390_WLAON_QFPROM_PWR_CTRL_REG (0x1f8031c)` 并清掉 `SHUTDOWN_EN (0x1)` 与
+`VDD4BLOW_SW_EN (0x4)` —— 也就是把 WLAN 子系统从"关断"里放出来。这正是"链路在、寄存器可读、
+但 PBL 不跑"所缺的那类开关。
+
+```
+pcie: 47: chip QFPROM_PWR_CTRL (0x1f8031c) reads 0x6: shutdown clear, vdd4blow switch set
+pcie: 47: after clearing both: 0x2 (shutdown clear)
+```
+
+**shutdown 本来就是清的**；清掉 vdd4blow 之后 BHI 依旧 `status 0 / exec env 0`。
+
+### 3. 芯片侧 iATU（`0x1e0a000` 一带）是噪声
+
+第 46 步把 `0x1e09000..0x1e0b000` 按 32 字节一行读了一遍：`0x1e09000` 有几个可疑值
+（`0 2 7 0x1010`），`0x1e0a000` 往后整片都是随机数 —— **不是寄存器，是未初始化的 SRAM/ROM**。
+
+### 4. SMMU 故障寄存器：没有故障
+
+```
+pcie: 38: smmu global: gfsr 0 gfsynr0 0 gfsynr1 0
+pcie: 38: context 6: fsr 0x400 far 0x3fffaf9f fsynr0 0x75092c (iova 0x1000000 phys 0x193060000)
+```
+
+`FSR` 的 STATUS 字段是 0（没有翻译故障），`FAR` 每次都是 `...af9X` 这种带固定尾巴的值，
+不像真地址。**结论：端点的读请求根本没有到达 SMMU。**
+
+### 现在的位置
+
+门铃、描述符、INTVEC、cache、电源窗口、IOVA 范围、芯片 PARF、WLAON 电源 —— 全部排除了。
+**端点就是不启动它的 BHI 传输，而且两边都不报告原因。**
+
+下一步的方向（需要新资料，不是再试寄存器）：
+
+1. **`BOOT.XF.3.3` 里的 `pcie_props.xml`**（SM8250 各根桥的时序/属性）——看 XBL 在把 PCIe 交给
+   系统之前，对 pcie0 还做了什么我们没做的；
+2. **cnss2 的 `cnss_power_on_device`**：它除了拉 WLAN_EN，还碰了哪些 GPIO/regulator（尤其
+   PMIC 上那几路）——我们只投了 RPMh 的四路，没走 SPMI 那侧；
+3. **芯片是否需要先"上电握手"**：Android 上 WLAN 的启动由 cnss 通过 SMP2P/WLAON 与固件侧配合，
+   而 PBL 的启动可能依赖那一步，不只是 PCIe 侧的 BHI。
+
+---
+
+## 18:40–18:50 社区复查 + 门铃四种变体（都失败）
+
+### 社区（重点 K40）
+
+| 仓库 | 今天动态 | 与我们的关系 |
+|---|---|---|
+| **MrMoxing/ios-alioth** | **11-03 08:03** 仍在提交：Wi-Fi 面板能进（补 `configd`/`securityd`/`wifianalyticsd`，`885af0d`）、`/private/var` 跨重启保留、新文档 `docs/PROJECT-PLAN.md` | 他们 **链路仍未训练**（`parf_ltssm 0`，11 步 922 行）—— 我们领先一个阶段 |
+| FFT-infra/UniXNU-alioth | 11-02 后无新提交 | — |
+| fjcx555 / songchiyu | 10-25 / 10-26 后停滞 | — |
+| **oosexgang/hakios-xnu-kernel**（MrMoxing 推测的"成品内核"来源） | 631 文件，`grep PERST\|LTSSM` = 0 | 是 **POCO/WCN6750（AHB）** 线，没有 PCIe 驱动 |
+
+**结论：没有公开可用的 K40 Wi-Fi(PCIe/MHI) 源码**；MrMoxing 也在找，说明那份"成品内核"的源码没公开。
+
+### 三项研究
+
+1. **XBL 对 pcie0 做了什么**：`BOOT.XF.3.3` 的 `pcie_props.xml` 只有 14 行 DAL 壳，`PcieBsp.h` 是通用结构 —— **没有我们没做的步骤**。
+2. **cnss2 上电序列**：`cnss_power_on_device` → `cnss_resume_pci_link` →
+   `cnss_pci_set_wlaon_pwr_ctrl(false,false,false)` → `cnss_pci_start_mhi`；
+   `qcom,sw-ctrl-gpio`（TLMM 124）**只在链路失败时打印电平**，不是拨的开关。
+3. **SMP2P/WLAON 握手**：属固件侧（DSS/CSS）启动之后，BHI 之前不需要；而 PBL 明显活着
+   （`SERIALNU=0xc4e10d95`、`NUMSEG=1`、版本 1.2 都是它给的）。
+
+### 第 48 步：门铃四种变体，全部失败
+
+```
+pcie: 38: A: INTVEC = 1:                       status 0, exec env 0
+pcie: 38: B: STATUS rewritten after the bell:  status 0, exec env 0
+pcie: 38: C: IMGSIZE 0x7f000 (just under):     status 0, exec env 0
+pcie: 38: D: the bell as 0 then the sequence:  status 0, exec env 0
+```
+
+`INTVEC` 读回 `0x1`（写非零也生效），`BHI_STATUS` 始终 0、`EXECENV` 始终 0。
+
+### 交给研究 agent 的问题（进行中）
+
+MHI 规范里 BHI 的启动条件、`BHI_STATUS` bits[31:30] 各取值含义、ath11k 对 QCA6390 的
+`sbl_size`/`seg_len`/`fbc_download`、以及"PBL 的 DMA 是否要求宿主 inbound 窗口落在特定范围"。
+输出会写到 `<主机>\Develop\iOSOnAndroid\research-mhi-bhi.md`。
+
+---
+
+## 18:50–19:05 关键新证据：WLAN SoC 卡在复位里（MHICTRL.RESET 永不自清）
+
+### 先说研究文档
+
+子 agent 的 `research-mhi-bhi.md`（`<主机>\Develop\iOSOnAndroid\`）核心结论：
+
+1. **Linux 里没有"裸写 BHI"这条路**：`ath11k_pci_sw_reset()` 在每次下载前对 WLAN SoC 做一次完整复位
+   —— LTSSM 使能 → 清中断 → 清 QFPROM → `WLAON_WARM_SW_ENTRY <- 0` → `PCIE_SOC_GLOBAL_RESET`
+   V 位翻转 → `MHICTRL.RESET`；**我们从没复位过这颗 SoC**；
+2. `BHI_STATUS[31:30]`：**0 = RESET（既没传输也没判词）**、1 未定义、2 成功、3 失败（失败必带 ERRCODE）。
+   所以"恒 0"= 设备侧状态机从未启动，而不是"读不到 DMA"；
+3. 硬判据应是 **`MHISTATUS[15:8] == 7`（BHI 状态）**，比轮询 STATUS 灵敏；
+4. `ERRCODE 0xef128100` 在下载前就存在 → 不是本轮判词（但现在知道它更像"上次描述符的回显"，见下）。
+
+### 于是照 ath11k 的顺序补了复位（第 50 步）
+
+```
+pcie: 50: WLAON_WARM_SW_ENTRY 0 -> 0
+pcie: 50: chip PARF_INT_ALL_CLEAR <- all ones
+pcie: 50: QFPROM_PWR_CTRL 0x2 -> 0x2
+pcie: 50: PCIE_SOC_GLOBAL_RESET (bar + 0x3008) 0x4 -> 0x4 (bit 0 toggled, 10 ms each way)
+pcie: 50: MHICTRL 0 -> 0x2: reset STILL SET after 201 tries      ← ★
+pcie: 50: after the reset: MHISTATUS 0 (state 0), EXECENV 0, BHI status 0
+```
+
+**`MHICTRL` 的 RESET 位写进去、200 ms 后仍然置着** —— 复位永远不完成。这不是门铃的问题，是
+**WLAN SoC 内部状态机没有在跑**（ath11k 里这一步是能自清的，读不到自清会告警）。
+
+### 第 51/52 步：把芯片自己的电源/复位/日志字都读了一遍
+
+```
+0x1f80000 WLAON_SOC_POWER_CTRL        0x20390
+0x1f8000c WLAON_SW_COLD_RESET         0
+0x1f806bc WLAON_PCIE_PWR_CTRL_REG     0          ← 全 0，可疑
+0x1f8031c QFPROM_PWR_CTRL             0x2        (shutdown 清、vdd4blow 清)
+0x1f80504 WLAON_WARM_SW_ENTRY         0
+0x1f8060c WLAON_SOC_RESET_CAUSE       0
+0x1839004 chip TLMM GPIO57            0x1
+0x183b004 chip TLMM GPIO59            0
+0x1b000f8 TCSR_PBL_LOGGING            0xef150600
+0x1910008 PBL_BOOTSTRAP_STATUS        0xc2
+0x1e22b34 PBL_WLAN_BOOT_CFG           0x203
+0x1e0e038 MHICTRL                     0x2        (我们写的，卡住)
+0x1e0e048 MHISTATUS                   0          (state 0 = RESET, READY 0)
+0x1e00038/0x1e00048                   0xffffffff ← 0x1E00000 那块没实现
+```
+
+- **MHI 块确实在 `0x1E0E000`**（`0x1E00000` 全 F），我们之前的地址是对的；
+- `ERRBG1/2/3` 现在读回 `0x1000000 / 0 / 0x80000`，**正好是最近一次写的描述符** —— 芯片确实锁存了
+  我们的门铃参数，只是状态机不动；
+- PBL 日志 SRAM（`0x1403d58`，80 字节）**基本是 0 + 尾部乱码** → PBL 没写日志。
+
+### 现在的判断
+
+一句话：**PCIe 侧全通，WLAN SoC 内部（Q6/MHI）卡在复位，没进入 BHI 状态。**
+
+下一批假设（按代价排序）：
+
+1. **`WLAON_PCIE_PWR_CTRL_REG (0x1f806bc) = 0`**：cnss2 只把它当"保存/恢复"用，值应由更早的阶段设置；
+   如果是"PCIe 侧电源使能"而它是 0，SoC 内部逻辑就没有时钟。**试着把它写成非零**（先读、写 1、
+   再读 MHISTATUS）；
+2. **32 kHz 睡眠时钟**：Q6 的常开域需要睡眠时钟；我们只投了 GCC 的 PCIe 时钟，没碰 PMIC 侧的
+   时钟资源（RPMh 的 `xo`/`lnbbclk`）。可在 RPMh 库里查有没有 "xo.lvl"/"lnbbcla1" 之类的资源；
+3. **`MHICTRL.RESET` 卡住的另一种解释**：这块 MHI 的复位需要 SoC 侧时钟先起；与 1 是同一件事的
+   两面。
+
+
+### 第 53 步：`WLAON_PCIE_PWR_CTRL_REG` 写不进去
+
+```
+pcie: 53: WLAON_PCIE_PWR_CTRL reads 0; MHISTATUS 0 (state 0), MHICTRL 0x2
+pcie: 53: first, does the reset clear with the word as it is: no
+pcie: 53:   WLAON_PCIE_PWR <- 0x1   (reads 0): reset still set, MHISTATUS 0
+pcie: 53:   WLAON_PCIE_PWR <- 0x3   (reads 0): reset still set
+pcie: 53:   WLAON_PCIE_PWR <- 0x10  (reads 0): reset still set
+pcie: 53:   WLAON_PCIE_PWR <- 0x101 (reads 0): reset still set
+```
+
+**四个值写下去读回全是 0** —— 这个字在这个阶段是只读的（或者需要别的解锁），假设 1 排除。
+`MHICTRL` 的 RESET 位从第 50 步起就一直卡在 `0x2`。
+
+### 下一步只剩两条真实可能
+
+1. **Q6 的 32 kHz 睡眠时钟没起来**：MHI 块在复位里不出来的最典型原因。我们只投了 GCC 的 PCIe
+   时钟；PMIC 侧的时钟输出（RPMh 的 `xo`/`lnbbclk`/`rfclk` 一类资源）从未碰过。
+   证据方向：cmd-db dump 里有 `xo.lvl`、`xo.tmr`、`lnbclka1`、`rfclka1`、`divclkc1`；
+   若 WLAN 的睡眠时钟是其中之一，就需要一次 RPMh CLK 类投票。
+2. **MHI 块需要先清向量表再复位**：`ath11k_mhi_clear_vector()` 会写 0 到
+   `bhi+0x2c/0x30/0x34/0x3c`（TXVECADDR_LOW/HIGH、TXVECSIZE、TXVECDB），我们从未写过这几个字。
+   理论弱，但代价只是一次只读 + 四次写。
+
+### 第 54 步：给 WLAN 的常开域投票三个时钟，仍然不动
+
+用 RPMh 给 cmd-db 里的三个时钟资源各投了一票（走第 15 步那套本机验证过的 TCS 序列）：
+
+```
+pcie: 15: lnbclka1: wrote 0x42400 = 1: RPMh answered
+pcie: 15: rfclka1: wrote 0x42700 = 1: RPMh answered
+pcie: 15: divclkc1: wrote 0x45b00 = 1: RPMh answered
+pcie: 54: after the votes: MHICTRL 0x2, MHISTATUS 0 (state 0, ready 0), reset clears: no
+```
+
+RPMh 都应答了，但 `MHICTRL` 的 RESET 位照样不自清、`MHISTATUS` 照样 0。
+
+### 一个重要的重新解读
+
+回头查 Linux 的 `ath11k_mhi_set_mhictrl_reset()`：它在轮询超时后**只是告警**（"failed to reset MHI"），
+并不中止启动。也就是说 **`MHICTRL.RESET` 不自清很可能本来就是这台机器上的正常现象**，不是我们的
+拦路虎 —— 之前把它当成"SoC 卡在复位"的证据，可能是我过度解读了。
+
+那么问题就回到最简单的事实上：
+
+- `BHI_STATUS` bits[31:30] 恒 0（RESET，即"没有传输在进行"）
+- `EXECENV` = 0（PBL）
+- 描述符写进去、芯片也把它抄进了 `ERRBG1/2/3`
+- **SMMU 的 `GFSR`/`FSR` 全 0 → 端点的读请求从未产生**
+
+**门铃被芯片收下了（寄存器层面），但它没有因此发起一次 DMA 读。** 这条链条上只剩一个我们还没
+真正验证过的环节：**宿主侧那条 inbound 通路到底有没有把 0x1000000 变成一个可用的 PCIe 请求**。
+
+下一步该做的是**用一个确定会发 DMA 的主体验证 inbound 通路**，而不是继续问 PBL：
+比如让 GPU（我们已经有能跑的 Adreno 驱动）写一段地址落到同一个 iATU inbound 窗口上，
+看 SMMU 那边是否出现对应的事务/故障。若 GPU 的写能到，说明 inbound 通路本身没问题，
+问题就锁死在端点侧；若到不了，说明我们的 inbound 配置（或 `PARF_SLV_ADDR_SPACE_SIZE` 的
+语义）还没对。
+
+---
+
+## 21:00 接下来的行动计划（按判据排序，不需要人在场）
+
+当前事实（第 49–54 步之后）：
+
+- `BHI_STATUS[31:30]` 恒 0（RESET = 没有传输在进行），`EXECENV` 恒 0（PBL）；
+- 描述符四步写读一致，芯片把它抄进了 `ERRBG1/2/3`（`0x1000000 / 0 / 0x80000`）；
+- **SMMU 的 `GFSR`/`FSR` 全 0 → 端点的读请求从未产生**；
+- `MHICTRL.RESET` 不自清，但 mainline ath11k 遇到同样情况只告警不中止 → 很可能是本机常态，
+  不再当作证据；
+- `WLAON_PCIE_PWR_CTRL_REG` 写不进（四个值都读回 0）；
+- `lnbclka1`/`rfclka1`/`divclkc1` 三个时钟已通过 RPMh 投票并得到应答，状态无变化。
+
+### 1. 先确认"端点到底有没有发请求"（最便宜、判据最硬）
+
+把 BHI 的 `IMGADDR` 指到一个**故意不映射**的总线地址（例如 `0x20000000`）：
+
+- 端点真发了读 → SMMU 必产生翻译故障：`FSR`/`FAR` 非 0，且 `FAR` 就是那个地址；
+- 什么都没发生 → **确证端点从未发起 DMA**。
+
+只依赖端点侧、不需要 GPU，一轮 1.5 分钟。这一步把"通路问题"和"端点问题"一劳永逸分开。
+
+### 2. 扫 `IMGADDR` × `PARF_SLV_ADDR_SPACE_SIZE`
+
+若第 1 步显示"发了但被拒"：地址取 `0x1000` / `0x00100000` / `0x10000000`，
+`SLV_ADDR_SPACE_SIZE` 取设备树 `0x4000000` / 厂商初值 `0x1000000` / `0x800000`，
+看哪个组合让 `STATUS` 或 `EXECENV` 动，或让 SMMU 出现对应地址的故障。
+
+### 3. 若确证"压根没发请求"，转查端点侧门铃语义
+
+- 读 `bhi+0x1c`、`bhi+0x24`（BHI 块里我们从未碰过的两个字）；
+- `BHI_INTVEC` 非 0 + `MHICTRL` 的组合；
+- 参照 OpenBSD `qwx`：它靠 **EE 事件**推进而不是只轮询 STATUS —— 可能需要给
+  `WLAON_WARM_SW_ENTRY` 一个边沿。
+
+### 4. 兜底：换验证主体
+
+让已经能跑的 Adreno GPU 往同一个 iATU inbound 窗口写，验证宿主 inbound 通路本身
+（判据同第 1 步）。
+
+### 5. 若端点侧彻底哑
+
+考虑另一条路：在 Android 上拿一次成功的 BHI 时序（需要 TWRP 里读内核日志，或 Magisk），
+或对比另一台 SM8250 机器（OnePlus 8 / Mi 10）的 QCA6390 端口初始化。
+
+---
+
+## 21:00–21:50 三个决定性读数：芯片在跑，但它从不发 DMA；MHICTRL 的复位位是只读状态
+
+### 第 55 步：用"故意不映射的地址"证明端点没有发请求
+
+给 BHI 两种 IMGADDR，各敲一次门铃并读 SMMU 的故障寄存器：
+
+```
+A: imgaddr 0x20000000（不映射）: status 0 after 201 polls, exec env 0
+   smmu gfsr 0, context fsr 0x400 far 0x2fefaa28
+B: imgaddr 0x1000000（已映射） : status 0 after 201 polls, exec env 0
+   smmu gfsr 0, context fsr 0x400 far 0x2fefaa28
+```
+
+两次的 `FAR` **完全一样**，且不等于任何一个地址 —— 说明那个值是残留、不是本次事务。**结论：端点
+连一次读都没发**（若发了、且地址不映射，SMMU 必然报故障）。
+
+这也推翻了"是 inbound 窗口/IOVA 范围/`SLV_ADDR_SPACE_SIZE` 的问题"这一类假设。
+
+### 第 56 步：`MHICTRL` 的 RESET 位是只读状态，不是我们能拨的开关
+
+```
+MHICTRL 0x2 -> 0x2 after 101 ms: reset bit STILL SET
+```
+
+**写 0 也读回 1** —— bit1 在这颗芯片上是设备侧状态（"MHI 处于复位"）的只读位，不是可写的复位请求。
+第 50 步照 ath11k 写的那个 `MHICTRL.RESET` 是无效动作，也解释了"为什么它永不自清"。
+（重启后 `MHICTRL` 回到 0，本轮的 BHI 尝试是在 `MHICTRL=0` 的干净状态下做的，仍然不启动。）
+
+### 第 57 步：芯片的常开域确实在跑
+
+AON 计数器（cnss2 用来打时间戳的那组，`0x1f80100` 起）隔 100 ms 读两次：
+
+```
+0x1f80108: 0x194895da -> 0x19663530   MOVED
+PBL stage 0xef150600 -> 0xef150600    (不变)
+```
+
+**芯片有电有时钟、并且在执行**。所以"SoC 没起来/没时钟"这一类假设也排除。
+
+### 现在的完整事实表
+
+| 事实 | 值 |
+|---|---|
+| 链路 / 端点 | L0，`17cb:1101` 可枚举 |
+| 芯片 AON | **在跑**（计数器递增） |
+| 芯片 PARF_LTSSM | `0x111`（它也说 L0） |
+| `BHI_EXECENV` | 0（PBL） |
+| `BHI_STATUS[31:30]` | 恒 0（RESET = 没有传输） |
+| 描述符 | 写读一致，且被抄进 `ERRBG1/2/3` |
+| 端点发出的读请求 | **零**（SMMU `GFSR`/`FSR` 无变化，两个地址的 `FAR` 相同） |
+| `MHICTRL.RESET` | 只读状态位，写不动 |
+| `WLAON_PCIE_PWR_CTRL_REG` | 写不进（恒 0） |
+
+### 下一步（下一轮从这个清单里挑）
+
+1. **MSI**：ath11k 在 power up 之前就 `pci_alloc_irq_vectors` + 使能 MSI（`ath11k_pci_msi_enable`）。
+   我们从未使能过 MSI。虽然 BHI 是轮询判词，但如果 PBL 的完成路径依赖中断使能位，这会是缺口。
+   代价：写 MSI capability 的 control bit0 + 地址/数据（我们已能读写配置空间）。
+2. **在 PBL 状态下读 `MHISTATUS` 的 MHISTATE 字段是否应为 7**：现在读 0。若规范要求设备在
+   接受门铃前报告 BHI 状态，那我们的设备"没进入 BHI 状态"就是根因，要找进入该状态的写法。
+3. **再取一次更细的基线**：把 `BHI_STATUS`、`MHISTATUS`、`EXECENV` 在"写描述符前/后/门铃后"
+   各读一次（0/10/100/1000 ms），看有没有任何瞬态变化。
+
+---
+
+## 22:00–22:30 第 55–61 步：门铃零响应，且排除了"Q6 被这些开关按着"的可能
+
+### 第 55 步：端点到底有没有发读请求 —— 用"故意不映射的地址"验证
+
+```
+A: imgaddr 0x20000000（不映射）: status 0, exec env 0; smmu gfsr 0, fsr 0x400, far 0x2fefaa28
+B: imgaddr 0x1000000（已映射） : status 0, exec env 0; smmu gfsr 0, fsr 0x400, far 0x2fefaa28
+```
+
+两次 `FAR` 完全相同且不等于任一地址 → 是残留值。**端点从未发出读请求**（若发了且不映射，SMMU 必报故障）。
+据此排除：inbound 窗口、IOVA 范围、`PARF_SLV_ADDR_SPACE_SIZE`。
+
+### 第 56 步：`MHICTRL` 的 RESET 位是只读状态
+
+`MHICTRL 0x2 -> 0x2`（写 0 也读回 1）→ 它是设备侧状态位，不是可写请求。第 50 步那次"复位"是无效动作。
+
+### 第 57 步：芯片常开域确实在跑
+
+AON 计数器 `0x1f80108` 在 100 ms 内从 `0x194895da` → `0x19663530`。**有电、有时钟、在执行**；
+但 Q6 侧 `MHISTATUS` 状态仍是 0（RESET）。
+
+### 第 58 步：门铃前后瞬态采样（0/1/5/20/100 ms）
+
+`BHI_STATUS`、`EXECENV`、`MHISTATUS` **全部零变化**。端点的 MSI capability：控制 `0x18a`、地址 0、数据 0；
+RC 自己的 MSI 寄存器（DBI 0x820–0x830）全 0。
+
+### 第 59 步：芯片自己的 GPIO（57/59）
+
+两者都是 **function 1**（由芯片内部固件控制），写 cfg/io 无效（`gpio59` cfg 仍 `0xc7`，io 写 `0x2` 但电平 0）。
+
+### 第 60 步：Q6 cookie 与全局复位
+
+`Q6_COOKIE(0x1f80500) = 0`、`SOC_RESET_CAUSE = 0`、`WARM_SW_ENTRY = 0` —— 没有"暖启动"标记；
+按 ath11k 的方式翻转 `PCIE_SOC_GLOBAL_RESET`（bar+0x3008）**读回 0x4 → 0x4 不变**，复位后
+`EXECENV`/`MHISTATUS` 依旧 0。
+
+### 第 61 步：其它候选使能脚
+
+把 host TLMM 84/85/86/124 全部配成输出并拉高，芯片侧状态无变化。
+
+### 顺带修掉一个把自己搞崩的问题
+
+跑到第 61 步时内核 panic：`kmem_alloc(0x80000) failed with 3` —— 一路上几十个 `ml_io_map` 从不释放，
+把内核 map 用光了。已加窗口缓存（`map_cached()`：SMMU / iATU / conf / TLMM / cmd-db / RSC / BAR 各只映射一次），
+整条链现在能跑到底。
+
+### 结论：主机侧能试的开关基本试完了
+
+| 试过的 | 结果 |
+|---|---|
+| 四路 RPMh 电源 | ✅ 应答 |
+| WLAN_EN(20) 及其它候选脚(84/85/86/124) | 拉高无效 |
+| PERST# 两种极性 / 时序 | 链路 L0 |
+| LTSSM / ELBI / INTVEC / MBHI 描述符 / 门铃变体（4 种）| 无响应 |
+| SMMU 上下文 + iATU inbound + IOVA（映射/不映射对照）| 无 DMA 产生 |
+| WLAON 电源字 / QFPROM / WARM_SW_ENTRY / Q6 cookie / SOC_GLOBAL_RESET | 均无变化 |
+| MHICTRL（RESET 位）| 只读状态，写不动 |
+| 三个 RPMh 时钟（lnbclka1 / rfclka1 / divclkc1）| 应答，无变化 |
+
+芯片的表现是：**常开域在跑、Q6 在复位、从不响应 BHI 门铃**。而同一台机器上 Android 的 Wi-Fi
+是正常工作的，说明差异在 Android 做了而我们没做的事上。
+
+### 下一步的两条新方向
+
+1. **在 Android 侧取证**：用 logcat（不需要 root）抓 `cnss-daemon` / wifid 在 Wi-Fi 起来时的
+   用户态消息序列；同时找 Android 上是否有可读的 `/sys/kernel/debug/pcie*` 之类节点，看它
+   在成功路径上把什么写进了芯片。
+2. **比较"同一芯片在 TWRP 的 Linux 内核里"**：TWRP 里 PCIe 已被原生 pcie-qcom 拉起来并枚举出
+   `17cb:1101`（`/sys/bus/pci/devices/0000:01:00.0`，BAR0 = 1 MB @ `0x60300000`）。若能在 TWRP 里
+   用 mmap 访问 resource0（`dd` 不行，需要 mmap 工具），就能在**另一个内核**里复现门铃，判断
+   是"我们的主机侧序列有问题"还是"这颗芯片在该状态下就是不响应"。
+
+---
+
+## 22:30–23:10 第 62 步与社区再查：仍然没有出口，手机开始不稳定
+
+### 做了什么
+
+1. **PERST# 时序改成 PCIe 规范值**（断言 100 ms → EN 100 ms → 释放后 100 ms），
+   完整链跑通但 BHI 依旧 `status 0 / exec env 0` —— 时序不是原因。
+2. **社区再查**（按 K40 重点）：
+   - `UniXNU/UniXNU docs/devices/munch-erodenine.md`（Redmi K40S，同为 SM8250 + QCA6390）：
+     和 FFT-infra 的 alioth 一样停在"链路从未训练"，**没有 BHI 阶段的经验**；
+   - 代码搜索 `announce QCA6390` / `WLAN_EN GPIO20` 等成品内核里出现过的字符串：命中全是
+     Linux/OpenWrt 的 config，**没有公开的 XNU 实现**；
+   - `oosexgang/hakios-xnu-kernel` 确认是 POCO/WCN6750 的 AHB 线，`grep PERST|LTSSM = 0`。
+3. **第 62 步（写 `WLAON_SOC_POWER_CTRL` 与 `PCIE_CORE_CONFIG` 的候选值）已编译并启动**，
+   但这一轮手机在运行中自己重启回了 Android，**没有留下日志**（最近几轮反复出现这个现象，
+   可能与之前把 `MHICTRL` 写进复位态、或与 SMMU/PCIe 的残留状态有关）。
+
+### 现在的位置
+
+主机侧能碰到的开关几乎都试过了（电源、时钟、复位、PERST 时序、WLAN_EN 及候选脚、LTSSM、
+BHI 描述符与门铃的多种写法、SMMU 上下文与 iATU inbound、IOVA 范围、芯片自己的 PARF/GPIO/
+cookie/电源字）。芯片表现始终一致：**常开域在跑、Q6 在复位、从不响应 BHI 门铃**，
+而且**从不发出任何 DMA 读**。
+
+### 下一步（不需要新硬件）
+
+1. **在 TWRP 里 mmap `resource0`**：TWRP 的 Linux 内核已经把 `17cb:1101` 枚举出来
+   （BAR0 1 MB @ `0x60300000`），只要能 mmap 就能在**另一个内核**里复现门铃——判据是
+   `BHI_STATUS`/`EXECENV` 是否变化。需要一个小工具（交叉编译一个 aarch64 静态程序，或看
+   TWRP 里有没有 python/perl 之类能 mmap 的东西）。
+2. **Android 侧取证**：`logcat`（不需要 root）抓 `cnss-daemon`、`wifid` 在 Wi-Fi 起来时的
+   用户态消息，看它是否触发了某种我们没做的动作（例如固件的 "boot" 请求）。
+3. 若两条都无解，就只剩"读一份真机成功路径的寄存器轨迹"，那需要 root 的 Android 或另一台
+   可对照的机器——这属于需要外部条件的阶段。
+
+---
+
+## 23:10–23:40 厂商 cnss2 源码到手；第 63/64 步；两个机器状态坑
+
+### 拿到的东西：`reg.h` 是权威地址表
+
+从 LineageOS `android_kernel_xiaomi_sm8250`（`drivers/net/wireless/cnss2/`）取了 `main.c`
+`bus.c` `pci.c` `pci.h` `reg.h`，副本放在
+`<主机>\Develop\alioth-local\cnss2-src\`（自己的目录，不入 git）。
+
+**核对结果：我们猜的常数全对。** `reg.h:7` `QCA6390_PCIE_REMAP_BAR_CTRL_OFFSET = 0x310C`；
+`reg.h:66-71` 窗口常量 `0x80000 / 0x40000000 / >>19 / 0x3F / 0x7ffff`；
+`reg.h:105` `PCIE_BHI_EXECENV_REG = 0x01E0E228`（即 BHI 基址 0x1e0e200、EXECENV 在 +0x28）；
+`ERRDBG2/3 = 0x1e0e238/23c`（+0x38/+0x3c）。也就是说"半 BAR 窗口"这套读法没搞错。
+
+**厂商在 BHI 之前做的事，比我们少而不是多**（`pci.c:2107-2163`，qca6390 走 qca6290 这套 ops）：
+`cnss_power_on_device`（四路 regulator）→ `cnss_resume_pci_link` →
+`cnss_pci_set_wlaon_pwr_ctrl(false,false,false)`（读写 `QFPROM_PWR_CTRL` @0x1f8031c，
+清 shutdown/vdd4blow 两位）→ `cnss_pci_start_mhi`（`mhi_prepare_for_power_up` +
+`mhi_sync_power_up`，BHI 下载在里面）。**没有别的芯片寄存器写**。所以"少写了一个开关"这条
+假设，在厂商代码里找不到支撑点。
+
+另外 `cnss_pci_dump_qca6390_sram_mem`（`pci.c:1903`）就是厂商的"为什么没起来"取证：读
+`TCSR_PBL_LOGGING` 0x1b000f8、`BHI_ERRDBG2/3`、`PBL_WLAN_BOOT_CFG` 0x1e22b34、
+`PBL_BOOTSTRAP_STATUS` 0x1910008、PBL 日志 SRAM 0x1403d58（80 B）。我们第 52 步已经读过其中
+四个：`PBL stage 0xef150600`（不变）、`BOOTSTRAP_STATUS 0xc2`、`WLAN_BOOT_CFG 0x203`、
+PBL 日志基本全 0——**PBL 没写日志，但它的 bootstrap/boosting 字不是 0**，这组值现在有了
+对照物（同款芯片的 Android 成功路径若拿到，就能比出差异）。
+
+### 设备树的权威值（早就躺着，这次才对着看）
+
+`dump/twrp-fdt.dts:8159` 的 `qcom,cnss-qca6390@b0000000`：
+`wlan-en-gpio = <&tlmm 20 0>`（phandle 0x65 = `pinctrl@f000000`，即 NORTH 片 gpio20）、
+`qcom,wlan-rc-num = <0>`、`qcom,smmu-s1-enable`、`qcom,set-wlaon-pwr-ctrl`、
+`qcom,cmd_db_name = "smpf2"`、`mhi,m2-no-db-access`，
+四路电源 aon/dig 同一路 + io + rfa1 + rfa2，电压 950 mV / 1.8 V / 1.9 V / 1.35 V，
+iommu 池 `0xa0000000+256 MB`。都写进了 `devices/alioth/hardware.md` 新的 WLAN 小节。
+
+### 新加的步骤 63/64
+
+- **63**：厂商 dump 表里 WLAON + 主机接口那一片（`WL_PWR_STATUS` 0x1f8002c、
+  `POWERCTRL_PMU/MEM` 0x1f806b4/b8、`PBL_STACK_CANARY` 0x1f80614、`SYSPM_PWR_STATUS` 0x1f82000、
+  `PARF_MHI_CLOCK_RESET_CTRL` 0x1e08174、`PARF_MHI_BASE_ADDR_LOWER` 0x1e08178、
+  `PARF_BDF_TO_SID_CFG` 0x1e0ac00、`SOC_WDOG_DISC_BAD_DATA` 0x1e04234 等 22 个）。全是读。
+- **64**：WCSS/Q6 那片（PMM WLAN1/2 状态、`Q6SS_SAW2_SPM_STS`、`QDSP6SS_PLL_MODE`、
+  四个 GDSCR）。**故意单独一步**：域没电时读它可能挂总线，63 拿到读数的前提下再碰。
+- **`pcie_skip=60[,61,62]`**：第 60 步会 toggle 芯片的 SOC_GLOBAL_RESET，**之后链路对面不再
+  应答，下一次访问窗口就把内核挂住**——上一轮跑到 60 就死、日志停在 23:28、超时自复位回
+  Android，就是这样。所以要跑 63 必须 `pcie_skip=60`。
+
+### 两个机器状态坑（下次别再踩）
+
+1. **`fastboot boot` 报 `Failed to load/authenticate boot image: Load Error`**：不是镜像的
+   问题，是 **ABL 会话态**。办法：从 Android `adb reboot bootloader` 开一个新会话，再
+   `fastboot boot xnu-usb.img` ——立刻 `Booting OKAY`，12 秒后 `xl state` 就是 loader。
+   在旧会话里重试多少次都没用。
+2. **在 bootloader 里 `fastboot reboot` 回不到 Android**：会直接回到 fastboot（试了 8 次，
+   每次 20 秒）。恢复路径是**先 `fastboot boot twrp-alioth.img`，再在 TWRP 里 `reboot`**。
+   这一条以前没人写过，卡在这里容易以为系统被搞坏了。
+3. `DEVICE=alioth` 必须显式给（`mkxnuimg.py` 默认 poco-x5-pro），这套脚本已经写进
+   `alioth-local/tools/run_steps.sh`。
+
+### 顺带：TWRP 里 poke BHI 的尝试失败（方向记下来）
+
+交叉编译了一个静态 aarch64 `bhi_probe`（`alioth-local/tools/bhi_probe.c`），打算在 TWRP 的
+Linux 里 mmap `resource0` 复制门铃，判断"是我们主机侧序列错"还是"芯片在这个状态就不回应"。
+**结果一读 BAR0 整机就炸回 Android**——原因大概是 Linux 侧没有任何驱动 claim 这个端点，
+`PCI_COMMAND` 的 memory/bus-master 位没使能，访问 BAR 变成 abort，用户态 mmap 读直接
+SError。要走这条路，得先在 Linux 里 `setpci -s 01:00.0 COMMAND=0x6` 之类把设备使能起来，
+且输出要逐行落盘（这次日志全丢了）。**优先级低于第 63/64 步的读数**，先不动。
+
+### 第 63/65 步跑出来的读数（00:00）
+
+`pcie_step=63 pcie_skip_mask=24575`（跳过 50–62，第 60 步会 toggle 芯片全局复位、之后链路对面
+不再应答）跑通，两轮读数一致：
+
+| 地址 | 名字 | 值 | 怎么读 |
+|---|---|---|---|
+| 0x1f8002c | `WL_PWR_STATUS` | **0xf** | 四路 WLAN 电源域状态位全置 → 域是"开"的 |
+| 0x1f82000 | `SYSPM_PWR_STATUS` | 0x0005285f | SYSPM 活着 |
+| 0x1f8031c | `QFPROM_PWR_CTRL` | 0x2 | shutdown / vdd4blow 两位都是 0（厂商也这么清） |
+| 0x1f80614 | `PBL_STACK_CANARY` | **0xc9a485cc** | 非 0 → **PBL 确实跑过**（不是"从没启动"） |
+| 0x1f80108 | 全局计数器 | 0x423a9dc0 → 0x42583e92 | AON 时钟在跑（100 ms 内前进） |
+| 0x1f806b0/0x1f806ac/0x1f80318 | `WL_SS_ROOT_CLK_SWITCH` / `WL_CLK_CNTL_PMU_LPO2M` / `_HFRC` | 0 / 0 / 0 | **三个时钟切换字都是 0**——PBL 没走到"切时钟"那一步 |
+| 0x1f80200–0x1f80220 | `RTC_CLK_CAL_CTRL1..9` | 0xfa0 / 0x17700 / 0x5d2 / 0x59688c 等，100 ms 内不动 | 是标定结果不是计数器，看不出 LPO 在不在 |
+| 0x1e081b0 | **端点自己的 LTSSM** | **0x111** | **芯片那边也认为自己已经在 L0**，不是只有我们这么想 |
+| 0x1e08178 | `PARF_MHI_BASE_ADDR_LOWER` | 0x01e00000 | BHI 0x1e0e200 = base + 0xe200，地址模型自洽 |
+| 0x1e08174 | `PARF_MHI_CLOCK_RESET_CTRL` | 0x3 | 与厂商 RC 侧写法（clear bit4）不冲突，bit4 本来就是 0 |
+| 0x1e0ac00 | `PARF_BDF_TO_SID_CFG` | 0x1 | 端点侧 BDF→SID 表 |
+| 0x1e04234 | `SOC_WDOG_DISC_BAD_DATA_LOW_CFG` | 0xffffffff | 厂商会写 0xDEAD1234；这里没写过 |
+| 0x1e03140 | `PCIE_WCSS_STATUS_FOR_DEBUG_LOW` | 0x03402001 | — |
+| 0x1e08024 | 端点 `PARF_PM_STTS` | 0xc0000400 | — |
+| 0x1e08224 | 端点 `INT_ALL_STATUS` | 0x2000 | 有一个中断挂着，mask 0x7fc0bb2e |
+
+**能下的结论**：电源、常开域、AON 时钟、链路（两侧都 L0）、BHI 地址模型、PBL 曾经运行——
+全都"正常"。唯一异常的是**三个时钟切换字为 0**，也就是 PBL 停在了"拿不到它要的时钟、没能把
+WLAN SS 切到自己的时钟源"这一步，与它不响应门铃、从不发 DMA 完全吻合。
+
+**下一步**顺着这条走：芯片要的外部时钟有 PCIe refclk（链路在跑就是证明）、XO、32.768 kHz
+睡眠时钟（LPO，来自 PMIC）。LPO 缺了 PBL 就会停在这里。查法：
+① 看 PMIC 侧有没有把 sleep clock 输出打开（`soc.args`/RPMh 时钟投票里没有 LPO）；
+② 芯片侧换个能看到 LPO 的读数（`RTC_CLK_CAL_CFG` 的使能位 + 用 `WLAON_GLOBAL_COUNTER`
+与 RTC 计数器一起看比例）。
+
+（这一轮刻意跳过第 64 步：WCSS 域没电时读它会挂总线，等 65 的时钟线**索查完再碰。）
+
+### 01:00–01:30 意外收获：TWRP 的内核里就有 cnss2
+
+在 TWRP 里读 `dmesg`（TWRP 是 root，Android 里 `dmesg` 被拒——这条路一直没走过）才发现：
+**TWRP 的 4.19.113-lineageos 内核把 cnss2 整个编进去了**，它 probe 了 `qcom,cnss-qca6390`、
+读了芯片、然后因为没人要它上电而挂起。整段日志存档：
+`alioth-local/evidence/twrp-dmesg-20261104.txt`。
+
+这段日志一次给出了好几件以前只能猜的事：
+
+```
+cnss: Got regulator: vdd-wlan-io / -aon / -dig / -rfa1 / -rfa2      ← 四路，电压 1.8/0.95/0.95/1.9/1.35
+cnss: Failed to get optional clock rf_clk, err = -2                 ← rf_clk 是可选的，没有
+cnss: CPR PMIC address is not available for smpf2                   ← smpf2 的 PMIC 地址拿不到（不影响）
+msm_pcie_enable: Assert the reset of endpoint of RC0
+pcie_phy_init: PCIe RC0 PHY is ready!
+msm_pcie_enable: Release the reset of endpoint of RC0
+msm_pcie_link_train: PCIe RC0 link initialized
+cnss: PCI is probing, vendor ID: 0x17cb, device ID: 0x1101
+cnss: Powerup is ignored                                           ← driver_state == 0（没有 ath11k 来请求）
+cnss: Enabling SMMU S1 stage
+cnss: smmu_iova_start: 0xa0000000, len 0x10000000
+cnss_pci 0000:01:00.0: BAR 0: assigned [mem 0x60300000-0x603fffff 64bit]
+cnss_pci 0000:01:00.0: enabling device (0000 -> 0002)              ← 只开了 memory，没开 bus master
+cnss: Config PCIe remap window register to 0x4000003f / 0x4000003c
+cnss: Read register offset 0x1f8031c, val = 0x6                     ← QFPROM_PWR_CTRL 上电前是 0x6
+cnss: Write val 0x2 to register offset 0x1f8031c                    ← 清掉 shutdown 位后 = 0x2（我们现在读到的正是 0x2）
+cnss: Assign MSI to user: MHI, num_vectors: 3, user_base_data: 800   ← 上电前就把 MSI 配好了
+cnss: Get device version info, family 0x4, device 0xa, major 0x2, minor 0x0
+cnss: Get PCI link status register: 4114 (0x1012), speed 0x2, width 0x1  ← **Gen2 x1**
+cnss: Write val 0x3 to register offset 0x1f8031c                    ← 挂起时把 shutdown 位置回去
+cnss: Suspending PCI link
+msm_pcie_disable: Assert the reset of endpoint of RC0              ← 端点被按在 PERST 里
+```
+
+由此：
+
+1. **`Powerup is ignored` 的原因是 `driver_state == 0`**（`main.c:980`）：cnss2 要等 WLAN 驱动
+   （ath11k）调 `cnss_wlan_register_driver` 才开始上电。TWRP 里没有 ath11k（`/lib/modules` 空、
+   `/vendor` 没挂），所以它 probe 完就挂起、并把端点按进 PERST。
+2. **这就解释了上一轮 `bhi_probe` 为什么一读就炸**：那时端点已经在 PERST 里，配置空间读回
+   `0xff`（这次实测确认：`config space` 全是 `ff`，连 `rescan` 之后也是）。**不是我们的工具
+   写错了，方向本身在 TWRP 里做不成**——除非能让 cnss2 真的上电。
+3. 厂商在 MHI 之前**唯一我们没做的一步是 MSI**（3 个向量、base data 0x800），而且它是在
+   上电窗口里就跑完的。
+4. 顺带确认：`vdd-wlan-*` 就是那五路（io/aon/dig/rfa1/rfa2，其中 aon 与 dig 同一路），
+   与设备树一致；`rf_clk` 可选、为空。
+5. 链路是 **Gen2 x1**（`0x1012`）；我们只确认过 L0，没确认过速率档位。
+
+**这一轮的结论**：TWRP 这条路（在另一个内核里复现门铃）走不通，因为那个内核在 200 ms 内就把
+端点挂起了，而我们改不了它的策略。**但 TWRP 的 dmesg 成了我们唯一能看到的"厂商栈在本机上的
+真实行为"**，比读源码更有用。
+
+**下一步的两个候选**（下一步只做其中一个）：
+- **A：把 MSI 补上再试门铃**。厂商在 MHI 之前一定配 MSI（3 向量、RC 的 `pci-msi@17a10040`
+  等着），我们到现在端点 MSI 能力里 address/data 还是 0（第 58 步读过）。BHI 是轮询判词，
+  但"PBL 完成路径依赖中断使能"是我们唯一还没排除的结构性差异。
+- **B：把链路速率记下来**（端点 `PARF_LINK_STATUS` 之类）确认我们是 Gen2 x1 还是 Gen1，
+  差异只可能在带宽，不影响 PBL 是否启动——所以优先级低于 A。
+
+### 02:00–02:30 第 67 步：写入确实落地；断电重启也没用
+
+**第 67 步（写验证）**用了厂商 `reg.h:292-294` 那三个专门留的 scratch 字：
+
+```
+scratch before: 0  0x80000  0
+wrote 0x5a5a1234 0xc3c3abcd5 0x0f0f7777  →  read back 0x5a5a1234 0xc3c3abcd5 0x0f0f7777
+   三个不同的值各自读回、互不相同 → 不是"回声寄存器"，**写真的落到芯片上**
+再写 0x11111111 到 scratch0 后 BHI major 仍是 0x1 → 读也不是被最后一次写污染的
+```
+
+然后同一个窗口重敲门铃（image 0x1000000、size 0x80000），**100 ms 内
+`EXECENV` 恒 0、`BHI_STATUS[31:30]` 恒 0，没有任何瞬态**。
+
+**第 68 个假设（芯片被上一次会话卡住，只有断电才清）也做了**：在 Android 里
+`adb shell svc wifi disable`（厂商栈会 `cnss_pci_shutdown` → 四路电源关 → PERST 断言，
+这一步在 TWRP 的日志里亲眼见过），等 12 秒，再进 loader 重跑第 67 步——**结果一模一样**。
+所以不是"前一次失败把 PBL 卡住了"。
+
+### 到此为止，主机侧能排除的已经排除干净
+
+| 假设 | 结论 | 证据 |
+|---|---|---|
+| 寄存器窗口读法不对 | 排除 | 厂商 `reg.h` 的地址/窗口常量与我们逐字一致 |
+| 写不落地 / 读到回声 | **排除** | 第 67 步三个 scratch 各自读回 |
+| BHI 描述符偏移写错 | 排除 | 与 Linux `mhi_boot.c` 的 `BHI_IMGADDR_LOW/HIGH/IMGSIZE/IMGTXDB/STATUS` 一致 |
+| 门铃值/顺序/边际写 | 排除 | 第 36/38/48 步四种变体 |
+| 电源没上 | 排除 | `WL_PWR_STATUS=0xf`、`QFPROM=0x2`（与厂商上电后的值相同） |
+| 链路没通 | 排除 | 两侧 LTSSM 都是 L0 |
+| SID/SMMU 让 DMA 被丢 | 未证实但也无迹象 | `GFSR=0`、context `FSR` 状态 0 |
+| PERST 时序 | 排除 | 改成规范值（100/100/100 ms）后一样 |
+| 芯片被前次实验卡死 | **排除** | 断电重启后一样（第 67 步第二轮） |
+| PBL 从没跑 | 排除 | `PBL_STACK_CANARY=0xc9a485cc` |
+| 缺某个 PBL 之前的开关 | 无支撑 | 厂商在 BHI 之前**只**做四路电源 + 清 QFPROM 两位 + 配 MSI |
+| 时钟没切 | **唯一活着的异常** | `WL_SS_ROOT_CLK_SWITCH` / `LPO2M` / `HFRC` 三个都是 0 |
+
+**结论**：主机侧该做的都做了，芯片的 PBL 就是不响应门铃，而且它连一次 DMA 都没发过。
+我们手上所有环境（XNU、TWRP 的 Linux）里，**没有任何一处观察到过这颗芯片成功的 BHI 传输**——
+Linux 那套（TWRP 里编着 cnss2）因为没有 ath11k 从来不真正上电。
+
+**要往前走，需要一个"成功路径"的样本**，而这只有两条路：
+1. **Android 上拿到 root**（Magisk 打补丁刷 boot），就能 `dmesg` + debugfs 看 ath11k/MHI 的真实
+   启动过程，对照出我们缺的那一步。手机 root 是可逆的（`boot_a/boot_b-stock.img` 都在
+   `alioth-local/dump/`），但这是刷机动作、要用户点头。
+2. 拿一颗同型号（QCA6390）的 HDK/开发板或另一台手机做对照。
+
+这两条都不是我能自己决定的，所以目标在这里挂起，等用户选。
+
+---
+
+## 2026-11-04 01:00–01:20 拿到 root，拿到"工作状态"和"PBL 状态"两份参考读数
+
+### root 怎么来的（可复现，且可回退）
+
+1. 备份两个槽：TWRP 里 `dd if=/dev/block/by-name/boot_a|boot_b of=/sdcard/...`，拉回
+   `alioth-local/dump/boot_{a,b}-stock-20261104.img`（**两个槽内容不同**，今早 boot_a 与 10-26 存档也不
+   同，所以必须用当槽的镜像打补丁）。
+2. Magisk 27.0 离线打补丁：从 APK 里取 `lib/x86_64/libmagiskboot.so`（当 Linux 可执行用）、
+   `lib/arm64-v8a/{libmagiskinit,libmagisk64}.so`、`stub.apk`、`assets/boot_patch.sh`
+   → `alioth-local/magisk/bin/`，`patch.sh stock_boot_b.img` → `magisk-patched-boot.img`。
+   （`api_level_arch_detect` 要 `getprop`，所以在宿主机上用 `SOURCEDMODE=1` 手工 source。）
+3. `fastboot flash boot magisk-patched-boot.img`（写 boot_b）。之后 `su -c id` = `uid=0`。
+   回退：`fastboot flash boot boot_b-stock-20261104.img`。
+4. **试过但没用的一条**：改 boot ramdisk 的 `prop.default`（`ro.secure=0`、`ro.debuggable=1`）。
+   Android 13 上 boot ramdisk 的 `prop.default` 不是权威来源，属性没生效。
+
+### 用 root 读到的东西
+
+**端点配置空间（固件运行中）**：`command = 0x0406`（memory + bus master + serr）、
+BAR0 = 0x60300000（64 位）、能力链 0x40 = PM、0x50 = MSI：
+
+```
+MSI control 0x015b   (enable=1, 32 vectors, per-vector mask, 32-bit address)
+MSI address 0xa0000040     <- 0x17a10040（qcom,pci-msi）在端点 SMMU 里的 IOVA
+MSI data    0x00000320     <- 800，与 cnss "MSI base data is 800" 对上
+```
+
+**这一条补上了我们唯一的已知结构缺口**：厂商确实把 MSI 配好了才启动 MHI。
+
+**`regpeek`（新工具，`alioth-local/tools/regpeek.c`）**：在 Android 上以 root 通过 BAR0 窗口读/写
+芯片寄存器，一条命令读任意地址，也可以 `w` 写入并回读。有了它，后面每次对照都不用刷内核。
+
+### 两份参考读数（同一颗芯片，`BHI_SERIALNU = 0xc4e10d95`）
+
+| 地址 | 含义 | 厂商·固件运行(AMSS) | 厂商·PBL（固件缺失，MHI 超时） | 我们 XNU |
+|---|---|---|---|---|
+| 0x1e0e228 | BHI_EXECENV | **0x2** | 0 | 0 |
+| 0x1e0e22c | BHI_STATUS | 0x9aae8427 | 0 | 0 |
+| 0x1e0e21c | BHI_INTVEC | — | **0x026c675a** | 0（我们主动写 0） |
+| 0x1e0e240 | BHI_SERIALNU | 0xc4e10d95 | 0xc4e10d95 | 0xc4e10d95 ✓ |
+| 0x1e0e248 | BHI_NUMSEG | 1 | 1 | 1 ✓ |
+| 0x1e08174 | PARF_MHI_CLOCK_RESET_CTRL | 0x1 | **0x3** | 0x3 ✓ |
+| 0x1e08000 | PARF_PHY_CTRL | 0x2000321c | **0x2000361c** | 0x2000361c ✓ |
+| 0x1e081b0 | PARF_LTSSM | 0x111 | 0x111 | 0x111 ✓ |
+| 0x1e08178 | MHI_BASE_ADDR_LOWER | 0x1e00000 | 0x1e00000 | 0x1e00000 ✓ |
+| 0x1f8002c | WL_PWR_STATUS | 0x9 | **0xf** | 0xf ✓ |
+| 0x1f806b0/ac, 0x1f80318 | 三个时钟切换字 | 0 | 0 | 0 ✓ |
+| 0x1f80614 | PBL_STACK_CANARY | — | 0xf35b05cf（每次不同） | 0xc9a485cc（每次不同）✓ |
+| 0x1b000f8 | TCSR_PBL_LOGGING | — | **0xef150600** | 0xef150600 ✓ |
+| **0x1e22b34** | **PBL_WLAN_BOOT_CFG** | — | **0x201** | **0x203** ✗ |
+| **0x1910008** | **PBL_BOOTSTRAP_STATUS** | — | **0x42** | **0xc2** ✗ |
+
+结论很硬：**我们芯片的状态和一个"电源/链路/时钟全对、正停在 PBL 等固件"的厂商芯片逐字相同**，
+之前怀疑的 `MHI_CLOCK_RESET_CTRL=3`、`PHY_CTRL` 差一位、`WL_PWR_STATUS=0xf`、时钟字为 0，
+**全都被证明是 PBL 的正常值**（第 68 步把前两个改成"工作值"再敲门铃，依旧毫无反应）。
+
+**只剩下两个引导配置字不一样**：`PBL_WLAN_BOOT_CFG`（bit1）和 `PBL_BOOTSTRAP_STATUS`（bit7）。
+这两个字**可以被主机写进去**（实测写入并回读成功），所以下一步就是在 XNU 里把它们改成厂商
+PBL 的 0x201 / 0x42，再敲门铃。
+
+### 顺带的两件事
+
+- `adb bugreport` 里没有运行时内核日志，只有 `minidump last_kmsg`（早期启动快照），所以 root 是必须的。
+- 在 Android 上 `unbind` 端点会**直接把手机搞重启**（两次），所以"断电重连"要用改固件文件名的办法：
+  把 `/vendor/firmware_mnt/image/qca6390/amss20.bin` 改名或 bind-mount 成空文件，重启后固件加载
+  失败，芯片就停在 PBL，可以随便读。**用完必须改回来**（今天已经改回并 remount ro）。
+
+### 01:20 第 69 步：那两个"差异"也不存在，剩下的怀疑点转向 SMMU/地址
+
+第 69 步把 `PBL_WLAN_BOOT_CFG` / `PBL_BOOTSTRAP_STATUS` 写成厂商 PBL 的值再敲门铃，
+结果发现**这一轮我们自己读到的就是 0x201 / 0x42**：
+
+```
+pcie: 69: PBL_WLAN_BOOT_CFG 0x201 (working PBL: 0x201), PBL_BOOTSTRAP_STATUS 0x42 (working PBL: 0x42),
+          BHI_INTVEC 0x26ce359
+pcie: 69: ringing with image 0x1000000, INTBVEC left alone
+pcie: 69:   +0..95 ms: exec env 0, status 0
+```
+
+所以上一轮看到的 0x203 / 0xc2 是**另一次启动的值**——这两个字每次启动都不同（像 strap/OTP 派生的
+随机量），不是环境差异。同理 `BHI_INTVEC` 我们这次读到 0x26ce359，与厂商 PBL 的 0x026c675a 同类
+（以前读到 0 是因为我们自己把它写过 0）。
+
+**结论：凡是能和"电源/链路/时钟全对、正在等固件"的正常芯片对比的寄存器，我们现在逐字相同。**
+主机侧的寄存器状态假设已经全部出清。
+
+### 剩下的怀疑点：DMA 的目标地址根本到不了宿主内存
+
+如果 PBL 一响铃就去读宿主内存，而**这次读被 SMMU 拦下并且"停住"而不是报错**，那表现就正好是：
+状态位一直是 0、没有任何瞬态、SMMU 的 GFSR 还是 0、并且芯片从此再也不发第二个请求。
+
+设备树里 `qcom,iommu-faults = "stall-disable HUPCF no-CFRE non-fatal"` 正是"故障不报、不 stall"的
+配置，所以"读不到也不报错"是说得通的。
+
+而我们和厂商在**地址**上有一处明显不同：
+
+| | 厂商 | 我们 |
+|---|---|---|
+| SMMU IOVA 池 | `0xa0000000` + 256 MB（`qcom,iommu-dma-addr-pool`），连 MSI 门铃都落在 `0xa0000040` | 我们自己挑了 `0x01000000` |
+| RC inbound 窗口 | `qcom,slv-addr-space-size = 0x4000000` | 我们把 iATU inbound 设成 `0x1000000..0x17fffff` |
+
+**下一步（第 70 步）**：把固件缓冲区的 IOVA 挪到厂商的池子里（`0xa0100000` 之类），iATU inbound
+窗口相应覆盖 `0xa0000000` 起的那段，再用这个地址敲门铃。这是目前唯一还没试过的结构差异。
+
+### 01:30–02:00 事故：我的追踪脚本把开机卡死；手机已恢复，root 暂时不可用
+
+**做了什么（以及为什么错）**：为了抓一次"厂商成功 BHI 传输"的寄存器轨迹，我在
+`/data/adb/post-fs-data.d/bhitrace.sh` 放了脚本，在开机最早期以 ~100 Hz 轮询 BHI 寄存器。
+错在两处：
+1. Magisk 的 `post-fs-data.d` 是**阻塞执行**的，脚本不返回，开机就停在 post-fs-data；
+2. 脚本在上电窗口里反复读 `resource0`，`regpeek` 一旦碰上正在上电的端点就会**卡在内核里**，
+   于是那个阻塞变成永久。
+
+结果：手机起不来。救回来的过程（下次照这个来）：
+
+1. 长按电源键 → fastboot；
+2. `fastboot flash boot dump/boot_b-stock-20261104.img`（原厂 boot，无 Magisk）→ 系统正常；
+   这一步**不需要任何 root 或解密**，是最可靠的退路。
+3. 试过但**不通**的两条：
+   - `/cache/.disable_magisk`（Magisk 核心模式标记）：建了，Magisk 仍然跑那个脚本；
+   - **音量下键安全模式**：这台机器音量下键就是 fastboot 组合键，按住只会进 fastboot。
+4. 也试过 TWRP 解密 `/data`：`twrp decrypt` 失败（flag 6），TWRP 里 `/data` 只能看到
+   `recovery/`，说明这个 TWRP 没法解 FBE，所以 `/data/adb/post-fs-data.d/bhitrace.sh`
+   现在还在那里、删不掉（删它需要 root，拿 root 又需要它不在——死循环）。
+
+**当前状态**：手机在原厂 boot 上正常运行（Android 13，wifi 开），**没有 root**。
+以后要恢复 root，可选：
+- 格式化 /data（破坏性，需要用户点头），或
+- 换一个能解 FBE 的 TWRP，或
+- 找一个不经过 `/data/adb` 的 root 方案（KernelSU/APatch 需要改内核，alioth 是 4.19 非 GKI，代价大）。
+
+**规则记下来**：`post-fs-data.d` 里只允许瞬时、绝不阻塞的动作；要在最早期采样，就把它写成
+一次性后台 `&` 且带超时，或者干脆从 adb 侧在触发事件之前启动。
+
+### 01:20–01:30 这一轮拿到的两条技术结论（root 还在的时候做的）
+
+1. **厂商 MHI 的寄存器表和我们逐字一致**（`vendor-mhi_internal.h`，取自 LineageOS 4.19 树）：
+   `BHIOFF=0x28`、`MHICTRL=0x38`、`MHISTATUS=0x48`、`BHI_IMGTXDB=0x18`、`BHI_STATUS=0x2C`、
+   `BHI_EXECENV=0x28`、`BHI_IMGADDR_LOW/HIGH=0x08/0x0C`、`BHI_IMGSIZE=0x10`。
+   **只有一处不同**：`BHI_INTVEC = 0x20`，而主线的 `0x1C` 在这颗芯片上是 `BHI_RSVD2`
+   ——我们一直往保留寄存器写 0，无害但白写（第 44 步可以改掉）。
+2. **第 55 步的"未映射地址没有 fault"其实是有效结论**：我们 context 的
+   `SCTLR` 里 CFRE 位（bit12）本来就是开的，所以 SMMU **会**记录 context fault。
+   未映射地址敲门铃没有任何 fault，说明**端点根本没有发出那次 DMA 读**——不是映射错，
+   是它没开始传。这条把"SMMU 映射问题"彻底排除了。
+3. 另外确认：固件加载失败后，cnss2 会在 MHI 超时后**把芯片断电**，所以"让厂商芯片停在 PBL
+   再从 userspace 敲门铃"这条路走不通（敲到的是已断电的端点，直接 `Bus error`）。
+
+### 02:00–02:20 最后一条主机侧假设也排除：把 IOVA 挪进厂商的池子
+
+手机恢复后（root 也在，方法是把 `/data/local/tmp/regpeek` 从**原厂系统的 shell 用户**下删掉——
+那个脚本第一行就是 `[ -x "$TOOL" ] || exit 0`，工具不在它立刻退出，Magisk 就能正常开机，
+不用清数据），试了最后一条有依据的主机侧假设：
+
+| | 厂商（`qcom,iommu-dma-addr-pool = <0xa0000000 0x10000000>`，连 MSI 都在 0xa0000040） | 我们原来 |
+|---|---|---|
+| 固件缓冲 IOVA | 0xa0000000 起的池子 | 0x01000000（自己挑的） |
+
+改 `WIFI_IOVA` 为 **0xa0100000**，iATU inbound 相应变成
+`0xa0100000..0xa08fffff → phys 0x193058000`（第 43 步日志确认生效），敲门铃：
+
+```
+pcie: 69: ringing with image 0xa0100000, INTBVEC left alone (0x27d675a)
+pcie: 69:   +0..95 ms: exec env 0, status 0
+```
+
+**还是不动。** 到这里，主机侧能想到的差异全部试完。
+
+### 结论：这一步卡在"无法观测"上，不是"没试够"
+
+能把我们的芯片和一颗"正常等待固件"的芯片对比的寄存器，已经**全部相同**（第 63/65/69 步
+vs 厂商 PBL 参考读数），厂商在 BHI 之前做的事也**不比我们多**（四路电源 + 清 QFPROM 两位 +
+配 MSI），寄存器地址、门铃偏移、写入是否落地，都逐条验证过。剩下的可能性都在芯片的 PBL 内部
+或者需要"看一个成功传输的现场"，而我们没有观测通道：
+
+- **debugfs 没编进厂商内核**（`Unable to create debugfs -19`、`mount -t debugfs` 失败），
+  所以没有 `dynamic_debug`、没有 `mhi` 的 debugfs 寄存器转储；
+- **IPC logging 也没编进去**（没有 `/sys/kernel/ipc_logging/`），所以读不到 MHI 驱动的内部日志；
+- **没有 `/dev/mem`**，所以读不到 RC 的 iATU / apps-SMMU 的真实配置；
+- 想在"厂商刚上电还在 PBL"的窗口里从 userspace 敲一次门铃：那个窗口只有 ~10 秒（MHI 超时），
+  而 `svc wifi disable` 只是挂起不真断电；用 cnss 的 sysfs `shutdown` 做真断电再上电，
+  **会让手机重启**（试了两次，两次都是重启）——采样撞上端点断电瞬间就是 SError。
+
+也就是说：**要继续往下，需要"能看到厂商成功路径现场"的能力**，那不是再试几个寄存器能换来的。
+可能的来源：
+1. 厂商 PBL 的文档（不公开）；
+2. 另一台同型号 QCA6390 设备做对照；
+3. 一个带 debugfs/IPC logging 的自编译厂商内核（要能编出匹配 4.19.157-perf 的模块/内核）。
+
+---
+
+## 02:00–02:30 深夜两轮（用户睡觉，只做不依赖人的实验）
+
+### 1. Linux 根本不设 iATU inbound —— 我们第 43 步的设计是错的（已改）
+
+读 `pci-msm.c` 全文：它只配 **outbound** 区域（config 空间），**"inbound" 一次都没出现**。
+也就是说在厂商的栈里，端点发来的请求保持原地址进入 apps-SMMU，由 stage-1 把 IOVA
+（`0xa0000000` 起）翻成宿主内存。
+
+我们第 43 步却额外配了一个 iATU inbound（`IOVA → 物理地址`），等于**翻译了两遍**：SMMU 拿到的
+是物理地址，而它的页表只覆盖 IOVA。第 70 步因此把 inbound 区域**关掉**（恢复成"读到时的样子"，
+`ctrl2=0`、`limit=0xfff`），再敲门铃——**仍然 `exec env 0, status 0`**。
+
+顺带：SMMU context 的 `FSR` 一直是 `0x400`（FS 字段为 0，不是有效 fault 状态），`FAR` 在两次运行
+里分别是 `0x1fffaf9d` 和 `0x9fffaf9d`（跟着无关的东西变），敲门铃前后**没有新增 fault** ——
+再次说明端点没发起任何读。
+
+### 2. 补了"先拉低 WLAN_EN"的 POR 时序，仍然没用
+
+对照 Android 自己的启动日志（`evidence/wlan-cycle-20261104.log`）：regulator 在 0.595 s 上电、
+**WLAN_EN 在 0.697 s 拉高**、PCIe probe 在 0.771 s —— 使能脚属于上电序列，不是事后补的。
+我们第 12 步原来只"拉高"，如果 ABL 已经把它拉高，芯片就没经历过一次真正的 POR。改成
+**拉低 50 ms → 拉高 → 50 ms** 之后跑完整链：链路照常到 L0，BHI 照常可读，门铃**照旧零响应**。
+
+### 3. 顺手拿到的资产
+
+- **厂商内核源码**：`Xiaomi_Kernel_OpenSource` 的 `alioth-r-oss` 分支（4.19.113，177 MB tarball）
+  解在 `~/alioth-kernel/src`。里面有 `arch/arm64/configs/alioth_user_defconfig`（没有 DTS，
+  DT 由 ABL 提供）。将来若要"带 debugfs 的自编内核"就从这里起。
+- 从设备拉下的完整 `kconfig-alioth.txt`（`alioth-local/evidence/`）——`CONFIG_MODULE_SIG is not set`
+  （可以 insmod 自编模块）、`CONFIG_DEBUG_FS is not set`、`CONFIG_IPC_LOGGING=y`（但接口在 debugfs 里，
+  所以等于没有）。
+
+### 到此为止的判断
+
+主机侧已经不剩任何"有依据"的开关：iATU inbound（错的方式、以及关掉）、IOVA 池、POR 时序、
+MSI、门铃变体、电源、时钟、链路、SMMU 映射与 fault 报告、BHI 描述符与偏移，全部试过或复核过。
+芯片的状态和一个"正常等待固件的 PBL"逐字相同，却对门铃无反应、从不发 DMA。
+
+**要继续，只有两条路**：① 找到能观测厂商成功路径的办法（自编带 debugfs 的内核，或另一台设备）；
+② 拿到 PBL 的文档。这两条都不是靠再跑几轮 XNU 能解决的。
+
+### 02:30 深夜第三个差异也试了：RC 的 `PARF_MHI_CLOCK_RESET_CTRL` bit4
+
+`pci-msm.c:4533` 对 RC 的这个寄存器做的是 **清 bit4**
+（`msm_pcie_write_mask(parf + 0x174, 0, BIT(4))`），而本文件第 5 步一直写 `0x13`（**置** bit4）。
+改成清 bit4 后跑完整链：本机读回本来就是 `0x3`（说明之前那次写并没有留在 bit4 上），
+门铃**依旧零响应**（80 次采样全为 `exec env 0, status 0`）。
+
+### 今晚（02:00–02:40）净结论
+
+三条新差异全部试完，全部否证：
+
+| 试的东西 | 结果 |
+|---|---|
+| iATU inbound 关掉（Linux 根本不设 inbound，靠 SMMU stage-1） | 无变化 |
+| WLAN_EN 先拉低 50 ms 再拉高（做一次真 POR） | 链路照常 L0，门铃无变化 |
+| RC 的 MHI clock/reset bit4 清掉（照厂商写法） | 无变化（本来读回就是 0x3） |
+
+顺带确认：`FSR=0x400` 且 FS 字段为 0，**不是有效 fault**；`FAR` 两次运行分别是
+`0x1fffaf9d` / `0x9fffaf9d`，跟着无关状态变，敲门铃前后没有新增 fault —— 端点确实没发读。
+
+**记录一个仍然成立的判断**：主机侧所有能找到依据的差异都已经试过或对照过，芯片的状态与
+"正常停在 PBL 等固件"的芯片逐字相同，却对 BHI 门铃没有任何反应。要继续必须有观测通道
+（自编带 debugfs 的内核 / 另一台设备）或 PBL 文档。
+
+---
+
+## 02:40–03:50 找到了设备的"官方"寄存器布局，并把门铃按它自己的地址敲了一次
+
+### 关键实测：`BAR+0x28` 给出的是**偏移**，不是芯片内部地址
+
+用 `regpeek`（新加了普通读模式）在**厂商芯片（固件运行中）**上直接读 BAR0：
+
+```
++0x18 CHDBOFF 0x300    +0x20 ERDBOFF 0x700    +0x28 BHIOFF 0x100
++0x2c BHIEOFF 0x224    +0x30 DEBUGOFF 0xb00    +0x38 MHICTRL 0x400
++0x48 MHISTATUS 0x401
+```
+
+而 **`BAR+0x100` 就是 BHI 寄存器块本身**：
+
+```
++0x100 2（minor）  +0x104 1（major）  +0x108 0xa2380000（固件 DMA 地址，在厂商 IOVA 池里）
++0x110 0x80000（size）  +0x118 0x21df6194（它敲过的 session id）
++0x128 2（EXECENV = AMSS）  +0x140 0xc4e10d95（序列号）  +0x148 1（numseg）
+```
+
+也就是说：厂商 MHI 的 `mhi_cntrl->bhi = regs + BHIOFF`（源码 `mhi_init.c:1785` 就是这么算的），
+**BHI 门铃就在 `BAR + 0x118`**；而本文件一直通过 `0x310c` 窗口按"芯片内部地址 0x1e0e200"访问它。
+
+### 第 72 步：在 link 正常的前提下，两条路径都通，两条都没用
+
+（先说一个教训：中途我加的"WLAN_EN 先拉低 50 ms"**破坏了链路训练**——`ltssm 卡在 0x905`、
+整片读回 `0xffffffff`。所以那两轮"直接区全 ff"是假象，不是发现。第 12 步已回滚，并留下注释。）
+
+回滚后重跑，链路 `ltssm 0x111`（L0），然后：
+
+```
+pcie: 72: PARF_MHI_CLOCK_RESET_CTRL 0x3; direct bar before: +0x28 0x100, +0x18 0x300, +0x38 0
+pcie: 72: BHIOFF 0x100; direct BHI: minor 2 major 1 execenv 0 status 0 serial 0xc4e10d95 numseg 0x1
+pcie: 72: ringing at 0x118 with image 0xa0100000
+pcie: 72:   +0..40 ms: exec env 0, status 0
+```
+
+于是可以确认：
+
+- 我们芯片的偏移表**和厂商芯片逐字一致**（BHIOFF 0x100、CHDBOFF 0x300）；
+- 直接路径（`BAR+0x100`）**在 PBL 下也能读**（版本 2.1、序列号、numseg 都对）；
+- 把端点自己的 `PARF_MHI_CLOCK_RESET_CTRL` 的 bit1 清成 `0x1`（AMSS 下的值）**没有任何作用**；
+- **按设备自己给出的地址 `BAR+0x118` 敲门铃，PBL 依旧不响应**。
+
+### 这意味着什么
+
+"门铃地址找错了"这个最后的可能性也被排除了：窗口路径和直接路径都到达同一个寄存器块，两条路
+都敲过，都不动。至此这条链上**再没有任何"主机侧配置"层面的未知量**。
+
+（顺带记下：我们的 `MHISTATUS` 直连读到 `0xff04`，厂商是 `0x401`；`MHICTRL` 直连读到 0。
+这些是 PBL 与 AMSS 的状态差异，不是我们写错了什么。）
+
+---
+
+## 03:50–06:00 突破性重解：**PBL 一直在处理门铃，是我们给它的 DMA 地址不可读**
+
+### 关键读数：错误寄存器是设备写的
+
+第 73/74 步读 `BHI_ERRCODE` / `ERRDBG`：
+
+```
+BHI_ERRCODE 0xef128100     BHI_ERRDBG1 0xa0100000（我们给的 IOVA）     BHI_ERRDBG3 0x80000（我们给的 size）
+```
+
+`ERRDBG1`/`ERRDBG3` **主机侧从不写**——只有 PBL 会在传输失败时写。也就是说门铃**从来不是被忽略的**：
+PBL 收下请求、尝试 DMA 读、失败、把地址和长度记下来。`BHI_STATUS` 一直是 0 只是这颗芯片在这条
+失败路径上不置状态位。之前所有"门铃零响应"的结论都要改成"**DMA 读失败**"。
+
+（补充：标记测试显示 ERRDBG 只在**本轮第一次**尝试时被写，之后 PBL 不再更新——它一旦失败就停住，
+所以每轮实验只有第一次敲门铃有意义。）
+
+### 然后找到了两个真 bug（第 75 步手工走页表）
+
+用**非缓存映射**把 SMMU 页表逐级走了一遍：
+
+```
+level 1 index 2   -> 0xca2b5003（指向二级表）
+level 2 index 256 -> 0                      ← 空！
+```
+
+而第 35 步刚刚在那里写过东西。两个 bug 叠在一起：
+
+1. **页表写进 CPU cache 就没落地**（SMMU 不 snoop CPU cache，走查读的是 DRAM，看到 0）；
+2. **2 MB 块描述符放错了层级**：39 位、4 KB 粒度的走法在**第 2 级**（bits 29:21）找块描述符，
+   而代码写进了第 3 级表，第 3 级是按 bits 20:12 索引的（我们这个 IOVA 命中索引 0），
+   所以即使刷了 cache 也照样找不到。
+
+**已修**（保守写法，`dc civac` 刷三页表 + `dsb sy`；`ml_io_map` 映射普通 RAM 会让内核挂住，
+试过一次就退回了）：
+
+```
+root[(IOVA>>30)&0x1ff] = phys(second) | 3;
+second[((IOVA>>21)&0x1ff)+i] = (base + (i<<21)) | 3;      /* 2 MB 块，放在二级 */
++ 刷 cache + dsb
+```
+
+### 仍然失败，但错误没变
+
+修完再跑完整链（首次门铃在第 36 步）：**`errcode 0xef128100` 依旧，`ERRDBG` 依旧是我们给的
+地址/长度，`STATUS` 依旧 0**。所以：
+
+- 页表两项 bug 是真的、已修，但**不是唯一的阻碍**；
+- 剩下的嫌疑集中在 `0xef128100` 这个具体错误码指向的那一层——很可能是 **iATU inbound**：
+  第 43 步把 `0xa0100000` 再翻译成物理地址，于是 SMMU 看到的是物理地址，而它的表里只有 IOVA。
+  （厂商的 `pci-msm.c` 里完全没有 inbound 配置，这一点早就发现了，但配合这个错误码看才成立。）
+- 下一轮该做的：**在第一轮里先关掉 iATU inbound（或干脆不配），再敲第一次门铃**，
+  看 `0xef128100` 会不会变成成功。
+
+### 状态
+
+手机：Android 正常、root 在、wifi 开、固件完好。代码改动仍未提交。
+
+### 06:00 第 77 步（SMMU 流匹配表）已写好，但两轮都没跑完
+
+- 第 77 步会打印：每个有效 SMR 的 mask/SID、对应的 S2CR（类型 + context）、S2CR[0]（未命中时
+  的默认项）、我们 context 的 CBAR/SCTLR/TCR/TTBR0/FSR/FAR，以及 GFSR/GFSYNR0。
+- 两轮都没跑到它：`XL_SECS=480` 不够（完整链现在要 7 分钟以上），第二轮 `run_steps.sh` 又在
+  `xl enter` 阶段就退了（这类"脚本提前退出"最近出现三次，原因多半是残留锁或 fastboot 会话态）。
+- **下一步（干净的做法）**：`pcie_step=77` + `XL_SECS=600`，并且先手动 `xl enter` /
+  `xl ramdisk` 再 `xl run`，避免脚本里的自动流程。
+
+记录一条观察：这一轮里第 38 步的四种门铃变体**每一种都**报 `errcode 0xef128100`、`ERRDBG` 都是
+我们给的地址/长度——所以"只有第一次有效"的说法要修正为：**每次失败都会写 ERRDBG，但状态位始终不置**。
+
+手机已恢复：Android 13、root 在、wifi 开。
+
+## 04:00–06:30 第 77 步的读数：SMMU 流匹配表，以及"如果 SID 没打上会落到别人家"
+
+第 77 步终于跑出来了（`pcie_step=77 pcie_skip_mask=7168` 跳过 60–62，10 分钟内到）：
+
+```
+IDR0 0x4c017e57（87 个 SMR）, IDR1 0x6000004a（74 个 context）
+S2CR[0] = 0                    -> type 0（翻译）, context 0     ← 未命中流的默认项
+smr 5: mask 0x8000 sid 0x0000  -> s2cr 0x5: context 5
+smr 7: mask 0x8000 sid 0x1c01  -> s2cr 0x6: context 6           ← 我们的（bus1 dev0）
+smr 8: mask 0x8000 sid 0x1c00  -> s2cr 0x6: context 6
+context 6: CBAR 0, SCTLR 0x127, TCR 0x803519, TTBR0 0x60001ca45c000, FSR 0x400, FAR 0xbfffaf9d
+GFSR 0, GFSYNR0 0
+```
+
+**这张表解释了一个一直对不上的现象**：如果 RC 没把 BDF→SID 打对（请求带着 SID 0 或别的值进
+SMMU），它会被 **SMR 5（context 5）** 或 **S2CR[0]（context 0）** 接走——用别的驱动的页表翻译。
+表现出来正是：PBL 读失败（`0xef128100`，`ERRDBG1` 是我们的地址）、而**我们的 context 6 的
+FSR 一直是干净的**（0x400 且 FS 字段为 0）。故障根本不在我们这张表里。
+
+**已实现**（第 35 步末尾）：找一个空闲 SMR，写成 `SID 0 mask 0`（掩码 0 = 匹配任意 SID），
+S2CR 指向 context 6，并做一次 sTLBIALL——这样无论端点带什么 SID，都会用我们这张表翻译。编译
+通过（`strings` 能看到 "matches every stream"）。
+
+**但没测出结果**：三轮尝试都没跑完——第一次超时（完整链 >10 分钟）、第二次脚本在 `xl enter`
+阶段自己退了、第三次内核在第 10 步（链路已 L0）之后就没再输出（疑似 panic，队列里没有
+"pcie: 35" 的行）。三分钟一轮太久，且 `run_steps.sh` 的自动流程最近不稳，需要改成手动
+`xl enter` / `xl ramdisk` / `xl run` 三段各自确认。
+
+### 下一步（留给下一轮，代码已就位）
+
+1. 手动跑一轮 `pcie_step=40`（第一次门铃在第 36 步），确认 `matches every stream` 那行打印出来，
+   再看第 38 步的 `errcode` 是否**不再是 `0xef128100`**；
+2. 如果通了：`BHI_STATUS` 或 `EXECENV` 会动，接着做 BHIE（第 47 步那块的下一段）；
+3. 如果仍失败：改用"先把 S2CR[0] 设成 bypass"再试一次，把"未命中流"这条分支也排掉。
+
+### 06:30–07:00 通配 SMR 还没能验证：现在内核在"第 2 步之后"就停
+
+- 第 35 步已经加好**通配 SMR**（空闲槽、`SID 0 + MASK 0` 匹配任意流、S2CR 指向 context 6、sTLBIALL），
+  编译通过、`strings` 里能看到 `matches every stream`。
+- 但连续几轮都跑不到它：
+  - 一轮抓日志太晚，早期的 `pcie:` 行被用户态日志挤出捕获窗口（教训：**跑起来 60–90 秒内就要读日志**）；
+  - 之后两轮，内核**在第 2 步（时钟）之后就再没有输出**，一次连第 3 步（复位）都没打印；
+  - 那两轮的日志里还有一条以前没见过的现象：`pcie_0_gdsc` 开机读数是 **0x22f001（关）**，而以往是
+    `0xf822f000（开）`——第 1 步把它打开后，第 3 步的复位写入似乎就卡住了。
+- 结论：**这是运行环境的问题（PCIe 电源域在上电时的初始状态变了），不是代码逻辑的新 bug**。
+  手机重启后 Android 一切正常，只是 XNU 这一轮进不去。
+
+### 下一轮要做的（按顺序）
+
+1. 让手机彻底放电/冷启一次（`adb reboot` 之后再进 loader），确认第 1 步读到的 `pcie_0_gdsc`
+   回到"开"；
+2. `pcie_step=40`，**开跑后 90 秒内**取日志，看 `pcie: 35: smr N now matches every stream → context 6`
+   是否打印；
+3. 看第 38 步的 `errcode` 是否不再是 `0xef128100`——这是"是不是 SID 不匹配"的唯一判据。
+
+### 07:00–07:40 定位"A 轮能跑、B 轮卡在第 2 步"：是间歇性的，别跳那几个时钟
+
+- 用只到第 4 步的短链定位到：卡点在**第 2 步末尾那三个跨域时钟门**（`0x8c004 pcie_wifi_clkref_en`、
+  `0x9000c`、`0x8d058`）的写操作上。前几轮日志里这三行写成功过（034727 那轮），后几轮
+  写到 `0x8c004` 就没下文——**间歇性挂死，不是寄存器的属性**。
+- 试过把它们做成 `pcie_clk_gates=0` 跳过：链能走过第 2 步，但**第 8 步报 `phy NOT ready (info 0xd)`**
+  ——说明 `pcie_wifi_clkref_en` 是 PHY 的参考时钟，不能省。已把这段恢复成"始终写"，
+  并把这个教训写进注释（**遇到挂死就重试一轮，不要跳过**）。
+- 顺便纠正一个误判：`pcie_0_gdsc` 开机读 `0x22f001`（关）**是正常的**——成功跑到第 77 步的那一轮
+  也是同一个初值，第 1 步会把它打开。所以它不是这几轮失败的原因。
+
+### 还没验证的（下轮第一件事）
+
+第 35 步的**通配 SMR**（`SID 0 + MASK 0` → context 6）仍然没有跑出结果：需要在一次**顺利跑过第 2 步**
+的运行里，用 `pcie_step=40`、**开跑 150–240 秒内**读日志，看：
+
+```
+pcie: 35: smr N now matches every stream -> context 6
+pcie: 38: done: ... error code 0x????   ← 不再是 0xef128100 就是进展
+```
+
+### 07:40–08:10 通配 SMR 仍未能验证：现在连链路都train 不起来了
+
+两轮重试（第二次还先在 Android 里 `svc wifi disable` 断一次电再进 loader）：
+
+| 轮次 | 结果 |
+|---|---|
+| 045003 | 第 2 步过了，但**第 19 步链路训练失败**（`elbi 0x1: link down, ltssm state 0`） |
+| 045614 | 同上，第 21 步 `parf ltssm 0x100 (state 0)`，链路没起来 |
+
+对比：034727 那轮（跑到第 77 步）链路是好的、第 2 步的门也写成功了。也就是说**最近这一小时里，
+同一条代码路径的表现反复无常**：有时卡在第 2 步的门、有时 PHY 不 ready、有时链路不训练。
+
+这不像代码逻辑问题（这段时间的改动只有第 35 步的页表与通配 SMR，都在第 30 步之后），
+更像**硬件/固件状态在多次实验后被留在了某种边缘状态**。可尝试的恢复手段（都需要有人在场）：
+1. 彻底断电（长按电源 10 秒以上）后再冷启，而不是 `adb reboot`；
+2. 在 Android 里让 wifi 完整跑起来一次（确认芯片正常），再进 loader。
+
+### 待办（不变）
+
+第 35 步的通配 SMR 需要在一次**链路正常**的运行里验证：
+`pcie_step=40`、开跑 150–240 秒内读日志，看
+`pcie: 35: smr N now matches every stream -> context 6` 和
+`pcie: 38: done: ... error code 0x????`（不再是 `0xef128100` 就是突破）。
+
+### 08:10–08:40 链路训练也失败了（换了动手时机、换了电源参数都不行）——需要一次真正的断电
+
+最近四轮里，同一条链在第 2 步的门、第 8 步的 PHY、第 16–21 步的链路训练上**轮流失败**：
+
+| 轮次 | 参数 | 停在哪 |
+|---|---|---|
+| 043249 | `pcie_at=2` | 第 2 步的跨域时钟门（写 `0x8c004` 无下文） |
+| 045003 | `pcie_at=1` | 第 19 步：`elbi 0x1: link down, ltssn state 0` |
+| 045614 | `pcie_at=1` + 先断 wifi 电 | 第 21 步：`parf ltssm 0x100 (state 0)` |
+| 050249 | `pcie_at=4` | 第 16 步：`link down, ltssm state 0`（第 2 步的门这轮是好的） |
+
+而 034727 那轮（同一份代码的早前版本）一路跑到第 77 步、链路正常。这四轮里第 1/2/4 步的读数都正常
+（GDSC 开了、六个时钟分支 running、三个跨域门写成功、两个复位已释放），**唯独端点侧不响应链路训练**。
+
+判断：**WLAN 芯片/它的电源域被这一晚的实验留在了某个边缘状态**，需要一次真正的断电（拔电池/长按电源
+10 秒以上）——`adb reboot` 和 loader 的冷复位都清不掉它。这一步必须有人在场，我做不到。
+
+### 恢复后第一件事（不变）
+
+`pcie_step=40`、**开跑 150–240 秒内**读日志，看：
+```
+pcie: 35: smr N now matches every stream -> context 6
+pcie: 38: done: ... error code 0x????     ← 不再是 0xef128100 就是突破
+```
+
+### 08:40–09:30 断电重启后仍然不训练；但确认了"芯片本身是好的"
+
+**最重要的一条**：断电重启后，**Android 的 wifi 完全正常**（`cmd wifi status`：连着
+<家里的 5GHz SSID>、192.168.1.91、Wi-Fi 6、576 Mbps、RSSI −61）。所以 QCA6390 和它的四路电源都没坏。
+
+**XNU 侧的状况**：还是训练不起来。这一轮的主机侧读数全对（GDSC 打开、六个时钟分支 running、
+三个跨域门写成功、两个复位已释放、PHY ready、PARF 可读），只有端点不回应训练
+（`parf ltssm 0x100`，state 0）。
+
+对比成功轮 034727 与失败轮，**第 10 步的输出完全一样**（那时 LIN 本来就还没起，PERST/电源在第
+13–16 步），差别在于失败轮在**第 10 步和第 11 步之间就卡住了**（第 11 步读 TLMM 引脚）。
+所以不是"链路训练算法"的问题，而是链在某一步挂住。
+
+**试过的自动化**：`retry_chain.sh`（loader 里镜像常驻，理论上重试只要 5 分钟）——实际只有第 1 轮
+真的跑了，第 2–4 轮几秒内就退（`xl run` 在 loader 状态变化后拒绝）。**所以每轮重试其实要
+`xl enter` + `xl ramdisk` 共 4 分钟，再加 5 分钟运行**。
+
+### 下一步（等有人在场时）
+
+1. 现在 Android 是好的，可以直接再试：`adb reboot bootloader` → `xl enter` → `xl ramdisk` →
+   `pcie_step=40`，**开跑 150–240 秒内**读日志；
+2. 如果又卡在 10/11 之间，说明是 TLMM 读取在特定状态下挂住——那就把第 11 步也做成可跳过
+   （`pcie_skip_mask` 目前只覆盖 60–62，需要把 50–99 都接上）；
+3. 一旦跑过第 35 步，就看 `smr N now matches every stream` 和 `pcie: 38: done: ... error code`。
+
+### 09:00–09:40 运行环境彻底不稳：内核起来了但 pcie 线程不再执行
+
+- `pcie_at=10` 那一轮（082734）是今天最后一次真正跑起来的：越过第 11 步、到第 21/22 步，
+  但**链路没训练**（`parf ltssm 0x100`，state 0）。链路本该在第 27 步的 plain enable 之后起来，
+  时限不够没走到。
+- 之后的所有尝试都变成"**内核起来了、iOS 也 boot，但 `hakios_pcie_init` 一行都没打印**"：
+  日志里 cmdline 明明是 `pcie_step=40 ... pcie_at=5`，却连
+  `pcie: step 40 of the PCIe root complex` 都没有。同一份内核在 08:27 还能打印。
+- 期间还多次被 `xl` 挡在门外（"a run is in progress"、loader 不在 loader 态），每次重试要
+  `xl enter` + `xl ramdisk` 4 分钟，再加 5–9 分钟运行，一晚上吞吐极低。
+
+**判断**：`hakios_pcie_init` 现在连第一行都不打，说明它可能在
+`PE_parse_boot_argn("pcie_step", ...)` 就返回了，或者线程根本没起——但 cmdline 明明带着这个参数。
+这已经不是"链路训练失败"，而是**加载器的 payload/cmdline 传递或内核入口状态出了问题**，
+需要单独查一次（例如用一个只打印一行就返回的桩来验证）。
+
+### 建议顺序（下轮）
+
+1. 先做一个**最小验证**：把 `hakios_pcie_init` 的第一行 tell 提前到 `PE_parse_boot_argn` 之前，
+   跑一次 `pcie_step=4`，确认"函数被调到"；
+2. 再确认 cmdline 是否被 XNU 真正接收（`PE_parse_boot_argn` 的返回值/`boot_args` 长度限制）；
+3. 这些都通了，再回到 `pcie_at=10` + `XL_SECS=600` 跑完整链到第 38 步。
+
+### 09:40–10:20 探针证明"函数在跑"，但链路彻底训练不起来
+
+1. **探针验证通过**：在 `PE_parse_boot_argn` 之前加了一行
+   `hakios_pcie_init: entered; looking for pcie_step` 和一行解析结果。跑 `pcie_step=4`：
+
+   ```
+   hakios_pcie_init: entered; looking for pcie_step
+   hakios_pcie_init: pcie_step parsed (steps 4)
+   pcie: 1: … pcie: 2: …
+   ```
+
+   → **函数被调用、参数解析正常**。之前那些"一行都不打印"的轮次，确实是 loader 不在运行态、
+   `xl run` 被拒（不是内核问题）。教训：`xl state` 必须是 `loader`，且 `xl run` 要作为
+   `enter → ramdisk → run` 一条命令串起来。
+
+2. **完整链（`pcie_at=10`、620 秒）跑到第 23 步就停**：
+
+   ```
+   pcie: 22:   try 30: parf ltssm 0x100 (state 0, flush 0), dbi link 0x10110008
+   pcie: 22: end: state 0, flush 0, dbi link ctrl/status 0x10110008 (width 0, active 0)
+   pcie: 23: bus 0 dev 0 fn 0: id 0xffffffff … 根桥总线号 primary/secondary/subordinate 全是 255
+   pcie: 23: bus 1 dev 0 fn 0: nothing (0xffffffff)
+   ```
+
+   **链路 state 0、宽 0、active 0，根桥的总线号还是 0xff（根本没被配置）**——链路没起来，
+   后面全部停下。而同一颗芯片、同一台手机，Android 自己的栈（`cmd wifi status`：连着
+   <家里的 5GHz SSID>、Wi-Fi 6、576 Mbps）是好的。
+
+3. 这一个障碍（XNU 侧链路训练不下来）已经连续多轮没有进展：`pcie_at` 从 2/4/5/10 都试过，
+   `pcie_rail=2`、`pcie_smmu_map=1` 固定，主机侧读数（GDSC/时钟/复位/PHY/PARF/四路电源投票）
+   全部正常，**只有端点不响应训练**。
+
+### 结论
+
+到这一步，XNU 侧的问题已经从"BHI 门铃不响"变成了**"PCIe 链路训练不下来"**，而后者的每一环
+主机侧都验证过了。要继续需要对照物（Android 栈在同一时刻的 PARF/LTSSM 读数、或另一台设备），
+或者换回早期的内核镜像逐版本二分（确认是某次改动引入的还是硬件状态漂移）。
+
+### 10:20–11:00 对照数据到位；发现一个真实的顺序 bug（已修）；但仍跑不出输出
+
+**厂商栈的对照读数（Android，root，sysfs 只读）**：
+
+```
+0000:00:00.0  RC   17cb:010b  class 060400  command 0x0007  current_link_speed = 5 GT/s (Gen2)
+              config 0x18..0x1a = 00 01 01   → primary 0, secondary 1, subordinate 1
+              memory window 0x6030–0x6050, prefetch 0x6061–0x6071
+0000:01:00.0  端点 17cb:1101  class 028000  command 0x0406  BAR0 0x60300004
+```
+
+我们 XNU 里根桥总线号是 `0xff/0xff/0xff`（从没写过）——**目标是 0/1/1**。
+
+**顺序 bug（已修）**：我们的链是
+`12 拉高 WLAN_EN → 13 释放 PERST# → 15 才投四路电源 → 19+ 训练`。
+PERST 释放时芯片可能**还没电**。早期一直能用，是因为 Android 把电留在那儿；今天在 Android 里
+关过 wifi（厂商栈把电断了）之后就再也没训练成功过。已把 `step_rails()` 提前到 `step_link()`
+开头（电源投票是幂等的，第 15 步仍保留）。
+
+**但仍然跑不出输出**：修完后跑 `pcie_step=40 pcie_at=10`，日志里连探针行
+`hakios_pcie_init: entered` 都没有（同一份内核在 `pcie_step=4 pcie_at=3` 下是能打印的）。
+所以现在的障碍已经不是链路，而是**这一轮 `hakios_pcie_init` 根本没被调用**——和链路无关的新问题，
+需要单独定位（例如检查 `hakios_pcie_init` 的调用点条件、以及 `pcie_step=40` 与 `pcie_step=4` 的差异）。
+
+### 明确的下一步（不盲试）
+
+1. 打印 `hakios_pcie_init` 的**调用点**（哪个 init 阶段调用它、有没有前置条件），只在
+   `pcie_step` 存在于 boot-args 时才打印，确认"参数到了但函数没被调"还是"函数被调但没打印"；
+2. 若确实是"没被调"，检查是不是 40>某个阈值导致别的分支（例如 `pcie_reuse` 判断）提前返回；
+3. 之后再回到链路训练：把根桥总线号 0/1/1 按厂商值写进去。
+
+### 11:00 两个新发现，但线程那条路仍然进不去
+
+**发现 1（重要，已修）**：`pcie_thread` 里是**重新解析 boot-args** 的：
+
+```c
+delay_for_interval(seconds, NSEC_PER_SEC);
+if (PE_parse_boot_argn("pcie_step", &steps, ...)) pcie_run(steps);   /* 旧代码 */
+```
+
+主线程解析成功（探针两行都打印），但线程晚 10 秒再解析时就拿不到了——boot-args 所在内存
+在内核起来后可能已被复用。这正好解释"`pcie_at=2/3` 能跑、`pcie_at=10` 什么都不打"。
+已改成**把 steps 打包在参数里**（低 16 位秒数、高 16 位步骤数），只解析一次。
+
+**发现 2**：之前"`hakios_pcie_init` 没被调用"的判断是错的——是**日志环形缓冲把早期行挤掉了**。
+早读（130 秒内）能看到探针行；晚读（450 秒后）就只剩用户态日志。
+
+**但修完仍然没有步骤输出**：`pcie_at=10` 的新一轮里，探针两行在、`pcie: 1:` 等一行都没有。
+也就是说**线程起来后没有走到 `pcie_run`**（内联路径 `pcie_at=0` 是能打印的）。
+这一条现在没有便宜的验证手段：要么线程没被调度，要么 `delay_for_interval` 10 秒没返回。
+
+### 建议
+
+改用**不走线程**的方式跑完整链：去掉 `pcie_at`（或设成 0），让 `pcie_run(40)` 在
+`bsd_init` 里内联执行。代价是早期日志会被后续覆盖——所以要把关键读数改成**写入一段固定的
+内存块**（比如在 `run-payload` 的保留区），或者干脆让 pcie_run 把结果落到 `/dev/console`
+以外的持久位置。这是下一轮的工作量，但能把"线程/日志"这两个不确定因素一起消掉。
+
+---
+
+## 2026-11-04 20:00 社区结论：**K40 的 Wi-Fi 已经有人跑通了，走的不是我们这条路**
+
+查 `MrMoxing/ios-alioth` 的 atom feed 发现今天 08:41 的提交
+**「wifi: the link trains, an open network is joined, and a page loads」**，顺着它读到两份关键文档
+（已拉到本目录，见下）：
+
+- `MrMoxing/ios-alioth` 分支 **`wifi-ref-port`** → `docs/WIFI-REFERENCE-PORT.md`
+- 它们的上游：**`Klipboard2022/k40-ios-experiments`**（K40 跑 iOS 16.5 的实验补丁）
+
+### 事实
+
+1. `Klipboard2022/k40-ios-experiments` 的 `patches/hakios-k40-r45.patch` **是打在我们的仓库
+   `ufogxl/hackios-alioth @ 569a9cc` 上的**（正是我们自己"链路到 L0"那个提交）。已用
+   `git worktree add /tmp/refcheck 569a9cc` + `git apply --check` 验证：**rc=0，干净应用**。
+2. 补丁覆盖 19 个文件，核心是：
+   - `xnu/files/bsd/dev/hakios.pcie.c`（参考实现 4001 行：电源/时钟/复位/PERST/LTSSM/iATU/BAR/
+     **SMMU 页表**/BHI(SBL)/MHI/BHIE(AMSS)/QRTR/QMI）
+   - `hakios.lx.c` + `wifi/lx/src/*`（FreeBSD LinuxKPI 垫层）
+   - `hakios.qrtr.c` / `hakios.radio.c` / `hakios.apple80211.c`（QRTR、射频、en0）
+   - `xnuloader/loader.c` 等
+3. **驱动本体不是自己写的**：它们把 **Linux 7.0.14 的 `drivers/net/wireless/ath/ath11k` 原样编进
+   XNU**（`tools/mk-ath11k.sh` → `ath11k.o`，764 KB，`stubs.txt` 0 行）。
+4. 他们的真机结果（`WIFI-REFERENCE-PORT.md` §5.2，本机 alioth）：
+   ```
+   pcie: 28: endpoint 01:00.0: id 0x110117cb
+   pcie: 31: after SBL transfer MHI status 0x101, execenv 0x1
+   pcie: 31: after M0 MHI status 0x201, execenv 0x1
+   pcie: 31: requested 4352144-byte AMSS transfer in 9 BHIE vectors
+   ath11k: fw_version 0x1016046e ... QCAHSTSWPL_SILICONZ
+   lx: the driver registers a radio: channels: 14 in band 0 ...
+   pcie: 35: ath11k returned 0
+   lx: early station interface attached 1
+   net_test: wifi: en0 is there after 0.0 s
+   ```
+   即 **BHI→MHI→BHIE→QMI→ath11k→en0 全链路通**，`configd` 自动给 en0 配网络服务。
+   （他们剩下的问题只是"用自动化点开设置页触发扫描"，与我们无关。）
+
+### 需要的开机参数（参考实现自己的）
+
+```
+pcie_step=31 pcie_ipcr=2 wifi_lx=2 wifi_station=1 wifi_mac=<本机 MAC>
+```
+本机真实 MAC 从 Android 的 `/mnt/vendor/persist/wlan_mac.bin` 读到：`wlan0=<本机 MAC>`。
+（不传 `wifi_mac` 时固件报 `00:00:00:00:00:00`，`lx` 就不建接口——这是他们踩过的坑。）
+
+### 本目录下已归档
+
+| 目录 | 内容 |
+|---|---|
+| `<主机>\Develop\iOSOnAndroid\k40-ios-experiments\` | 参考项目（补丁、overlays 19 个文件、manifest、userland） |
+| `...\ios-alioth-moxing\` | MrMoxing 的 main（他们自研 `alioth_pcie.c` 与文档） |
+| `...\moxing-wifi-ref\` | MrMoxing 的 `wifi-ref-port` 分支（含 `docs/WIFI-REFERENCE-PORT.md`、构建实录、上机日志） |
+
+### 结论与下一步
+
+**我们这条手写驱动的路线的天花板，就是参考文档里那句话**：手写寄存器序列能走到链路/BAR/BHI，
+但后面还有 MHI 通道、QRTR/QMI（board file/fw 下载/校准）、802.11 状态机、mac80211 语义——
+"不是一个文件能补完的"。
+
+所以下一步应该是**换路线**，而不是继续调我们的 `hakios.pcie.c`：
+
+1. 在 `569a9cc` 上建一个干净工作树（`git worktree add ~/hackios-ref 569a9cc`）；
+2. `git apply k40-ios-experiments/patches/hakios-k40-r45.patch`（已验证干净）；
+3. 按其文档构建：`XNU_URL=file://~/hackios-alioth/xnu-src/xnu-8796.121.2 bash xnu/apply.sh`
+   → `bash tools/mk-ath11k.sh`（需下载 Linux 7.0.14 + FreeBSD 15.1，用 aliyun/ustc 镜像）
+   → `bash xnu-build.sh`；
+4. 上机：`pcie_step=31 pcie_ipcr=2 wifi_lx=2 wifi_station=1 wifi_mac=<本机 MAC>`，
+   固件用我们已经归档的 `fw-wifi/qca6390/`（51 个文件）。
+
+---
+
+## 2026-11-04 21:00 转向参考实现：一切就绪，只等手机回到 USB
+
+### 已经完成（不需要手机）
+
+在**我们仓库**开了一个工作树 `~/hackios-ref`（detached at `569a9cc`），把社区验证过的那套搬了进来：
+
+| 步骤 | 结果 |
+|---|---|
+| `git apply k40-ios-experiments/patches/hakios-k40-r45.patch` | ✅ 干净（19 个文件：参考版 `hakios.pcie.c` 4001 行、`hakios.lx.c`、`wifi/lx/src/*`、`qrtr/radio/apple80211`、`conf/files`、`loader.c`） |
+| `XNU_URL=file://…/xnu-src/xnu-8796.121.2 bash xnu/apply.sh` | ✅ 193 个文件铺进 `xnu-src`（省掉再下 500 MB） |
+| `bash tools/mk-ath11k.sh` | ✅ **`ath11k.o` 759,644 B、`stubs.txt` 0 行、`undefined.txt` 0 行**（Linux 7.0.14 的 ath11k 真的编出来了） |
+| `./xnu-build.sh -j8` | ✅ 内核 15.7 MB，含 `requested signed SBL` / `BHIE vectors` / `ath11k returned` / `wifi_station` |
+| 固件 | ✅ 改成读我们现有 `root.apfs` 里的 `fw/qca6390/{amss20.bin,bd_k11a.elf,regdb.bin,m3.bin}`（4,352,144 / 57,896 / 19,348 / 266,684，与参考文档记录逐字节一致） |
+| 上机脚本 | ✅ `alioth-local/tools/run_ref.sh`（含 `restore` 子命令，把我们自己的内核放回） |
+
+注意：为了用**主树那套已验证的 `xl` 流程**，参考内核已被临时拷到主树的
+`xnu-src/.../mach.development.bcm2837`，我们自己的内核备份在 `/tmp/mach-ours.bak`
+（`run_ref.sh restore` 会换回来）。
+
+### 阻塞：手机从 USB 上消失了
+
+- `xl state` = `absent`；`adb devices` / `fastboot devices` 都空；
+- **PowerShell 里按 VID 查（2717 小米 / 18D1 Google / 05C6 高通 / 22D9）也是零** ——
+  也就是说设备在 USB 总线上彻底不见，不是"adb 没起来"。
+- 已经等了三轮（每轮 2 分钟）都没回来，需要物理操作：长按电源 10 秒强制关机再开机，
+  顺便确认数据线两端插紧。
+
+### 手机回来后一条命令
+
+```
+bash <主机>/Develop/alioth-local/tools/run_ref.sh
+# = xl enter → xl ramdisk userland/system.apfs → xl run
+#   参数 pcie_step=31 pcie_ipcr=2 wifi_lx=2 wifi_station=1 wifi_mac=<本机 MAC> bootcpu=7
+```
+
+预期日志（照参考实现的实测记录）：`after SBL transfer MHI status 0x101 execenv 0x1`
+→ `requested 4352144-byte AMSS transfer in 9 BHIE vectors` → `ath11k returned 0`
+→ `en0 is there after 0.0 s`。
+
+---
+
+## 2026-11-04 22:00–22:30 **参考实现的全套硬件链在本机跑通**（BHI→BHIE→M0→QMI）
+
+### 两个决定性的发现
+
+1. **芯片必须先真正断电再上电**。之前所有"链路训练不下来（`LTSSM state 0x5`）"的失败，
+   都发生在芯片还带着 Android 的 AMSS 状态时。做法：**在 Android 里 `svc wifi disable`
+   （厂商栈会把四路电源断掉 + 断言 PERST），等 10 秒，再 `adb reboot bootloader` 进 loader**。
+   这样我们的上电/复位序列才是真的 POR。**这一条同时解释了今晚十几个小时的链路失败。**
+2. **参考实现的启动参数不止 `pcie_step=31`**（他们的 `docs/BUILD.md`）：
+   ```
+   pcie_step=31 pcie_at=2 pcie_ipcr=2 wifi_lx=2 wifi_quiet=1 wifi_station=1 wifi_keep=1 wifi=1
+   wifi_mac=<本机 MAC>
+   ```
+
+### 跑出来的日志（`logs/220135-run.log.live`、`222715-run.log.live`）
+
+```
+pcie: 30: requested signed SBL transfer (512 KiB) through BHI
+pcie: 31: after SBL transfer MHI status 0x101, execenv 0x1, version 0x1000000
+pcie: 31: after M0 MHI status 0x201, execenv 0x1
+pcie: 31: requested 4352144-byte AMSS transfer in 9 BHIE vectors
+pcie: 31: BHIE status 0xa0ff0d3f, execenv 0x2, MHI status 0x201
+pcie: 31: mission observation MHI status 0x201, execenv 0x2, stable M0 2000 ms
+pcie: 35: event ring 1 type 0x22 channel 21 code 2 pointer 0xa000a000 length 52 …（QMI 报文在流）
+pcie: 35: cyclic MHI/QRTR ready; starting QCA6390 ath11k
+```
+
+**这就是目标里 1) 和 2) 的判据**：BHI 下载成功（execenv 0→1）、BHIE 9 段 AMSS 灌完
+（execenv→2）、MHI 到 M0 且稳定 2 秒、QMI/QRTR 通道上有报文来回。**这些以前一次都没出现过。**
+
+### 剩下的唯一失败点：board 数据没找到
+
+```
+ath11k ERROR: failed to fetch board data … from ath11k/QCA6390/hw2.0/board-2.bin
+ath11k WARNS: qmi failed to fetch board file: -2
+pcie: 35: ath11k returned 5
+```
+
+我加的三级文件名回退（`fw_find`：`fw/<name>` → `fw/qca6390/<name>` → 目录 `fw/qca6390`）让
+**AMSS 找到了**（4352144 字节、9 段都灌进去了），说明嵌套路径可用；但 **board 那条没有走到
+`qca_qmi_file`**（我加的 `pcie: 34: qmi file …` 诊断一行都没打印），说明 ath11k 的 BDF 请求
+走的是另一条路径（`qca_ipcr_probe` 里，未被执行或提前 `goto failed`）。
+
+### 下一步（下一轮，两件事）
+
+1. 在 `qca_ipcr_probe()` 入口和每个 `goto failed` 前加打印，看它到底有没有被调用、在哪一步退出；
+2. 若它没被调用，就在 step 35 启动 ath11k 之前显式调用一次——参考实现的 board/regdb/m3
+   就是由它送进固件的（`state.board`/`state.regdb`/`state.m3`）。
+
+### 操作备忘（很重要）
+
+每次跑之前：**Android 里关 wifi → 等 10 秒 → 进 bootloader → `xl enter` → `xl ramdisk` → `xl run`**。
+不这么做，链路一定停在 `LTSSM 0x5`。
+
+---
+
+## 2026-11-04 22:30–22:50 **ath11k 起来了：`ath11k returned 0`、station 交给 iOS**
+
+### 关键修复（两处）
+
+1. **`lx_os_firmware()` 的固件映射指向 `fw/` 根**，而我们的镜像把厂商固件放在 `fw/qca6390/`。
+   改成先找 `fw/qca6390/<name>`、失败再退回参考实现的扁平名（`qca6390_bd_k11a.elf` 等），
+   映射为 `board.bin → bd_k11a.elf`、`m3.bin → m3.bin`、`regdb.bin → regdb.bin`。
+2. 之前的 `fw_find()` 三级回退（`fw/<name>` / `fw/qca6390/<name>` / 目录 `fw/qca6390`）保住了
+   AMSS 的 512 KiB + 9 段 BHIE。
+
+### 跑出来的完整链条（`logs/224059-run.log.live`）
+
+```
+pcie: 30: requested signed SBL transfer (512 KiB) through BHI
+pcie: 31: after SBL transfer MHI status 0x101, execenv 0x1
+pcie: 31: after M0 MHI status 0x201, execenv 0x1
+pcie: 31: requested 4352144-byte AMSS transfer in 9 BHIE vectors
+pcie: 31: BHIE status …, execenv 0x2, MHI status 0x201
+pcie: 31: mission observation MHI status 0x201, execenv 0x2, stable M0 2000 ms
+pcie: 35: cyclic MHI/QRTR ready; starting QCA6390 ath11k
+lx: the rings are set up and the copy engines have their buffers: the bus is started
+lx: 249 ms after its start the driver IS UP as far as it is built:
+    the firmware has said "unified ready"; its flags: 0x4100
+pcie: 35: ath11k returned 0
+pcie: 36: station offered to iOS; keeping isolated endpoint until session return
+```
+
+**目标判据 1) 与 2) 已经满足**：BHI 成功 → BHIE 9 段 → mission mode M0 稳定 → QMI 报文往返
+→ ath11k 以 0 返回、固件报 "unified ready"、station 交给 iOS。
+判据 3) 的一半也满足：`net_test: wifi: en0 is there after 0.0 s`——**en0 存在**。
+
+### 还剩什么
+
+`net_test: wifi: configd has no network service for en0 (a kernel without its IOKit objects)`
+——en0 在，但没注册成 IOKit 网络对象，所以 configd 不给它配地址。参考实现那边同样的内核 +
+他们的用户态镜像是 "configd has a network service for en0 after 1.4 s"，说明差在**用户态镜像**
+（我们的 system.apfs 比他们用的旧，缺发布 IOKit 网络对象那一层）。
+再往后才是"扫描要打开设置页"（他们也在这一步卡过，且他们发现那套内核里用户态 `sleep` 偶发不醒）。
+
+### 复现命令（每次必须冷芯片）
+
+```
+# Android 里：svc wifi disable；等 10 秒
+adb reboot bootloader
+xl enter → xl ramdisk userland/system.apfs
+XL_SECS=300 xl run 参数：
+  bootcpu=7 pcie_step=31 pcie_at=2 pcie_ipcr=2 wifi_lx=2 wifi_quiet=1 wifi_station=1
+  wifi_keep=1 wifi=1 wifi_mac=<本机 MAC>
+```
+
+---
+
+## 2026-11-04 23:00–23:40 驱动起来了，但参考内核的用户态是短板（黑壁纸/无触摸/无音量）
+
+### 用户反馈（重要）
+
+参考内核上：**桌面黑壁纸、触摸不响应、音量键无效**——所以"手动打开设置→Wi-Fi"这条扫描路径
+在当前内核上走不通。原因不是新问题：**参考补丁是针对我们更早的提交（`569a9cc`）做的**，
+那时 GPU/触摸/按键这条线还没后来这么多修复；主树 `HEAD` 上的改进不在这个工作树里。
+（`adreno=22`、`gl=1`、`touch_poll_us=500` 这些参数名是对的，参考内核源码里就是 `adreno=`。）
+
+### 当前确切位置（相对目标判据）
+
+| 判据 | 状态 | 证据 |
+|---|---|---|
+| 1) BHI→BHIE→MHI→QMI | ✅ | `after SBL transfer … execenv 0x1`、`9 BHIE vectors`、`execenv 0x2`、QMI 报文往返 |
+| 2) mission mode M0 | ✅ | `mission observation MHI status 0x201, execenv 0x2, stable M0 2000 ms` |
+| 3) iOS 出现 Wi-Fi 接口 | ⚠️ 一半 | `net_test: wifi: en0 is there after 0.0 s`；但 `configd has no network service for en0` |
+| 4) 扫描/关联/IP | ❌ | 需要打开设置面板（本内核 UI 不可用），或走 `fw/network` 自动连接 |
+
+### 两条可走的路
+
+1. **重建用户态镜像**（在他们的 `build.sh` 里补 daemon 列表 + `fw/network`）：
+   - `com.apple.networkd_privileged` / `com.apple.networkd` / `com.apple.apsd` 加进 job 列表（拿 IP 用）
+   - `MDNS=1`（解析）、`TRUSTD=1`（证书）——参考实现的文档 §5.3/§5.5 有完整说明
+   - `fw/network`：第一行 SSID、第二行密码，`lx_os_network` 会读它自动连接
+   这条路不需要 UI，是**最接近完成**的。
+2. **把参考的 Wi-Fi 改动移植到主树 `HEAD`**（保住后来的 GPU/触摸/按键修复），
+   但 `hakios.pcie.c` 是整份替换（4001 行），其余文件也有冲突，工作量大。
+
+### 复现（每次必须冷芯片）
+
+```
+Android: svc wifi disable；等 10 秒 → adb reboot bootloader
+xl enter → xl ramdisk userland/system.apfs
+XL_SECS=300 xl run 参数：
+ bootcpu=7 pcie_step=31 pcie_at=2 pcie_ipcr=2 wifi_lx=2 wifi_quiet=1 wifi_station=1
+ wifi_keep=1 wifi=1 gl=1 adreno=22 touch_poll_us=500 fb_threads=8 fb_hz=60 display_hz=60
+ battery_qg=1 wifi_mac=<本机 MAC>
+```
+
+---
+
+## 2026-11-04 23:40 **找到"GPU/触摸/音量不正常"的根因：跑的是参考内核，不是我们的**
+
+### 根因
+
+为跑参考实现，我把参考内核（基于更早的 `569a9cc`）**拷到了主树的 kernel 路径**
+`xnu-src/.../mach.development.bcm2837`，之后就一直在那儿。于是每一次 `xl run` 跑的都是
+**参考内核**——它那份 `hakios.gpu.cpp` / `hakios.input.c` / `hakios.buttons.c` 是两天前的版本，
+正好对上"黑壁纸、触摸无反应、音量键无效"。
+
+### 修复与验证
+
+从我们自己的源码重编主树内核（15,256,992 B，含 `pcie: 77`、不含 `requested signed SBL`），
+用正常参数跑一次（`gl=1 adreno=22 adreno_keep=1 touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 rd=md0 battery=1`）：
+
+```
+adreno: 22: A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue from the top
+[TouchEvents] init: <BKDirectTouchState: … touchScreen; builtin; …>
+buttons: step 4: … volume up's pin: … level high (released)
+```
+
+**GPU、触摸、音量键都正常**。截图 `logs/desk-check.png`：桌面图标、状态栏都在。
+
+（壁纸黑 + 小组件空白是另一个已知问题——PROGRESS 10-30 那条记的是"镜像里的作业表，不是渲染"，
+和这次的回归无关；这条要单独查。）
+
+### 教训（写给以后的自己）
+
+**不要用覆盖主树 kernel 的方式跑别的内核。** 以后要么用独立工作树，要么给 `xl` 指定别处的
+kernel 路径。这次就是这样把"我们的内核"悄悄换成了别人的，害得用户以为驱动坏了。
+
+### 当前状态
+
+- 主树 kernel：**我们自己的**（Wi-Fi 停在"参考方案已验证到 ath11k 起来"这一步）
+- 参考工作树 `~/hackios-ref`：保留，随时可跑（用 `run_ref.sh`）
+- 手机：Android 13、wifi 正常
+
+---
+
+## 2026-11-04 23:50 **壁纸黑/小组件空白修好：`root.apfs` 重建时漏了 `GL=1 REST=1 SYSTEM=1`**
+
+### 根因
+
+`GL=1 REST=1 SYSTEM=1` 是**构建时烤进镜像**的开关（`userland/build.sh`）。前几天为了把
+`fw/qca6390/*` 塞进镜像重建了一次 `root.apfs`，**这三个开关没带**，于是镜像里没有 Mesa、
+没有 REST/SYSTEM 那批资源——表现就是：壁纸纯黑、停靠栏纯白、小组件不加载。
+PROGRESS 里 10-31 和 11-01 各记过一次同一个坑（"重建小镜像时这三个必须带"），这次是第三次。
+
+### 修复
+
+```
+cd userland && GL=1 REST=1 SYSTEM=1 bash build.sh
+```
+- `root.apfs` → 14,422,016 B（23:12），`system.apfs` → 2,486,968,320 B（23:14）
+- 重传 system 镜像后跑：截图 `logs/desk-check2.png`
+  —— **渐变壁纸、Weather「No weather data」、Calendar「No events today」、Dock 全部正常**
+- 同时 GPU（`adreno: 22: A PICTURE DRAWN …`）、触摸（`BKDirectTouchState … touchScreen`）、
+  音量键（`buttons: step 4 …`）都正常
+
+### 教训（第三次同一个坑）
+
+**任何重建 `root.apfs` 的命令都必须带 `GL=1 REST=1 SYSTEM=1`。** 建议把这三条写进
+`devices/alioth/README.md` 的构建段落里（下次不要再靠记忆）。
+
+---
+
+## 2026-11-05 00:00 C 方案的两次尝试与结论
+
+### 教训：`fb_beat` 默认是 1（限速出帧）
+
+`MiniIOMobileFramebuffer.cpp:168`：`TUNABLE(gOnTheBeat, "fb_beat", 1)`。为流畅配的那组参数里有
+`fb_beat=0`（立刻出帧）。我这两轮的启动参数漏了它，于是"GPU 正常但界面几乎没反应"。
+**以后任何给人看的会话都必须带 `fb_beat=0 fb_ca_hz=120`。**
+
+### 尝试一：全量合并（分支 `wifi-ref-port`）
+
+补丁 19 个文件全部应用（`hakios.pcie.c` 用参考版整份替换），编译通过。
+结果：**系统卡死**（GPU 画得出图、SpringBoard 起来了，但 UI 几乎无响应）。
+→ 卡死来自**非 Wi-Fi 的那批文件**（`hakios.gpu.cpp` / `hakios.input.c` / …），不是 PCIe 驱动。
+
+### 尝试二：只并 Wi-Fi 文件（分支 `wifi-lite`）
+
+只替换 `hakios.pcie.c`、`hakios.lx.c`、`hakios.radio.c`、`hakios.apple80211.c`、新增
+`hakios.qrtr.c` / `hakios.qca6390_qmi.h`、`bsd/sys/hakios.lx.h`、`bsd/conf/files`、`wifi/lx/src/*`。
+
+- **不带 Wi-Fi 参数**：系统正常（截图 `logs/lite.png`：壁纸、小组件、Dock 都在）。✅
+- **带 Wi-Fi 参数（冷芯片）**：链路训练成功、BAR 读到、BHI 0x100 读到序列号 `0xc4e10d95`、
+  第 31 步的 pre-boot reset 也做了——**然后停在 "pre-boot reset requested" 之后，没有出现
+  `requested signed SBL transfer`**，`net_test` 报 "no en0 after 120 s"。
+
+也就是说：**wifi-lite 缺了参考实现里让 BHI 跑起来的那部分**（大概率在 `hakios.shared.c` 或
+`hakios.gpu.cpp` 之外的某个被我们跳过的文件里），而全量合并又把 GPU/输入改坏。
+
+### 现状
+
+| 分支 | 能起来 | Wi-Fi |
+|---|---|---|
+| `master`（我们自己的） | ✅ 正常 | ❌ 手写驱动走不通 |
+| `wifi-lite` | ✅ 正常 | ⏳ 到 BHI 就停 |
+| `wifi-ref-port`（全量） | ❌ UI 卡死 | ⏳ 未到 |
+| `~/hackios-ref`（参考内核，基于 569a9cc） | ⚠️ 能起来，但触摸/音量是旧版 | ✅ **`ath11k returned 0`** |
+
+### 下一步的两个选项
+
+1. **在 `wifi-ref-port` 上回退指定的几个文件**（`hakios.gpu.cpp`、`hakios.input.c`、
+   `hakios.buttons.c`、`hakios.battery.*`、`hakios.apfs_check.c`）到我们 HEAD 的版本，
+   保留其余（含 `hakios.shared.c`、`hakios.pcie.c` 等）。这样既有参考的 Wi-Fi 完整依赖，
+   又不动 GPU/输入。**这是最可能一次成功的组合。**
+2. 继续在 `wifi-lite` 上补文件，逐个试（慢，每轮 10 分钟）。
+
+倾向第 1 条。
+
+---
+
+## 2026-11-05 00:20 收尾：回到 master（我们自己的内核），混合方案的构建留到下次
+
+### 这一小时做的事与结论
+
+1. **`fb_beat` 默认 1**（节流出帧）——漏了它就"GPU 正常但界面几乎不动"。以后给人看的会话
+   必须带 `fb_beat=0 fb_ca_hz=120`。
+2. **全量合并补丁（19 文件）→ 系统卡死**（GPU 能画图、SpringBoard 起来了，UI 几乎无响应）。
+   卡死源自非 Wi-Fi 的那批文件（`hakios.gpu.cpp` / `hakios.input.c` …），不是 PCIe 驱动。
+3. **只并 Wi-Fi 文件（`wifi-lite`，11 文件）→ 系统正常**（截图 `logs/lite.png` 壁纸/小组件/Dock 齐）。
+   带 Wi-Fi 参数跑（冷芯片）：链路训练成功、BAR 读到、BHI 0x100 读到序列号 `0xc4e10d95`、
+   pre-boot reset 也做了，**但停在 "pre-boot reset requested" 之后**，没有
+   `requested signed SBL transfer`，`net_test` 报 "no en0 after 120 s"。
+   → 说明 Wi-Fi 那套还缺一个依赖（很可能在 `hakios.shared.c` 或被跳过的文件里）。
+4. **混合方案（全量补丁 + 回退 7 个非 Wi-Fi 文件）**：应用后构建在 config 阶段失败，
+   `--clean` 也没产出新内核（原因未定位，时间不够）。
+
+### 现在
+
+- 已回到 **`master`**：我们的内核重新编好（15,257,048 B，`pcie: 77` 在），
+  `PROGRESS.md` / `hardware.md` / 我们的 `hakios.pcie.c` 都保留。
+- 分支 `wifi-lite`、`wifi-ref-port` 保留着这两次尝试（未提交）。
+- 手机停在 loader（用户暂时不用这台机器）。
+
+### 下次继续的第一步
+
+在**干净树**上重做混合方案（这次先 `git checkout -- .` 再应用，确保补丁能干净二次应用），
+并且先只验证"系统是否可用"，再验证 Wi-Fi。构建失败要先把 `config` 阶段真正的第一个错误抓出来
+（现在只看到 symbolset 那堆已知噪音）。
+
+---
+
+## 2026-11-05 00:35 `wifi-mix` 的分支卡点找到了：内核里根本没有 Wi-Fi 驱动对象
+
+### 症状回顾
+
+混合内核（`wifi-mix`：除 GPU/输入/按键/电池/APFS/CPU 频点之外的 Wi-Fi 文件全用参考实现）跑起来后：
+
+```
+pcie: 31: pre-boot reset requested, MHI ctrl 0x2 status 0xff04, EE 0, BHI error 0
+pcie: 35: driver memory preparation failed: 0
+```
+
+`hakios_lx_prepare()` 返回 0（成功），但 `qca_driver_pool_mapped` 仍然是 false，
+而且 `lx:` 开头的日志一行都没有；我加在 `hakios_pcie_radio_map()` 里的两条诊断
+（`pcie: 34: radio_map refused …` / `pcie: 34: radio_map: the pool tables refused …`）
+也一行没打印 → 说明那个函数**从来没有被调用过**。
+
+### 真正的原因
+
+`xnu/files/bsd/dev/hakios.lx.c` 末尾有一组 `__attribute__((weak))` 兜底：
+
+```c
+__attribute__((weak)) int
+lx_prepare(void)
+{
+	return 0;                      /* 没有驱动对象时：说成功，其实什么也没做 */
+}
+```
+
+真正的 `lx_prepare()`（`wifi/lx/src/lx_bus.c:858` → `lx_base_init() || lx_pool_init()`）
+是编在 **`xnu-deps/build/ath11k/out/ath11k.o`** 里的，由 `tools/mk-ath11k.sh` 产出，
+`xnu-build.sh` 只有在这个对象存在时才 `HAKIOS_OBJECTS=` 把它链进内核。
+我们这棵树里 `xnu-deps/build/ath11k/` **一直不存在**（以前都是在参考工作树 `~/hackios-ref` 里编的），
+所以 00:21 那个内核里所有 `lx_*` 都是弱符号兜底：`lx_prepare()` 返回 0、`lx_start()` 返回 ENXIO、
+`lx_pool_init()` 根本不存在 → 内存池没映射、SMMU 上下文没建、BHI 那条链永远走不到。
+
+判别办法（一眼就能看出来）：
+
+```
+$ strings -a mach.development.bcm2837 | grep -c "for the radio to read and write"
+0        # 0 = 驱动对象没进内核（lx_pool_init 的日志字符串不在里面）
+```
+
+### 修了什么
+
+1. 把 `~/hackios-ref/xnu-deps/build/ath11k/` 整个拷进我们仓库（Linux 7.0.14 源码、FreeBSD 15.1
+   源码与已打的补丁、两个压缩包都在，469 MB），避免重新下载 400 MB。
+   `freebsd/.release` 里的补丁哈希与本仓库 `wifi/lx/patches/*.patch` 一致 → 不用重解包补丁。
+2. `rm -rf obj out && tools/mk-ath11k.sh`：用**我们的** `wifi/lx/src/*.c`（含固件路径回退修复）
+   重编，产出 `out/ath11k.o`（759,716 B；参考实现是 759,644 B；stubs.txt 为空、undefined.txt 为空）。
+   注意：这个脚本调用 `llvm-nm` / `llvm-size` 之类别名工具，本机只有 `llvm-ar`，
+   所以结尾那行"asks the kernel for N names"会报 command not found——
+   **不影响产物**，`ld.err` 里只有一条 `-F/System/Library/Frameworks/` 的警告。
+3. `rsync -r --no-times xnu/files/ xnu-src/xnu-8796.121.2/` 后 `./xnu-build.sh --clean -j8`。
+
+### 验收（编完之后必查）
+
+```
+M=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+strings -a $M | grep -c "for the radio to read and write"   # 必须是 1
+strings -a $M | grep -c "requested signed SBL"              # 必须是 1
+```
+
+### 2026-11-05 00:40 混合内核跑通：Wi-Fi 启动链全绿
+
+把 `ath11k.o` 挪进本仓库、重编内核后（15,736,104 B，00:32），冷芯片跑一轮
+（`logs/mix2-console.log`、内核日志 `logs/004035-run.log.live`）：
+
+```
+pcie: 12: driving gpio20 (wlan-en) high
+pcie: 15: 4 of 4 rails handled
+pcie: 19: wlan-en low (the rails are already up), then high again
+pcie: 31: pre-boot reset requested, MHI ctrl 0x2 status 0xff04, EE 0, BHI error 0
+pcie: 30: requested signed SBL transfer (512 KiB) through BHI
+pcie: 31: after SBL transfer MHI status 0x101, execenv 0x1, version 0x1000000
+pcie: 31: requested 4352144-byte AMSS transfer in 9 BHIE vectors
+pcie: 31: BHIE status 0xadcf0d91, execenv 0x2, MHI status 0x201
+pcie: 31: mission observation MHI status 0x201, execenv 0x2, stable M0 2000 ms
+pcie: 35: cyclic MHI/QRTR ready; starting QCA6390 ath11k
+lx: the firmware is asked for mode 0 (0: mission, 4: off, 7: calibration)
+lx: the rings are set up and the copy engines have their buffers: the bus is started
+lx: 290 ms after its start the driver IS UP: the firmware has said "unified ready"; flags 0x4100
+pcie: 35: ath11k returned 0
+pcie: 36: station offered to iOS; keeping isolated endpoint until session return
+net_test: wifi: en0 is there after 0.0 s
+net_test: wifi: configd has a network service for en0 after 10.2 s: it configures it itself
+```
+
+**结论：目标 1)、2) 达成，3) 的"iOS 侧出现接口且 configd 认它"达成**（以前卡在这条：
+"configd has no network service for en0 (a kernel without its IOKit objects)"）。
+桌面也正常（截图 `alioth-local/evidence/mix2-desk2.png`：壁纸、小组件、Dock、状态栏电池 87%），
+说明混合方案没有破坏我们自己的 GPU/触摸/按键/电池。
+
+### 踩过的操作坑（以后别再犯）
+
+1. **WSL 里后台跑的 `xl run` 会随 WSL 实例一起死**：WSL2 在最后一个进程退出时关掉虚拟机，
+   `nohup … &` 也没用，`/tmp` 一起清空。跑真机必须让 `wsl.exe` 前台挂着（本项目的
+   `alioth-local/tools/run_cycle.sh`，用 Bash 后台任务跑，这样 wsl.exe 一直活着）。
+   日志写进仓库 `logs/`，不要写 `/tmp`。
+2. `xl run` 还在进行时，`xl enter` / `xl ramdisk` 会被拒绝；换轮次前先
+   `XL_FORCE=1 ./xl stop` 并删 `/tmp/darwin-hakios-phone.{lock,who}`。
+3. `rsync -r --no-times xnu/files/ xnu-src/…` 之后再编，`--clean` 会让 config 阶段的
+   symbolset 检查报错退出（`exported name not in import list`），但紧接着**不带的增量编译**
+   就能把 `mach` 链出来（00:32 那次 15,736,104 B）。所以 `--clean` 失败不等于内核没出来，
+   看 `mach` 的 mtime 和 `strings` 校验。
+
+### 2026-11-05 01:00 让内核自己扫（wifi_scan=1）会卡住；改用 iOS 侧那条路
+
+`wifi_scan=1`（lx_bus.c 的 `lx_station_scan()`，被动监听 26 个信道）实测：
+`lx: THE DRIVER IS ASKED TO SCAN 26 channels, listening only: 0` 之后**再也不回来**，
+连 40 秒超时那句 "ms later the scan is …" 都没打印（`logs/005052-run.log.live`）。
+所以内核自带的扫描路径先不用。
+
+改成 iOS 走的那条：`Settings → Wi-Fi` 用的 Apple80211 请求
+（`SIOCSA80211` type 10 SCAN_REQ / type 20 ASSOCIATE，`bsd/dev/hakios.apple80211.c`）→
+`hakios.sta.c` → `wifi/lx/src/lx_80211.c` 的 `boundary_scan`/`boundary_join`。
+参考项目的 RESULTS.md 也印证这条路是可用的（他们手动连接 WPA2/AES、DHCP、HTTPS 都通）。
+
+**给 `userland/src/net_test.m` 加了三个动作**（这样无人值守也能扫/连）：
+
+- `scan`：发 SCAN_REQ（全信道、主动），轮询 type 13 等扫完，再用 type 11 逐个读结果，
+  打印每个 AP 的 SSID / dBm / 信道 / BSSID；
+- `join NAME [PASSPHRASE]`：用 Settings 同款 ASSOCIATE 报文（592 字节布局见
+  `struct apple80211_assoc`），轮询 type 21 取结果（1 = 成功）；
+- `autojoin [FILE]`：等电台就绪（轮询 SUPPORTED_CHANNELS），扫描，然后按
+  `FILE`（默认 `/redwood/fw/network`，第一行 SSID、第二行密码）连接。
+
+`userland/rc.jobs.wifi` = `rc.jobs` + `net_test wait 20` + `net_test scan`；
+用 `GL=1 REST=1 SYSTEM=1 RC_JOBS=rc.jobs.wifi ./build.sh` 生成镜像（root.apfs 14,426,112 B）。
+以后要自动连网，把 SSID/密码写进 `userland/root/fw/network`（不进 git）再重编 root.apfs 即可。
+
+### 2026-11-05 01:13 扫描成了：真实 SSID 列表（目标 3 达成）
+
+把 `scan` 放进 `com.hakios.wifi` 这个 launchd 任务（比等 `com.hakios.demo` 的 rc.jobs 快得多，
+后者前面卡着 `cpu_test 240`），冷芯片跑一轮（`logs/011200-run.log.live`）：
+
+```
+net_test: scan: the scan is over after 1.2 s
+net_test: scan:  1. "<SSID>" -85 dBm, channel 36, bssid <BSSID>
+net_test: scan:  5. "<SSID>" -52 dBm, channel 5, bssid <BSSID>
+net_test: scan:  6. "<SSID>" -41 dBm, channel 6, bssid <BSSID>
+...
+net_test: scan: 13 access point(s) heard
+```
+
+内核侧同一时刻也说：
+
+```
+lx: THE SCAN HEARD 13 NETWORKS (access points): 11 at 2.4 GHz, 2 at 5 GHz; ...
+lx: a scan for the kernel: 0 channels named (0: all), asking, 0 ms on each (0: the radio's own): 0;
+    13 access points heard, 17 frames, in 1106 ms
+```
+
+即：固件真的在收帧、SSID 能解析、iOS 的 Apple80211 扫描请求全程走通
+（`Settings → Wi-Fi` 用的就是这条路，所以现在手动点开设置也能看到列表）。
+
+### 连网准备的现状
+
+- 从 Android 的 `/data/misc/apexdata/com.android.wifi/WifiConfigStore.xml`
+  （`adb shell su -c cat`，Magisk 有 root）取出这台手机保存过的 Wi-Fi：
+  SSID `<家里的 2.4GHz SSID>`（扫描里 -41 dBm，信道 6），密码存 `fw-wifi/network`
+  （第一行 SSID，第二行密码；`fw-wifi/` 与 `userland/` 都在 .gitignore 里）。
+- `userland/build.sh` 原本只在 WCN6750（`fw-wifi/wpss.mdt`）那条分支里拷 `fw/network`，
+  QCA6390 这条没有；已补一段：`fw-wifi/network` → `root/fw/network`（0600，`SHARE=1` 时不带）。
+- 注意：内核里的 `hakios_wifi_network()` 在混合内核里解析到 `hakios.radio.c` 的桩（返回 false），
+  因为 `hakios.wifi.c` 不在 `conf/files` 里。所以"内核自己读密码连网"这条路在我们这棵树上没有，
+  连网必须由用户态的 `net_test autojoin` 发 ASSOCIATE 请求（`fw/network` 由它自己读）。
+
+### 2026-11-05 01:42 Wi-Fi 打通了（目标 1–4 全部达成）
+
+冷芯片跑 `logs/013819-run.log.live`，`com.hakios.wifi` 这一个任务里依次做完：
+
+```
+net_test: scan: a scan is asked for (every channel, asking)
+net_test: scan: 17 access point(s) heard
+net_test: autojoin: joining "<家里的 2.4GHz SSID>" (a passphrase)
+lx: AUTHENTICATION: the access point accepts (status 0)
+lx: THE KEYS ARE GIVEN TO THE DRIVER, 33 ms after the association: ours with the access point, and the group's (number 1, 16 bytes): 0
+lx: THE NETWORK IS JOINED: frames can pass
+net_test: autojoin: the join SUCCEEDED after 1.6 s (Apple80211's result 1)
+net_test: dhcp: IPConfiguration says of "setservice en0 DHCP": 0 (done)
+net_test: waitaddr en0: an address after 3.5 s
+net_test: en0: inet 192.168.1.92 netmask 255.255.255.0
+net_test: en0: inet6 2409:8a1e:4d32:dad0:c5e:e682:59f1:6812
+```
+
+状态栏出现了 Wi-Fi 图标（截图 `alioth-local/evidence/join3-screen2.png`）。
+至此：固件启动链、mission mode、iOS 接口、真实 SSID 扫描、关联、DHCP 拿地址全部成立。
+
+### 这一轮修掉的两个用户态问题（以后别再踩）
+
+1. **`net_test` 的输出只在进程退出时刷出来**：`setvbuf(stdout, NULL, _IOLBF, 0)` 对 launchd 给的
+   `/dev/console` 不管用，任务挂住时一行日志都没有，看起来像"什么都没做"。改成
+   `setbuf(stdout, NULL)`（无缓冲）后，每一步都实时出现在 `xl` 的日志流里。调试期间这是关键。
+2. **扫描要等"扫完"再读结果**：SET 返回后立刻读 type 13（状态）可能还是 idle，第一次实现就
+   把它当成扫完，得到 "0 access point(s) heard"。现在会先等到看见 SCANNING 或等 2 秒，
+   结果为空时还会每 300 ms 重读最多 20 次。
+3. `autojoin` 的可选文件参数只认以 `/` 开头的（否则会把后面的 `dhcp` 当成文件名）。
+
+### 现在的自动化链路（无需人碰手机）
+
+`userland/com.hakios.wifi.plist` → `net_test wait 15 scan autojoin dhcp en0 waitaddr en0 30 show`；
+`autojoin` 从镜像里的 `fw/network` 读 SSID/密码（由 `fw-wifi/network` 经 `userland/build.sh` 打进
+`root.apfs` 的 `/redwood/fw/network`，0600，`SHARE=1` 时不带）。要换网络只改 `fw-wifi/network` 再
+`GL=1 REST=1 RC_JOBS=rc.jobs.wifi ./build.sh`（root.apfs 约 9 秒）。
+
+### 2026-11-05 01:50 一次不稳定：`join4` 那轮扫描状态卡住
+
+同一套镜像再跑一轮（`logs/014252-run.log.live`）时，扫描的 type 13 状态一直停在
+SCANNING 直到 60 秒超时（`the scan is over after 60.0 s`），结果还是拿到了（11 个 AP），
+但之后 `autojoin` 那一步一直没打印，进程直到内核返回都没有退出（其余系统正常，GL 帧照常）。
+也就是说 **扫描结束标志偶尔丢**，之后 station 线程可能还认为自己忙，后续 join 被挡住。
+
+要查的方向（下次从这儿开始）：
+
+- `wifi/lx/src/lx_80211.c` 的 `radio->scan` 复位：`station_scan()` 设 1，谁负责设 2/3，
+  以及在"上一个扫描还没收尾就再来一个"时会不会把标志漏掉；
+- `hakios.sta.c` 的 `sta_calls` / `hakios_sta_busy()` 在扫描超时路径上的行为；
+- 用户态 `net_test scan` 现在对空结果重试 20 次 × 300 ms，但状态卡住时它只是等到 60 秒。
+
+目前可用的稳定路径就是 `join3` 那一轮（先扫、再 join、DHCP 成功）。这一轮失败说明
+"每次都能连上"还没做到 100%，但链路本身已经验证通了。

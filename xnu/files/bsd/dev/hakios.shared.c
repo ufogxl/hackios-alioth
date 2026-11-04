@@ -15,8 +15,8 @@
  *
  * They are here now, where a kernel that needs them can have them without another phone's radio.
  *
- * The three hooks do nothing, and that is the whole of them: this kernel has no radio to start,
- * quieten or stop. They exist so that a caller does not have to know which kernel it is in.
+ * The K40 publishes its selected station interface here before userland starts. The PCIe
+ * worker starts the radio later; these hooks also stop it before restoring Android's mappings.
  */
 
 #include <libkern/libkern.h>
@@ -53,18 +53,33 @@ hakios_wifi_file(const char *name, uint64_t *size)
 	return data;
 }
 
-/* The radio's lifecycle, of which this kernel has none. */
+/* The PCIe firmware probe must quiet its endpoint before restoring its SMMU. */
+extern void hakios_pcie_quiesce(void);
+extern void hakios_pcie_stop(void);
+extern uint32_t hakios_wifi_option(const char *name);
+extern void hakios_lx_net_early(void);
+
+/* en0 and its IOKit service must precede wifid. This only publishes the
+ * interface: firmware startup remains in the explicitly selected PCIe worker. */
 void
 hakios_wifi_init(void)
 {
+	if (hakios_wifi_option("pcie_step") >= 31 &&
+	    hakios_wifi_option("pcie_ipcr") == 2 &&
+	    hakios_wifi_option("wifi_lx") == 2 &&
+	    hakios_wifi_option("wifi_station")) {
+		hakios_lx_net_early();
+	}
 }
 
 void
 hakios_wifi_quiesce(void)
 {
+	hakios_pcie_quiesce();
 }
 
 void
 hakios_wifi_stop(void)
 {
+	hakios_pcie_stop();
 }

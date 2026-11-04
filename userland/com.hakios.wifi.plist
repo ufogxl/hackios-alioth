@@ -4,12 +4,28 @@
 <dict>
 	<key>Label</key>
 	<string>com.hakios.wifi</string>
-	<!-- with wifi=1 among the kernel's arguments: has configd configure the radio's interface (src/net_test.m,
-	     "wifi"); without, it ends at once -->
+	<!-- with wifi=1 among the kernel's arguments: say what the radio hears (src/net_test.m, "scan": the
+	     Apple80211 SCAN_REQ Settings makes), join the network fw/network names (first line the name,
+	     second the passphrase; "autojoin"), have configd configure the interface by DHCP, and then use
+	     the link: a name resolved, an HTTP answer fetched. Without wifi=1 the scan is refused and the
+	     job ends after that -->
 	<key>ProgramArguments</key>
 	<array>
 		<string>/redwood/bin/net_test</string>
-		<string>wifi</string>
+		<string>wait</string>
+		<string>15</string>
+		<string>scan</string>
+		<string>autojoin</string>
+		<string>dhcp</string>
+		<string>en0</string>
+		<string>waitaddr</string>
+		<string>en0</string>
+		<string>30</string>
+		<string>show</string>
+		<string>resolve</string>
+		<string>captive.apple.com</string>
+		<string>fetch</string>
+		<string>http://captive.apple.com/hotspot-detect.html</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

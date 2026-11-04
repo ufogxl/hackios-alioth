@@ -31,6 +31,7 @@
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
 
+extern const uint8_t *hakios_image_file(const char *, const char *, uint64_t *, int *);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern kern_return_t thread_terminate(thread_t thread);
@@ -79,7 +80,8 @@ lx_os_radio_memory(unsigned long size, unsigned long long *address)
 	}
 	__asm__ volatile ("dsb sy");
 	uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB);
-	if (uncached == 0 || !hakios_wifi_radio_map(physical, size, address)) {
+	if (uncached == 0 || !(lx_os_pcie() ? hakios_pcie_radio_map(physical, size, address) :
+	    hakios_wifi_radio_map(physical, size, address))) {
 		return NULL;
 	}
 	return (void *)uncached;
@@ -215,7 +217,27 @@ int
 lx_os_firmware(const char *name, const void **data, unsigned long *size)
 {
 	uint64_t length = 0;
-	const uint8_t *file = hakios_wifi_driver_file(name, &length);
+	const uint8_t *file = NULL;
+	if (lx_os_pcie()) {
+		const char *last = strrchr(name, '/');
+		last = last ? last + 1 : name;
+		const char *mapped = strcmp(last, "m3.bin") == 0 ? "m3.bin" :
+		    strcmp(last, "board.bin") == 0 ? "bd_k11a.elf" :
+		    strcmp(last, "regdb.bin") == 0 ? "regdb.bin" : NULL;
+		/*
+		 * This image keeps the vendor names one directory down (fw/qca6390/), which is where
+		 * build.sh puts what /vendor/firmware_mnt/image/qca6390 of the phone's Android holds.
+		 * The flat names the reference used (fw/qca6390_board.bin ...) are tried second so an
+		 * image built either way works.
+		 */
+		if (mapped) file = hakios_image_file("fw/qca6390", mapped, &length, NULL);
+		if (file == NULL && mapped) {
+			const char *flat = strcmp(last, "m3.bin") == 0 ? "qca6390_m3.bin" :
+			    strcmp(last, "board.bin") == 0 ? "qca6390_bd_k11a.elf" :
+			    "qca6390_regdb.bin";
+			file = hakios_image_file("fw", flat, &length, NULL);
+		}
+	} else file = hakios_wifi_driver_file(name, &length);
 
 	if (file == NULL) {
 		return ENOENT;
@@ -228,7 +250,7 @@ lx_os_firmware(const char *name, const void **data, unsigned long *size)
 int
 lx_os_rproc_boot(void)
 {
-	return hakios_wifi_dsp_is_up() ? 0 : ENXIO;
+	return (lx_os_pcie() ? hakios_pcie_radio_up() : hakios_wifi_dsp_is_up()) ? 0 : ENXIO;
 }
 
 int
@@ -344,6 +366,9 @@ hakios_lx_net_early(void)
 
 	if (hakios_wifi_radio_address(address)) {
 		lx_os_net_attach(address);
+		hakios_wifi_tell("lx: early station interface attached %u\n", lx_link_attached);
+	} else {
+		hakios_wifi_tell("lx: early station interface has no valid device address\n");
 	}
 }
 

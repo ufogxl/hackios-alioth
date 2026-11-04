@@ -125,6 +125,7 @@ bsd/dev/hakios.lx.c		standard
 bsd/dev/hakios.sta.c		standard
 bsd/dev/hakios.apple80211.c	standard
 bsd/dev/hakios.radio.c		standard
+bsd/dev/hakios.qrtr.c		standard
 bsd/dev/hakios.pcie.c		standard
 bsd/dev/hakios.rpmh.c		standard
 # What is NOT built of the Wi-Fi: the POCO X5 Pro's radio itself (hakios.wifi.c, hakios.wlfw.c).

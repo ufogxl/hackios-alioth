@@ -30,6 +30,13 @@
  *                         ASSOCIATE), and say what the kernel answers: Apple80211's result number
  *                         (21: a wrong passphrase) and how long it took. The network's name is
  *                         the kernel's (its SSID request) and is not printed.
+ *   scan                  ask for a scan as Settings does (Apple80211's SCAN_REQ, every channel,
+ *                         asking), wait for it, and say each access point heard: name, signal,
+ *                         channel, address
+ *   join NAME [PASSPHRASE]  join that network through the same ASSOCIATE request Settings uses,
+ *                         and say Apple80211's result (1: joined); the passphrase is not printed
+ *   autojoin [FILE]       wait for the radio, scan, then join the network FILE names (default
+ *                         /redwood/fw/network: its first line the name, its second the passphrase)
  *
  * The interface QEMU's network gives (en0, bsd/dev/hakios.net.c) has no IOKit object behind it,
  * and configd makes its network services out of those. (The phone's radio has one now:
@@ -545,10 +552,297 @@ wrongjoin(void)
 	close(s);
 }
 
+/* ---- scan, and joining a network of one's own: the requests Settings makes ------------------------------ */
+
+struct a80211_channel {
+	uint32_t version, channel, flags;
+};
+
+struct a80211_scan_request {
+	uint32_t version, bss_type;
+	uint8_t bssid[6], unused_0[2];
+	uint32_t ssid_length;
+	uint8_t ssid[32];
+	uint32_t scan_type;
+	uint32_t phy_mode;
+	uint16_t dwell_ms, unused_1;
+	uint32_t rest_ms;
+	uint32_t channel_count;
+	struct a80211_channel channels[400];
+	uint64_t flags;
+	uint32_t unused_2;
+	uint32_t name_count;
+	uint8_t names[10][56];
+	uint32_t short_ssid, unused_3;
+};
+
+struct a80211_scan_result {
+	uint32_t version;
+	struct a80211_channel channel;
+	uint16_t noise_known;
+	int16_t noise, snr, rssi;
+	uint16_t beacon_interval, capability;
+	uint8_t bssid[6];
+	uint8_t rate_count, unused_0;
+	uint32_t rates[15];
+	uint8_t ssid_length, ssid[32], unused_1[3];
+	uint32_t age_ms;
+	uint8_t flags, unused_2;
+	uint16_t elements_length;
+	uint8_t elements[1024];
+};
+
+static int
+a80211_get(int s, int type, void *data, uint32_t length, uint32_t *used)
+{
+	struct apple80211req request;
+
+	memset(&request, 0, sizeof(request));
+	strlcpy(request.name, "en0", sizeof(request.name));
+	request.type = type;
+	request.length = length;
+	request.data = data;
+	if (ioctl(s, SIOCGA80211, &request) != 0) {
+		return errno;
+	}
+	if (used != NULL) {
+		*used = request.length;
+	}
+	return 0;
+}
+
+static int
+a80211_value(int s, int type, int32_t *value)
+{
+	struct apple80211req request;
+
+	memset(&request, 0, sizeof(request));
+	strlcpy(request.name, "en0", sizeof(request.name));
+	request.type = type;
+	if (ioctl(s, SIOCGA80211, &request) != 0) {
+		return errno;
+	}
+	*value = request.value;
+	return 0;
+}
+
+static int
+a80211_set(int s, int type, const void *data, uint32_t length)
+{
+	struct apple80211req request;
+
+	memset(&request, 0, sizeof(request));
+	strlcpy(request.name, "en0", sizeof(request.name));
+	request.type = type;
+	request.length = length;
+	request.data = (void *)data;
+	return ioctl(s, SIOCSA80211, &request) != 0 ? errno : 0;
+}
+
+/* The station answers for the radio only once the driver is up; SUPPORTED_CHANNELS is the question that
+ * says nothing until then (hakios.apple80211.c answers ENXIO for it while there is no radio). */
+static int
+radio_wait(int s, double limit)
+{
+	double start = seconds();
+	void *channels = calloc(1, 4824);
+	int there = 0;
+
+	while (seconds() - start < limit) {
+		uint32_t used = 0;
+
+		if (channels != NULL && a80211_get(s, 27, channels, 4824, &used) == 0) {
+			printf("net_test: the radio answers after %.1f s\n", seconds() - start);
+			there = 1;
+			break;
+		}
+		usleep(200000);
+	}
+	if (!there) {
+		printf("net_test: the radio did not answer in %.0f s\n", limit);
+	}
+	free(channels);
+	return there;
+}
+
+/* One scan, asked for as Settings asks, and what it heard: an access point a line, the way a person reads it. */
+static void
+scan_and_say(const char *label)
+{
+	struct a80211_scan_request *ask = calloc(1, sizeof(*ask));
+	struct a80211_scan_result *heard = calloc(1, sizeof(*heard));
+	int s = socket(AF_INET, SOCK_DGRAM, 0), error = 0, count = 0;
+	double start;
+
+	if (s < 0 || ask == NULL || heard == NULL) {
+		printf("net_test: %s: no socket or no memory for a scan\n", label);
+		goto out;
+	}
+	ask->version = 1;
+	ask->scan_type = 1;                     /* asking: the radio may send there */
+	ask->dwell_ms = 0;                      /* (0: what the driver itself uses) */
+	ask->channel_count = 0;                 /* (0: every channel of the radio's) */
+	if ((error = a80211_set(s, 10, ask, sizeof(*ask))) != 0) {
+		printf("net_test: %s: the scan is refused: %s\n", label, strerror(error));
+		goto out;
+	}
+	printf("net_test: %s: a scan is asked for (every channel, asking)\n", label);
+	start = seconds();
+	{
+		int saw_scanning = 0;
+
+		for (;;) {
+			int32_t phase = 0;
+
+			if ((error = a80211_value(s, 13, &phase)) != 0) {
+				break;
+			}
+			if (phase == 1) {
+				saw_scanning = 1;
+			}
+			/* (the scan can be over before the first look: seen or two seconds gone, that is over) */
+			if ((phase == 0 && (saw_scanning || seconds() - start > 2)) || seconds() - start > 60) {
+				break;
+			}
+			usleep(100000);
+		}
+	}
+	printf("net_test: %s: the scan is %s after %.1f s\n", label, error != 0 ? "unreadable" : "over", seconds() - start);
+	for (unsigned attempt = 0;; attempt++) {
+		for (;;) {
+			char name[33];
+			unsigned length;
+
+			memset(heard, 0, sizeof(*heard));
+			if ((error = a80211_get(s, 11, heard, sizeof(*heard), NULL)) != 0) {
+				break;
+			}
+			length = heard->ssid_length <= sizeof(heard->ssid) ? heard->ssid_length : sizeof(heard->ssid);
+			for (unsigned i = 0; i < length; i++) {
+				name[i] = heard->ssid[i] >= 0x20 && heard->ssid[i] < 0x7f ? (char)heard->ssid[i] : '?';
+			}
+			name[length] = 0;
+			count++;
+			printf("net_test: %s: %2d. \"%s\" %d dBm, channel %u, bssid %02x:%02x:%02x:%02x:%02x:%02x\n", label, count, name,
+			    heard->rssi, heard->channel.channel, heard->bssid[0], heard->bssid[1], heard->bssid[2], heard->bssid[3],
+			    heard->bssid[4], heard->bssid[5]);
+		}
+		/* (the results are filled once the station says the scan is over: an empty list is looked at again) */
+		if (count != 0 || attempt >= 20) {
+			break;
+		}
+		usleep(300000);
+	}
+	printf("net_test: %s: %d access point(s) heard\n", label, count);
+out:
+	if (s >= 0) {
+		close(s);
+	}
+	free(ask);
+	free(heard);
+}
+
+static int
+join_network(const char *ssid, const char *passphrase, const char *label)
+{
+	uint8_t assoc[592];
+	size_t ssid_length = strlen(ssid), key_length = passphrase != NULL ? strlen(passphrase) : 0;
+	int s = socket(AF_INET, SOCK_DGRAM, 0), error = 0;
+	int32_t result = 0;
+	double start;
+
+	if (s < 0 || ssid_length == 0 || ssid_length > 32 || key_length > 63 || (key_length != 0 && key_length < 8)) {
+		printf("net_test: %s: the name or the passphrase is not one the request can carry\n", label);
+		return 1;
+	}
+	/* the layout of iOS 16.5 (bsd/dev/hakios.apple80211.c, struct apple80211_assoc) */
+	memset(assoc, 0, sizeof(assoc));
+	*(uint32_t *)(assoc + 0x00) = 1;                /* version */
+	*(uint16_t *)(assoc + 0x04) = 1;                /* mode: a station */
+	*(uint16_t *)(assoc + 0x06) = 1;
+	*(uint16_t *)(assoc + 0x08) = 8;
+	*(uint32_t *)(assoc + 0x0c) = (uint32_t)ssid_length;
+	memcpy(assoc + 0x10, ssid, ssid_length);
+	if (key_length != 0) {
+		*(uint32_t *)(assoc + 0x38) = 1;        /* key version */
+		*(uint32_t *)(assoc + 0x3c) = (uint32_t)key_length;
+		*(uint32_t *)(assoc + 0x40) = 10;       /* a passphrase as typed */
+		memcpy(assoc + 0x48, passphrase, key_length);
+	}
+	error = a80211_set(s, 20, assoc, sizeof(assoc));
+	memset(assoc, 0, sizeof(assoc));                /* (the passphrase does not stay in this program) */
+	if (error != 0) {
+		printf("net_test: %s: the join is refused: %s\n", label, strerror(error));
+		close(s);
+		return 1;
+	}
+	printf("net_test: %s: joining \"%s\" (%s)\n", label, ssid, key_length != 0 ? "a passphrase" : "open");
+	start = seconds();
+	for (;;) {
+		if ((error = a80211_value(s, 21, &result)) != 0 || result != 0 || seconds() - start > 60) {
+			break;
+		}
+		usleep(200000);
+	}
+	printf("net_test: %s: the join %s after %.1f s (Apple80211's result %d)\n", label,
+	    error != 0 ? "could not be asked for" : result == 1 ? "SUCCEEDED" : result == 0 ? "did not finish" : "FAILED",
+	    seconds() - start, result);
+	close(s);
+	return result == 1 ? 0 : 1;
+}
+
+/* What a session with nobody at the phone needs: the network named in a file (its first line the name,
+ * its second the passphrase), joined as Settings would join it. */
+static int
+autojoin(const char *path)
+{
+	char ssid[64] = "", passphrase[80] = "";
+	FILE *file = fopen(path, "r");
+	int s;
+
+	if (file == NULL) {
+		printf("net_test: autojoin: there is no %s: no network to join\n", path);
+		return 1;
+	}
+	if (fgets(ssid, sizeof(ssid), file) == NULL) {
+		ssid[0] = 0;
+	}
+	if (fgets(passphrase, sizeof(passphrase), file) == NULL) {
+		passphrase[0] = 0;
+	}
+	fclose(file);
+	for (char *p = ssid; *p != 0; p++) {
+		if (*p == '\n' || *p == '\r') {
+			*p = 0;
+		}
+	}
+	for (char *p = passphrase; *p != 0; p++) {
+		if (*p == '\n' || *p == '\r') {
+			*p = 0;
+		}
+	}
+	if (ssid[0] == 0) {
+		printf("net_test: autojoin: %s names no network\n", path);
+		return 1;
+	}
+	printf("net_test: autojoin: the network is named %u bytes; waiting for the radio\n", (unsigned)strlen(ssid));
+	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		return 1;
+	}
+	if (!radio_wait(s, 120)) {
+		printf("net_test: autojoin: the radio was not there after 120 s\n");
+		close(s);
+		return 1;
+	}
+	close(s);
+	scan_and_say("autojoin");
+	return join_network(ssid, passphrase[0] != 0 ? passphrase : NULL, "autojoin");
+}
+
 int
 main(int argc, char **argv)
 {
-	setvbuf(stdout, NULL, _IOLBF, 0);
+	setbuf(stdout, NULL);           /* unbuffered: on the console, what happens is seen as it happens */
 	@autoreleasepool {
 		for (int i = 1; i < argc; i++) {
 			const char *step = argv[i];
@@ -586,6 +880,20 @@ main(int argc, char **argv)
 				watch(atof(argv[++i]));
 			} else if (strcmp(step, "wrongjoin") == 0) {
 				wrongjoin();
+			} else if (strcmp(step, "scan") == 0) {
+				scan_and_say("scan");
+			} else if (strcmp(step, "join") == 0 && i + 1 < argc) {
+				const char *ssid = argv[++i];
+				const char *passphrase = i + 1 < argc ? argv[++i] : NULL;
+
+				if (join_network(ssid, passphrase, "join") != 0) {
+					return 1;
+				}
+			} else if (strcmp(step, "autojoin") == 0) {
+				/* (a path only when it looks like one: the steps after it are not a file name) */
+				const char *path = i + 1 < argc && argv[i + 1][0] == '/' ? argv[++i] : "/redwood/fw/network";
+
+				autojoin(path);
 			} else {
 				fprintf(stderr, "net_test: bad step \"%s\"\n", step);
 				return 1;

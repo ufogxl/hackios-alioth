@@ -1,0 +1,13 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+/redwood/bin/hello_dyn started by launchd
+/redwood/bin/svc_test
+/redwood/bin/surf_test
+/bin/ps -A
+/redwood/bin/mg_test
+# the processors: how many, and -- once the system has settled -- whether they work at the same time
+/redwood/bin/cpu_test
+/redwood/bin/cpu_test 240 &
+
+# the radio: the interface, and what it hears (bsd/dev/hakios.apple80211.c through the station)
+/redwood/bin/net_test wait 20
+/redwood/bin/net_test scan
