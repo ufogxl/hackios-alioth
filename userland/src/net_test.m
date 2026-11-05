@@ -55,6 +55,7 @@
 #include <SystemConfiguration/SCNetworkReachability.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
@@ -839,11 +840,56 @@ autojoin(const char *path)
 	return join_network(ssid, passphrase[0] != 0 ? passphrase : NULL, "autojoin");
 }
 
+/* Everything said is also written to a file, because the console's log is a ring: a session long enough
+ * to be useful pushes its own beginning out of it, and then the run has nothing to show for itself.
+ * "report" says the file again at the end, where the log still is. */
+static int console_fd = -1;
+
+static int
+report(const char *path)
+{
+	char buffer[4096];
+	ssize_t got;
+	int in = open(path, O_RDONLY);
+
+	if (in < 0) {
+		printf("net_test: report: nothing was written to %s\n", path);
+		return 1;
+	}
+	printf("net_test: report: %s, said again:\n", path);
+	if (console_fd >= 0) {
+		write(console_fd, "---- net_test ----\n", 19);
+	}
+	while ((got = read(in, buffer, sizeof(buffer))) > 0) {
+		if (console_fd >= 0) {
+			write(console_fd, buffer, (size_t)got);
+		} else {
+			fwrite(buffer, 1, (size_t)got, stdout);
+		}
+	}
+	close(in);
+	if (console_fd >= 0) {
+		write(console_fd, "---- end ----\n", 14);
+	} else {
+		printf("---- end ----\n");
+	}
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
-	setbuf(stdout, NULL);           /* unbuffered: on the console, what happens is seen as it happens */
+	console_fd = open("/dev/console", O_WRONLY);     /* (kept: below, stdout becomes the file) */
 	@autoreleasepool {
+		int journal = open("/private/var/net_test.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+		/* the console's own log loses its beginning in a long session; the file does not */
+		if (journal >= 0) {
+			dup2(journal, 1);
+			close(journal);
+		}
+		setbuf(stdout, NULL);           /* unbuffered: what happens is seen as it happens */
+		printf("net_test: %d step(s) from pid %d\n", argc - 1, getpid());
 		for (int i = 1; i < argc; i++) {
 			const char *step = argv[i];
 
@@ -894,6 +940,8 @@ main(int argc, char **argv)
 				const char *path = i + 1 < argc && argv[i + 1][0] == '/' ? argv[++i] : "/redwood/fw/network";
 
 				autojoin(path);
+			} else if (strcmp(step, "report") == 0 && i + 1 < argc) {
+				report(argv[++i]);
 			} else {
 				fprintf(stderr, "net_test: bad step \"%s\"\n", step);
 				return 1;

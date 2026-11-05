@@ -8759,3 +8759,90 @@ SCANNING 直到 60 秒超时（`the scan is over after 60.0 s`），结果还是
 
 目前可用的稳定路径就是 `join3` 那一轮（先扫、再 join、DHCP 成功）。这一轮失败说明
 "每次都能连上"还没做到 100%，但链路本身已经验证通了。
+
+### 2026-11-05 08:16 上网打通：DNS 与 HTTP 都通了（<家里的 5GHz SSID>）
+
+`logs/081414-run.log`（冷芯片，`fw/network` 换成 `<家里的 5GHz SSID>`）：
+
+```
+net_test: the radio answers after 0.0 s
+net_test: autojoin: a scan is asked for (every channel, asking)
+net_test: autojoin: the scan is over after 1.1 s
+net_test: autojoin: 10 access point(s) heard
+net_test: autojoin: joining "<家里的 5GHz SSID>" (a passphrase)
+net_test: autojoin: the join SUCCEEDED after 0.4 s (Apple80211's result 1)
+net_test: dhcp: IPConfiguration says of "setservice en0 DHCP": 0 (done)
+net_test: waitaddr en0: an address after 3.9 s
+net_test: en0: inet 192.168.1.92 netmask 255.255.255.0
+net_test: resolve captive.apple.com, 3.92 s: 111.32.202.188 111.32.202.186 … (16 个地址)
+net_test: fetch http://captive.apple.com/hotspot-detect.html: status 200, 69 bytes in 0.88 s
+```
+
+DNS 走 mDNSResponder、HTTP 走 CFNetwork（TLS 栈那套同样的路），所以不是"只有一个 IP"，
+是真的能收发。5 GHz 关联（-57 dBm，ch36）比 2.4 GHz 那次（1.6 s）还快，0.4 s。
+
+### 又踩了一个坑：控制台日志是环形缓冲
+
+`xl` 拿回来的控制台日志只有约 1.4 MB 的环，跑几分钟就被 `hakios-gl: frame …` 那类行冲掉，
+于是**任务明明跑完了（launchd 记 EXITED code 0），日志里却一行 `net_test:` 都看不到**，
+看起来像"卡住了"。这也解释了之前 `join4` 那轮的"离奇失联"。
+
+修法（`userland/src/net_test.m`）：
+
+- 启动时把 stdout `dup2` 到 `/private/var/net_test.log`（追加），控制台不再被洪水冲掉；
+- 新动作 `report FILE` 在会话靠后的位置把这份日志整段再打到控制台（`/dev/console` 单独开一个 fd）；
+- `com.hakios.wifi` 的参数顺序改成 `wait 10 → autojoin → dhcp → waitaddr → show → resolve →
+  fetch → wait 60 → report → scan`：**把扫描放到最后**，因为扫描偶尔会耗满它的一分钟，
+  不能挡在连接和上网前面。
+
+### 顺带确认：Master 已是 mix
+
+`master` 之前比 `origin/master` 多的 10 个提交并不是废料——它们是 `wifi-mix` 的祖先，
+所以 `git merge --ff-only wifi-mix` 就能让 master 等于 mix（已于 41bccf5 完成并推送）。
+对比 `master~1..master` 只动 18 个文件，全是 Wi-Fi 那批加用户态；`hakios.adreno.c` /
+`hakios.gpu.cpp` / `hakios.input.c` / `hakios.buttons.c` / `hakios.battery.*` /
+`hakios.apfs_check.c` / `hakios.cpufreq.c` / `hakios.display.c` 与 master 逐字节相同。
+
+同一轮 `net2` 里的驱动读数（`logs/081414-run.log`）：`adreno: 22` 10 次、
+`buttons: so far` 10 次、battery 相关 312 行、`hakios-gl: frame` 213 次（最后一帧 frame 3540）、
+没有 "THE GPU IS NOT STARTED"。
+
+### 2026-11-05 08:42 合入后的性能核对（帧率 / 触控链路没退化）
+
+先说清一个误会：`join3`/`join4` 截图里"壁纸黑、小组件空白"不是驱动退化。日志里
+`PosterBoard` 和 `WallpaperKit.CollectionsPoster` 是开机 **74 秒**才被拉起的
+（`logs/081414-run.log`，08:15:28），在那之前桌面就是黑底。`perf1` 那轮 08:28 截的图
+（`alioth-local/evidence/perf1-screen.png`）壁纸、图标、状态栏 Wi-Fi 图标都正常。
+
+帧率用同一套办法重量了一遍（`RC_JOBS=rc.jobs.fps` 的镜像 + `touch_lat=1`，GPU 开，
+`XL_FOLLOW=2 XL_FOLLOW_KEEP=1` 保留 live 日志，`tools/frames.py` 一起喂）：
+
+```
+logs/083728-run.log：37 个手势，3717 个帧间隔
+  全部手势合计：超过 16.7 ms 28%，超过 33 ms 5%
+  桌面左右滑（touch at 15%/85%,50%）: 445 帧 41.0 fps 与 991 帧 71.9 fps
+  上下滑（50%,30% / 50%,80%）：393 帧 68.3 fps / 378 帧 59.1 fps
+  慢帧的时间去向仍然是 idle before 10–31 ms（在等一次 commit），draw 3.7–26.6、gpu 0.7–7.1、copy ~2.0
+```
+
+对照合入前 `master` 那一轮（PROGRESS 上面记的 58 fps / 20% 超 16.7 / 2% 超 33）：手势集合和
+boot-arg 不完全一样（这次带 `pcie_*`/`wifi_*`，还同时跑着 Wi-Fi），所以百分比不能逐项比，
+但**桌面滑动这一项这次是 71.9 fps，比之前的 57–60 fps 还高**（`fb_beat=0` + `fb_ca_hz=120`
+本来就会超过面板的 60）；慢帧依旧是"窗口服务器等 commit"，不是 GPU 或上屏拷贝变慢。
+再叠加"这几个源文件和 master 逐字节相同"（`hakios.adreno.c`、`hakios.gpu.cpp`、
+`hakios.input.c`、`hakios.display.c`、`hakios.battery.*`），可以认为没有退化。
+
+触控链路：`tl: p`（内核采样）、`tl: c`（goodix 读）、`tl: i`（窗口服务器取出）、`tl: g`（画一帧）、
+`tl: v`（上屏）都在，`rwtouch` 的 37 个手势全部有响应——手指事件能一路走到面板。
+
+### 现在这套的完整链路（无人工干预）
+
+1. `adb shell svc wifi disable` → 等 12 s → `adb reboot bootloader`（让 WLAN 芯片真断电）；
+2. `xl enter` → `xl ramdisk userland/system.apfs` → `xl run`（boot-arg 见上）；
+3. 内核：pcie step 31 启动 QCA6390（BHI→BHIE→MHI→QMI→mission mode）→ ath11k up →
+   station 交给 iOS；
+4. 用户态 `com.hakios.wifi`：`autojoin`（读 `/redwood/fw/network`，Apple80211 ASSOCIATE）→
+   `dhcp en0` → `waitaddr` → `show` → `resolve` → `fetch`（HTTP 200）→ `report` → `scan`。
+
+换网络：改 `fw-wifi/network`（第一行 SSID，第二行密码，0600，不进 git），
+`cd userland && GL=1 REST=1 RC_JOBS=rc.jobs.fps ./build.sh` 重打 `root.apfs`（约 9 秒）。
